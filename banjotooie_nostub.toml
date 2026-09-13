@@ -1,0 +1,30 @@
+# Config file for Banjo-Tooie (USA) static recompilation.
+# Modeled on BanjoRecomp's banjo.us.rev0.toml.
+
+[input]
+entrypoint = 0x80000400
+# Paths are relative to the location of this config file.
+output_func_path = "RecompiledFuncs"
+rom_file_path = "build/decompressed.us.z64"
+symbols_file_path = "build/banjotooie.us.syms.toml"
+bss_section_suffix = "_bss"
+
+# Emit several functions per output file to keep build times reasonable.
+functions_per_output_file = 8
+
+[patches]
+
+# Functions that the recompiler should not emit code for (handled by the
+# runtime / reimplemented natively). Stubbed functions are not decoded, so this
+# is where low-level CPU functions that use cop0 registers or cache ops go
+# (exception handler, thread dispatcher, cache management, TLB, SR/FP control).
+stubs = [
+]
+
+# Functions to skip entirely (not emitted into the section function tables).
+ignored = [
+]
+
+# Functions whose recompiled names should be exposed for patch replacement.
+renamed = [
+]

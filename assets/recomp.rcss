@@ -1,0 +1,2 @@
+/* RecompFrontend requires at least one rule in the project stylesheet. */
+.banjo-tooie-bootstrap-style { color: #ffffff; }

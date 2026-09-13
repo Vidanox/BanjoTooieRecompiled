@@ -1,0 +1,23 @@
+# Build output and generated code — reproducible, and the build dir alone is
+# ~1.3 GB. See "Version control" in AGENTS.md.
+build/*
+build-cmake/
+RecompiledFuncs/
+*.log
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.exe
+
+# force_keep is ACCUMULATED STATE that cannot be regenerated, so it is kept even
+# though it lives under build/. See "Traps" in AGENTS.md.
+!build/force_keep*
+
+# A machine-specific symlink to the RecompFrontend checkout.
+lib/
+
+# Python bytecode from the tools.
+__pycache__/
+*.pyc

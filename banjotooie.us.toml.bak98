@@ -1,0 +1,394 @@
+# Config file for Banjo-Tooie (USA) static recompilation.
+# Modeled on BanjoRecomp's banjo.us.rev0.toml.
+
+[input]
+entrypoint = 0x80000400
+output_func_path = "RecompiledFuncs"
+rom_file_path = "build/decompressed.us.z64"
+symbols_file_path = "build/banjotooie.us.syms.toml"
+relocatable_sections_path = "build/sections.txt"
+bss_section_suffix = "_bss"
+# Measured: every generated translation unit pays ~130 ms to parse the 1.2 MB
+# funcs.h declaration list, plus ~50 ms of compiler process startup, before any
+# code is generated. At 8 functions per file that fixed cost is paid 2337 times
+# and dominates a full rebuild (~2 minutes on 6 cores); the actual codegen is
+# only ~100 s of CPU in total. 128 keeps the fixed cost near zero while leaving
+# a single changed function cheap to rebuild.
+functions_per_output_file = 256
+recomp_include = "#include \"tooie_recomp.h\""
+
+[patches]
+
+# Functions the recompiler should not emit code for (handled by the runtime).
+stubs = [
+    "anseq_entrypoint_1",
+    "babackpack_set_state",
+    "boot___osDispatchThread",
+    "bsbbuster_setSubstate",
+    "chquicksandbaddy_entrypoint_0",
+    "func_80032558",
+    "func_800963E4",
+    "func_800A6250",
+    "func_800D9888",
+    "func_800F2C1C",
+    "func_801137E4",
+    "func_80115618",
+    "func_80800000_gclightsDll",
+    "func_8080003C_chblackeye",
+    "func_80800050_chbanjocurrent",
+    "func_80800064_bsbflip",
+    "func_80800190_chbounce",
+    "func_808001B0_chbadjinjo",
+    "func_80800294_bsbflap",
+    "func_808002CC_chfaircoinbox",
+    "func_808003EC_chbadjinjo",
+    "func_80800418_chwarppad",
+    "func_808004B4_chbottlesfamily",
+    "func_80800534_gcnewpause",
+    "func_808005C4_gztrace",
+    "func_808005D0_chbottlesfamily",
+    "func_808006A0_chgameselect",
+    "func_808006AC_badata",
+    "func_80800774_chblackeye",
+    "func_808008C0_chdiggerboss",
+    "func_80800FC8_chquicksandbaddy",
+    "func_80801518_chstatueboss",
+    "func_80801534_chevilspirit",
+    "func_80801964_chklungo",
+    "func_80801988_chevilspirit",
+    "func_80801C18_chdodgemcontrol",
+    "func_80802020_gcdialogexec",
+    "func_80803CC4_chflysaucer",
+    "func_80803E84_chdiggerboss",
+    "func_8080549C_bsfirstp",
+    "gcgoto_entrypoint_0",
+    "gsmaker_entrypoint_0",
+    "ncba1p_entrypoint_5",
+    "sujiggy_entrypoint_4",
+    "sujiggy_entrypoint_5",
+    "boot___osGetCause",
+    "boot___osExceptionPreamble",
+    "boot___osEnqueueAndYield",
+    "boot___osEnqueueThread",
+    "boot___osPopThread",
+    "boot___osCleanupThread",
+    "boot___ll_div",
+    "boot___ll_lshift",
+    "boot___ll_mod",
+    "boot___ll_mul",
+    "boot___ll_rem",
+    "boot___ll_rshift",
+    "boot___ull_div",
+    "boot___ull_divremi",
+    "boot___ull_rem",
+    "boot___ull_rshift",
+    "boot_osPiGetStatus",
+    "boot___osSetSR",
+    "boot___osGetSR",
+    "boot___osSetFpcCsr",
+    "boot___osSiRawReadIo",
+    "boot___osSiRawWriteIo",
+    "boot_osWritebackDCache",
+    "boot_osInvalICache",
+    "boot_osUnmapTLBAll",
+    "boot_osMapTLBRdb",
+    "boot_osVirtualToPhysical",
+    "boot___osDequeueThread",
+    "boot___osSiDeviceBusy",
+    "boot_osSetEventMesg",
+    "boot_osSetIntMask",
+    "boot_osDestroyThread",
+    "boot___osProbeTLB",
+    "boot___osEPiRawStartDma",
+    "boot___osDisableInt",
+    "boot___osRestoreInt",
+    "boot_osCreatePiManager",
+    "boot_osCreateMesgQueue",
+    "boot___osPiCreateAccessQueue",
+    "boot_osGetThreadPri",
+    "boot_osSetThreadPri",
+    "boot_osCreateThread",
+    "boot___osDevMgrMain",
+    "boot_osStartThread",
+    "boot_osSendMesg",
+    "boot_osRecvMesg",
+    "boot___osResetGlobalIntMask",
+    "boot___osEPiRawWriteIo",
+    "boot___osEPiRawReadIo",
+    "boot___osSetGlobalIntMask",
+    "boot_osYieldThread",
+    "boot___createSpeedParam",
+]
+
+# Functions to skip entirely.
+#
+# `wait_one_frame` is defined by N64ModernRuntime
+# (librecomp/src/vi.cpp:47), which spins on the runtime's VI counter. The
+# recompiled copy would define the same symbol and collide at link time, so
+# suppress it and let the runtime's definition satisfy the callers.
+ignored = [
+    "wait_one_frame",
+]
+
+# Functions whose recompiled names should be exposed for patch replacement.
+renamed = [
+]
+
+# ---------------------------------------------------------------------------
+# Overlay syscall subsystem hooks (see src/recomp_api.cpp).
+#
+# Tooie's ROM reader and overlay relocation-key reader use raw PI MMIO that
+# cannot run on the host; the runtime supplies the data from its ROM image.
+# ---------------------------------------------------------------------------
+
+[[patches.hook]]
+func = "func_8001E210"
+before_vram = 0x8001E210
+text = "tooie_rom_read_word(rdram, ctx); return;"
+
+# Boot-local PI DMA reads ROM directly; route it through the runtime's ROM.
+[[patches.hook]]
+func = "boot___osPiRawStartDma"
+before_vram = 0x80001A40
+text = "tooie_boot_pi_raw_start_dma(rdram, ctx); return;"
+
+# The boot loader inflates core1 into its final RDRAM range without a PI DMA the
+# runtime can see; register the section and reproduce IPL3's CIC boot words.
+[[patches.hook]]
+func = "func_80000450"
+before_vram = 0x80000518
+text = "tooie_boot_register_core1(rdram, ctx);"
+
+# core2 is expanded straight into its final RDRAM range by the boot
+# decompressor (`func_80019EC0`, called at 0x800122BC with 0x1E5AEB0/0x800815C0
+# in its argument list), so no PI DMA the runtime can observe ever registers
+# that section either. Register it as soon as the decompression returns, before
+# any core2 function pointer has to resolve through LOOKUP_FUNC.
+[[patches.hook]]
+func = "func_80012214"
+before_vram = 0x800122C4
+text = "tooie_boot_register_core2(rdram, ctx);"
+
+# Reads CP0 Count via a hardware path the runtime does not model.
+[[patches.hook]]
+func = "func_80014A54"
+before_vram = 0x80014A54
+text = "return;"
+
+# TEMPORARY diagnostics.
+[[patches.hook]]
+func = "func_800006D4"
+before_vram = 0x800006D4
+text = "tooie_probe(rdram, ctx, 1); tooie_dump(rdram, 0x80200000);"
+
+[[patches.hook]]
+func = "boot_inflate"
+before_vram = 0x800007AC
+text = "tooie_probe(rdram, ctx, 2);"
+
+[[patches.hook]]
+func = "boot_inflate"
+before_vram = 0x800007C8
+text = "tooie_probe_ret(rdram, ctx, 1);"
+
+[[patches.hook]]
+func = "boot_inflate"
+before_vram = 0x800007FC
+text = "tooie_probe_ret(rdram, ctx, 3);"
+
+[[patches.hook]]
+func = "boot_inflate"
+before_vram = 0x80000800
+text = "tooie_probe_ret(rdram, ctx, 2);"
+
+[[patches.hook]]
+func = "func_80000450"
+before_vram = 0x800004D0
+text = "tooie_probe_slot(rdram, ctx, 1);"
+
+[[patches.hook]]
+func = "func_80000450"
+before_vram = 0x800004D8
+text = "tooie_probe_slot(rdram, ctx, 2);"
+
+[[patches.hook]]
+func = "func_80000450"
+before_vram = 0x800004E4
+text = "tooie_probe_slot(rdram, ctx, 3);"
+
+[[patches.hook]]
+func = "func_80000450"
+before_vram = 0x800004EC
+text = "tooie_probe_slot(rdram, ctx, 4);"
+
+[[patches.hook]]
+func = "func_80000450"
+before_vram = 0x80000474
+text = "tooie_probe_slot(rdram, ctx, 10);"
+
+[[patches.hook]]
+func = "func_80000450"
+before_vram = 0x8000049C
+text = "tooie_probe_slot(rdram, ctx, 11);"
+
+[[patches.hook]]
+func = "func_80000450"
+before_vram = 0x800004C4
+text = "tooie_probe_slot(rdram, ctx, 12);"
+
+# func_80082088 polls PI status and reads the per-overlay relocation XOR key
+# straight from the cartridge. Force the status read to idle, then supply the
+# key from the host ROM and NOP the original cartridge load.
+[[patches.instruction]]
+func = "func_80082088"
+vram = 0x80082138 # lw $t2, PI_STATUS_REG
+value = 0x00005025 # or $t2, $zero, $zero
+
+[[patches.hook]]
+func = "func_80082088"
+before_vram = 0x80082148
+text = "tooie_overlay_read_relocation_key(rdram, ctx);"
+
+[[patches.instruction]]
+func = "func_80082088"
+vram = 0x80082148 # lw $s5, 0x40($s5)
+value = 0x00000000 # nop; host bridge populated s5
+
+# boot_osInitialize is a boot-prefixed libultra duplicate, so N64Recomp's
+# built-in osInitialize replacement does not apply. Suppress its three final
+# direct AI MMIO writes; audio state is owned by the runtime's osAi* handlers.
+[[patches.instruction]]
+func = "boot_osInitialize"
+vram = 0x80001968 # sw $t7, AI_CONTROL_REG
+value = 0x00000000 # nop
+
+[[patches.instruction]]
+func = "boot_osInitialize"
+vram = 0x80001974 # sw $t8, AI_DACRATE_REG
+value = 0x00000000 # nop
+
+[[patches.instruction]]
+func = "boot_osInitialize"
+vram = 0x80001980 # sw $t9, AI_BITRATE_REG
+value = 0x00000000 # nop
+
+# N64 maps the same RDRAM through cached KSEG0 (0x80000000) and uncached
+# KSEG1 (0xA0000000). N64ModernRuntime's direct host-memory macros expose the
+# KSEG0 range only. Tooie's CIC thread has exactly two KSEG1 reads of IPL3 boot
+# residue, so redirect only their LUI instructions to the equivalent KSEG0
+# aliases.
+[[patches.instruction]]
+func = "func_8001DE64"
+vram = 0x8001DE70 # lui $t6, 0xA030
+value = 0x3C0E8030 # lui $t6, 0x8030
+
+[[patches.instruction]]
+func = "func_8001DE64"
+vram = 0x8001DE80 # lui $t8, 0xA030
+value = 0x3C188030 # lui $t8, 0x8030
+
+# Four software-FPU trampolines that save the caller's return address in a
+# scratch register, call the shared routine at 0x80013ABC/0x80013818, finish the
+# operation and then "return" through that register:
+#
+#   0x80013804  or   $a1, $ra, $zero      (func_800137F4; $a3 in 80013A5C/7C)
+#   0x80013808  jal  0x80013818
+#   0x80013810  jr   $a1                  <- patched
+#   0x80013814  mov.s $f0, $f2            (delay slot)
+#
+# N64Recomp cannot resolve a register return, so it emits LOOKUP_FUNC($a1). By
+# then the helper has clobbered $a1 and the dispatch aborts with
+# `Failed to find function at 0x00000000` -- func_800137F4+0x5A was the first
+# one the game reached (from glgamedata's entrypoint walking its export table).
+# $ra still holds the original caller's return address (the helper returns
+# normally through its own saved $ra), so `jr $ra` is equivalent and statically
+# resolvable. The shipping reference port patches these same four words.
+[[patches.instruction]]
+func = "func_800137D4"
+vram = 0x800137EC # jr $a1
+value = 0x03E00008 # jr $ra
+
+[[patches.instruction]]
+func = "func_800137F4"
+vram = 0x80013810 # jr $a1
+value = 0x03E00008 # jr $ra
+
+[[patches.instruction]]
+func = "func_80013A5C"
+vram = 0x80013A74 # jr $a3
+value = 0x03E00008 # jr $ra
+
+[[patches.instruction]]
+func = "func_80013A7C"
+vram = 0x80013A98 # jr $a3
+value = 0x03E00008 # jr $ra
+
+# TEMPORARY diagnostic: suexpression_entrypoint_10 faults on `lh $v0, 0x0($a0)`.
+[[patches.hook]]
+func = "suexpression_entrypoint_10"
+before_vram = 0x80800428
+text = "tooie_probe_kseg1_entry(rdram, ctx);"
+
+# TEMPORARY diagnostic: chanim_entrypoint_7 is entered with a0 = NULL although
+# the syscall site that dispatches it had a0 = 0x801DD74C.
+[[patches.hook]]
+func = "chanim_entrypoint_7"
+before_vram = 0x808001F8
+text = "tooie_probe_ptr(rdram, ctx, 9);"
+
+# TEMPORARY diagnostic: func_80100094 indexes a table from (a0, a1) and faults
+# when a0 is NULL; report the caller.
+[[patches.hook]]
+func = "func_80100094"
+before_vram = 0x80100094
+text = "tooie_probe_slot_table(rdram, ctx);"
+
+# TEMPORARY diagnostic: the actor resource allocator. Every non-zero slot id
+# comes from here, and a size of 0 frees the slot instead of creating it.
+[[patches.hook]]
+func = "func_80100074"
+before_vram = 0x80100074
+text = "tooie_probe_create(rdram, ctx);"
+
+# TEMPORARY diagnostic: chintrochar's first function is the only place that
+# creates the actor's slot-1 (spline/expression) resource.
+[[patches.hook]]
+func = "func_80800000_chintrochar"
+before_vram = 0x80800000
+text = "tooie_probe_actor_setup(rdram, ctx);"
+
+# TEMPORARY diagnostic: trace the a0 passed into the overlay-load predicate.
+[[patches.hook]]
+func = "func_8009CC68"
+before_vram = 0x8009CC68
+text = "tooie_probe_ea(rdram, ctx, 0xF0);"
+
+# The loader has copied and relocated the overlay into RDRAM by this point.
+# Register the matching N64Recomp section before func_80081F64 patches the
+# syscall table.
+[[patches.hook]]
+func = "syscall_handler"
+before_vram = 0x80081F24
+text = "tooie_register_loaded_overlay(rdram, ctx);"
+
+# The handler tail-jumps back through the static syscall entry after
+# func_80081F64 rewrote it to `j overlay+0x10`. That address is dynamic MIPS
+# code, not a native function boundary, so LOOKUP_FUNC cannot resolve it.
+# Run the original jr delay-slot stack restore, then feed the rewritten
+# instruction back through the host-side decoder.
+[[patches.hook]]
+func = "syscall_handler"
+before_vram = 0x80081F5C
+text = "ctx->r29 = ADD32(ctx->r29, 0x40); recomp_syscall_handler(rdram, ctx, (int32_t)ctx->r8); return;"
+
+# Keep the runtime's loaded-function map in sync with Tooie's own overlay
+# unload and heap-defragmentation paths.
+[[patches.hook]]
+func = "ovl_unload"
+before_vram = 0x80081A20
+text = "tooie_unregister_loaded_overlay(rdram, ctx);"
+
+[[patches.hook]]
+func = "ovl_shift"
+before_vram = 0x80082528
+text = "tooie_reregister_shifted_overlay(rdram, ctx);"
