@@ -18,16 +18,30 @@ Usage (from the project root):
 Play until the defect appears, then close the window. Shots go to
 build-cmake/captures/play, the trace to build-cmake/trace_play.log.
 
-`--sky-stretch` additionally sets BT_RT64_SKY_STRETCH=on, which tells RT64 not to
-widen the skybox projection's field of view for the widescreen aspect
-(`G_EX_ASPECT_STRETCH`). Tooie builds its dome for a 4:3 field, so widening it
-leaves the dome covering only part of the width.
-
 `--sky-view-nointerp` additionally sets BT_RT64_SKY_VIEW_NOINTERP=on, which tags
 the skybox *projection* so RT64 renders it with the current frame's view instead
-of blending it with the previous frame's camera. The skybox is a dome anchored to
-the camera, so that blend moves the dome relative to the frame; every other
-projection belongs to geometry that really is in the world.
+of blending it with the previous frame's camera. ⚠ This one is a lever, not a
+default: the dome is anchored to the camera, so freezing its view to one camera
+while the world interpolates makes the sky slide against the world when the
+camera moves. It exists to reproduce that behaviour, not to fix anything.
+
+`--sky-no-stretch` additionally sets BT_RT64_SKY_STRETCH=off, which restores the
+old behaviour of letting RT64 widen the skybox projection's field of view for the
+widescreen aspect (`G_EX_ASPECT_STRETCH` off). The stretch is now the *default*:
+Tooie builds its dome for a 4:3 field, so widening it leaves the dome covering
+only part of the width.
+
+`--sky-infinite` additionally sets BT_RT64_SKY_INFINITE=on, which rewrites the
+skybox projection into the infinite-far-plane form Tooie uses in first person.
+That form is what the F3D depth-clip defect discarded, so this reproduces the
+triggering projection from the attract loop -- the skybox fix is regression-
+testable without a controller. Check the captured sky is lit: the black bars at
+the top and bottom of a capture are cinematic letterbox, not the defect.
+
+⚠ These are the levers for `BT_RT64_*` env vars; the exe itself parses none of
+them. `src/main.cpp` reads only `--show-console` and `librecomp`'s `parse_cli`
+reads only `--game`/`--game-mode`, so passing any of the above to the exe
+directly is silently ignored -- they have to go through this script.
 """
 
 import os
@@ -74,7 +88,8 @@ def main():
                             time.strftime("run_%Y%m%d_%H%M%S", time.localtime()))
     every = 4.0
     sky_view_nointerp = False
-    sky_stretch = False
+    sky_no_stretch = False
+    sky_infinite = False
     for a in list(args):
         if a.startswith("--every="):
             every = float(a.split("=", 1)[1])
@@ -82,8 +97,11 @@ def main():
         elif a == "--sky-view-nointerp":
             sky_view_nointerp = True
             args.remove(a)
-        elif a == "--sky-stretch":
-            sky_stretch = True
+        elif a == "--sky-no-stretch":
+            sky_no_stretch = True
+            args.remove(a)
+        elif a == "--sky-infinite":
+            sky_infinite = True
             args.remove(a)
 
     env = dict(os.environ)
@@ -92,8 +110,10 @@ def main():
     env["TOOIE_TRACE_SKY"] = "1"
     if sky_view_nointerp:
         env["BT_RT64_SKY_VIEW_NOINTERP"] = "on"
-    if sky_stretch:
-        env["BT_RT64_SKY_STRETCH"] = "on"
+    if sky_no_stretch:
+        env["BT_RT64_SKY_STRETCH"] = "off"
+    if sky_infinite:
+        env["BT_RT64_SKY_INFINITE"] = "on"
     log = open(log_path, "wb")
     proc = subprocess.Popen([exe] + args, stdout=log, stderr=subprocess.STDOUT,
                             cwd=cwd, env=env, creationflags=CREATE_NO_WINDOW)
@@ -183,10 +203,10 @@ def main():
 
     print(f"[trace] projections traced: {len(proj_lines)} records over "
           f"{len(sequences)} frames", flush=True)
-    if sky_stretch:
+    if not sky_no_stretch:
         print(f"[trace] sky/world horizontal-scale differences: {len(fbdiv_lines)} "
-              f"(expected with --sky-stretch: the sky is deliberately stretched to "
-              f"fill the view instead of being field-of-view widened)", flush=True)
+              f"(expected: the sky is deliberately stretched to fill the view "
+              f"instead of being field-of-view widened)", flush=True)
     else:
         print(f"[trace] [fbdiv] divergence records: {len(fbdiv_lines)}", flush=True)
     for line in fbdiv_lines[:8]:

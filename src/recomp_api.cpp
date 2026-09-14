@@ -901,14 +901,14 @@ static_assert(kRootGroupFlags == 0x02408AADU, "root matrix group flags");
 static_assert(kBoneGroupFlags == 0x02008AADU, "bone matrix group flags");
 static_assert(kProjectionGroupFlags == 0x02008AAAU, "projection group flags");
 
-// TEMPORARY experiment (Banjo-Tooie port). The skybox is a dome anchored to the
-// camera, so its view matrix is the *current* camera's; RT64 interpolating that
-// view blends the dome with the previous frame's camera position. The projection
-// processor lerps the view (`rigidBody->lerp`) and then interpolates the
-// projection with it, and the amount of the shift is the camera's per-frame
-// movement -- which is why the artifact appears while moving and changes size
-// with the movement, and why it is confined to the sky: every other projection
-// belongs to geometry that really is in the world.
+// The skybox is a dome anchored to the camera, so its view matrix is the
+// *current* camera's; RT64 interpolating that view blends the dome with the
+// previous frame's camera position. The projection processor lerps the view
+// (`rigidBody->lerp`) and then interpolates the projection with it, and the amount
+// of the shift is the camera's per-frame movement -- which is why the artifact
+// appears while moving and changes size with the movement, and why it is confined
+// to the sky: every other projection belongs to geometry that really is in the
+// world.
 //
 // This is the same flag layout as kProjectionGroupFlags with position and
 // rotation set to SKIP, which makes RigidBody::updateLinear/updateAngular clear
@@ -926,17 +926,16 @@ constexpr uint32_t kSkyProjectionGroupFlags = matrix_group_flags(
 static_assert(kSkyProjectionGroupFlags == (kProjectionGroupFlags & ~0x78U),
               "sky projection flags must differ from the projection flags only in pos/rot");
 
-// TEMPORARY experiment (Banjo-Tooie port). The skybox is the one projection that
-// must fill the whole view: Tooie builds its dome for a 4:3 field of view, and
-// RT64's aspect adjustment widens the projection's field of view by
-// aspectRatioScale (1/0.75 = 1.333 here) so the *world* is rendered correctly in
-// a 16:9 frame. A dome sized for the narrower field then covers only 0.75 of the
-// width, and where it fails to reach, the sky draw's own fullscreen black fill is
-// what shows. `G_EX_ASPECT_STRETCH` tells RT64 not to widen this projection at
-// all: the sky is drawn with the field of view the game built it for and the
-// result is stretched across the wider viewport, so it always covers. The vertical
-// field of view is identical either way, so the horizon still lines up with the
-// terrain. The aspect field is bits 20-21.
+// The skybox is the one projection that must fill the whole view: Tooie builds its
+// dome for a 4:3 field of view, and RT64's aspect adjustment widens the
+// projection's field of view by aspectRatioScale (1/0.75 = 1.333 here) so the
+// *world* is rendered correctly in a 16:9 frame. A dome sized for the narrower
+// field then covers only 0.75 of the width, and where it fails to reach, the sky
+// draw's own fullscreen black fill is what shows. `G_EX_ASPECT_STRETCH` tells RT64
+// not to widen this projection at all: the sky is drawn with the field of view the
+// game built it for and the result is stretched across the wider viewport, so it
+// always covers. The vertical field of view is identical either way, so the horizon
+// still lines up with the terrain. The aspect field is bits 20-21.
 constexpr uint32_t kSkyProjectionStretchFlags =
     (kProjectionGroupFlags & ~(3U << 20)) |
     (static_cast<uint32_t>(G_EX_ASPECT_STRETCH) << 20);
@@ -1133,21 +1132,25 @@ bool rt64_sky_off() {
     return off;
 }
 
-// BT_RT64_SKY_STRETCH=on: do not widen the skybox projection's field of view for
-// the widescreen aspect. Tooie's dome is built for a 4:3 field, so widening it
-// leaves the dome covering only part of the width and the black fill shows.
-bool rt64_sky_stretch() {
-    static const bool on = [] {
-        const char* value = std::getenv("BT_RT64_SKY_STRETCH");
-        return (value != nullptr) && ((value[0] == 'o') || (value[0] == '1'));
-    }();
-    return on;
+// BT_RT64_SKY_STRETCH=off: stop stretching the skybox projection, so RT64 widens
+// its field of view like every other projection. This is the A/B lever for the
+// stretch, which is on by default.
+bool rt64_sky_stretch_disabled() {
+    static const bool off = rt64_env_off("BT_RT64_SKY_STRETCH");
+    return off;
 }
 
 // BT_RT64_SKY_VIEW_NOINTERP=on: render the skybox projection with the current
-// frame's view and projection instead of RT64's blend of them with the previous
-// frame's. Exists so the "the sky's view is being interpolated" hypothesis can be
-// tested on the same binary as the current behaviour.
+// frame's view instead of RT64's blend of it with the previous frame's.
+//
+// ⚠ NOT the default, and it must not become one. `lerpTransforms` falls back to
+// the *current* transform when lerpTranslation/lerpRotation are false, so this
+// freezes the dome to one camera while the world keeps interpolating -- and RT64
+// renders each displayed frame at a weight between the previous and current
+// camera. The dome is anchored to the camera, so freezing it makes the sky slide
+// against the world whenever the camera moves. Measured: it does drive the sky's
+// camDelta to exactly 0, which is why it looked like a fix, but camDelta is not
+// the quantity that matters here -- matching the world's interpolation is.
 bool rt64_sky_view_nointerp() {
     static const bool on = [] {
         const char* value = std::getenv("BT_RT64_SKY_VIEW_NOINTERP");
@@ -1606,10 +1609,14 @@ extern "C" void tooie_rt64_tag_projection(uint8_t* rdram, recomp_context* ctx,
     if (kind == 0U) {
         if (g_sky_draw_depth != 0U) {
             transform_id = kSkyboxProjectionId;
-            // TEMPORARY experiment levers, both inert by default.
-            if (rt64_sky_stretch()) {
+            // Stretch is on by default: the dome is built for a 4:3 field, so
+            // letting RT64 widen the skybox's field of view leaves it covering
+            // only 0.75 of the width and the black fill shows through.
+            if (!rt64_sky_stretch_disabled()) {
                 flags = kSkyProjectionStretchFlags;
             }
+            // View interpolation is left alone unless explicitly asked for; see
+            // rt64_sky_view_nointerp -- freezing it slides the sky.
             if (rt64_sky_view_nointerp()) {
                 flags = (flags & ~0x78U) | (kSkyProjectionGroupFlags & 0x78U);
             }
