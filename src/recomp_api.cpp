@@ -926,16 +926,13 @@ constexpr uint32_t kSkyProjectionGroupFlags = matrix_group_flags(
 static_assert(kSkyProjectionGroupFlags == (kProjectionGroupFlags & ~0x78U),
               "sky projection flags must differ from the projection flags only in pos/rot");
 
-// The skybox is the one projection that must fill the whole view: Tooie builds its
-// dome for a 4:3 field of view, and RT64's aspect adjustment widens the
-// projection's field of view by aspectRatioScale (1/0.75 = 1.333 here) so the
-// *world* is rendered correctly in a 16:9 frame. A dome sized for the narrower
-// field then covers only 0.75 of the width, and where it fails to reach, the sky
-// draw's own fullscreen black fill is what shows. `G_EX_ASPECT_STRETCH` tells RT64
-// not to widen this projection at all: the sky is drawn with the field of view the
-// game built it for and the result is stretched across the wider viewport, so it
-// always covers. The vertical field of view is identical either way, so the horizon
-// still lines up with the terrain. The aspect field is bits 20-21.
+// ⚠ A deliberate trade, not a fix -- see rt64_sky_stretch. `G_EX_ASPECT_STRETCH`
+// tells RT64 not to widen this projection at all: the sky is drawn with the field
+// of view the game built it for and the result is stretched across the wider
+// viewport, so it always covers. But Tooie's dome ends at the 4:3 frustum edge, so
+// the only way to cover is to draw the sky 1.333x zoomed in horizontally relative
+// to the world -- which slides. The vertical field of view is identical either
+// way, so the horizon still lines up with the terrain. Aspect is bits 20-21.
 constexpr uint32_t kSkyProjectionStretchFlags =
     (kProjectionGroupFlags & ~(3U << 20)) |
     (static_cast<uint32_t>(G_EX_ASPECT_STRETCH) << 20);
@@ -1132,12 +1129,27 @@ bool rt64_sky_off() {
     return off;
 }
 
-// BT_RT64_SKY_STRETCH=off: stop stretching the skybox projection, so RT64 widens
-// its field of view like every other projection. This is the A/B lever for the
-// stretch, which is on by default.
-bool rt64_sky_stretch_disabled() {
-    static const bool off = rt64_env_off("BT_RT64_SKY_STRETCH");
-    return off;
+// BT_RT64_SKY_STRETCH=on: do not widen the skybox projection's field of view.
+//
+// ⚠ NOT the default, and it must not become one. It is the only way to make the
+// dome cover a 16:9 frame -- Tooie's sky ends at the 4:3 frustum edge, so widening
+// leaves the sky draw's own black fill showing at the sides -- but it buys that
+// coverage by drawing the sky 1.333x zoomed in horizontally relative to the world.
+// Measured with RT64's own divergence metric: with it on, RT64 reports 400
+// `[fbdiv]` records in 3 minutes, sky `net=1.00` against world `net=0.75`; with it
+// off, 0 records and both agree. A sky at a different horizontal scale than the
+// world slides against the world whenever the camera turns -- and the amount is
+// large (1.333x, i.e. ~30 degrees of drift over a 90 degree turn), which is far
+// more objectionable than the edge band it removes.
+//
+// So this is a deliberate trade, not a fix: coverage at the cost of alignment.
+// `--sky-stretch` in tools/trace_play.py turns it on to demonstrate the trade.
+bool rt64_sky_stretch() {
+    static const bool on = [] {
+        const char* value = std::getenv("BT_RT64_SKY_STRETCH");
+        return (value != nullptr) && ((value[0] == 'o') || (value[0] == '1'));
+    }();
+    return on;
 }
 
 // BT_RT64_SKY_VIEW_NOINTERP=on: render the skybox projection with the current
@@ -1609,14 +1621,14 @@ extern "C" void tooie_rt64_tag_projection(uint8_t* rdram, recomp_context* ctx,
     if (kind == 0U) {
         if (g_sky_draw_depth != 0U) {
             transform_id = kSkyboxProjectionId;
-            // Stretch is on by default: the dome is built for a 4:3 field, so
-            // letting RT64 widen the skybox's field of view leaves it covering
-            // only 0.75 of the width and the black fill shows through.
-            if (!rt64_sky_stretch_disabled()) {
+            // Off by default: the stretch makes the dome cover the widened frame,
+            // but it does so by zooming the sky 1.333x horizontally relative to
+            // the world, which makes the sky slide when the camera turns. See
+            // rt64_sky_stretch.
+            if (rt64_sky_stretch()) {
                 flags = kSkyProjectionStretchFlags;
             }
-            // View interpolation is left alone unless explicitly asked for; see
-            // rt64_sky_view_nointerp -- freezing it slides the sky.
+            // Also off by default; see rt64_sky_view_nointerp.
             if (rt64_sky_view_nointerp()) {
                 flags = (flags & ~0x78U) | (kSkyProjectionGroupFlags & 0x78U);
             }

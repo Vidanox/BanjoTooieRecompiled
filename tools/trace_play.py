@@ -25,11 +25,13 @@ default: the dome is anchored to the camera, so freezing its view to one camera
 while the world interpolates makes the sky slide against the world when the
 camera moves. It exists to reproduce that behaviour, not to fix anything.
 
-`--sky-no-stretch` additionally sets BT_RT64_SKY_STRETCH=off, which restores the
-old behaviour of letting RT64 widen the skybox projection's field of view for the
-widescreen aspect (`G_EX_ASPECT_STRETCH` off). The stretch is now the *default*:
-Tooie builds its dome for a 4:3 field, so widening it leaves the dome covering
-only part of the width.
+`--sky-stretch` additionally sets BT_RT64_SKY_STRETCH=on, which stops RT64
+widening the skybox projection so the dome covers the whole frame. ⚠ It is a
+trade, not a fix, and it is off by default: covering costs alignment, because the
+sky is then drawn 1.333x zoomed in horizontally relative to the world and slides
+when the camera turns. Use it to demonstrate the trade; see `rt64_sky_stretch`.
+
+`--sky-no-stretch` is gone -- not stretching is the default now.
 
 `--sky-infinite` additionally sets BT_RT64_SKY_INFINITE=on, which rewrites the
 skybox projection into the infinite-far-plane form Tooie uses in first person.
@@ -88,7 +90,7 @@ def main():
                             time.strftime("run_%Y%m%d_%H%M%S", time.localtime()))
     every = 4.0
     sky_view_nointerp = False
-    sky_no_stretch = False
+    sky_stretch = False
     sky_infinite = False
     for a in list(args):
         if a.startswith("--every="):
@@ -97,8 +99,8 @@ def main():
         elif a == "--sky-view-nointerp":
             sky_view_nointerp = True
             args.remove(a)
-        elif a == "--sky-no-stretch":
-            sky_no_stretch = True
+        elif a == "--sky-stretch":
+            sky_stretch = True
             args.remove(a)
         elif a == "--sky-infinite":
             sky_infinite = True
@@ -110,8 +112,8 @@ def main():
     env["TOOIE_TRACE_SKY"] = "1"
     if sky_view_nointerp:
         env["BT_RT64_SKY_VIEW_NOINTERP"] = "on"
-    if sky_no_stretch:
-        env["BT_RT64_SKY_STRETCH"] = "off"
+    if sky_stretch:
+        env["BT_RT64_SKY_STRETCH"] = "on"
     if sky_infinite:
         env["BT_RT64_SKY_INFINITE"] = "on"
     log = open(log_path, "wb")
@@ -203,10 +205,11 @@ def main():
 
     print(f"[trace] projections traced: {len(proj_lines)} records over "
           f"{len(sequences)} frames", flush=True)
-    if not sky_no_stretch:
+    if sky_stretch:
         print(f"[trace] sky/world horizontal-scale differences: {len(fbdiv_lines)} "
-              f"(expected: the sky is deliberately stretched to fill the view "
-              f"instead of being field-of-view widened)", flush=True)
+              f"(expected with --sky-stretch: the sky is deliberately stretched to "
+              f"fill the view, which draws it at a different horizontal scale than "
+              f"the world and makes it slide)", flush=True)
     else:
         print(f"[trace] [fbdiv] divergence records: {len(fbdiv_lines)}", flush=True)
     for line in fbdiv_lines[:8]:
