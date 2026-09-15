@@ -166,11 +166,25 @@ if (WIN32)
             "${RT64_DIR}/src/contrib/dxc/bin/x64/dxcompiler.dll"
             $<TARGET_FILE_DIR:BanjoTooieRecompiled>)
 
+    # Release must be a GUI subsystem binary: /SUBSYSTEM:CONSOLE makes Windows
+    # allocate a console for the process, so launching the game from Explorer
+    # pops up a cmd window that stays for the whole session.
+    #
+    # /ENTRY:mainCRTStartup is required alongside /SUBSYSTEM:WINDOWS, because the
+    # program's entry point is `main`, not `WinMain`.
+    #
+    # This does not lose the diagnostics: `--show-console` calls AllocConsole and
+    # rebinds stdin/stdout/stderr to it (see main.cpp), so a release build can
+    # still be run with a console when something needs debugging. Output is also
+    # captured normally when a parent process supplies pipes, which is how the
+    # tools in tools/ run it.
+    #
+    # Debug deliberately keeps a console, for development.
     set_target_properties(
         BanjoTooieRecompiled
         PROPERTIES
             LINK_FLAGS_DEBUG "/SUBSYSTEM:CONSOLE"
-            LINK_FLAGS_RELEASE "/SUBSYSTEM:CONSOLE"
+            LINK_FLAGS_RELEASE "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
             LINK_FLAGS_RELWITHDEBINFO "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
             LINK_FLAGS_MINSIZEREL "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
     )
