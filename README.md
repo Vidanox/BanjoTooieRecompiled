@@ -93,6 +93,12 @@ python tools/setup_deps.py --check  # report state, change nothing
 It is idempotent and reports a conflict rather than forcing a patch that does
 not apply.
 
+⚠ **`git status` will always show the three patched submodules as modified.**
+That is expected and correct: the gitlink points at the pinned upstream commit
+while the working tree carries the patch as uncommitted changes. It also means
+`git submodule update` reverts the patches — run `tools/setup_deps.py` again
+afterwards. Nothing else in the repository is affected by this.
+
 ### A note on `RecompFrontend`
 
 `lib/RecompFrontend` is the menus, input handling and settings UI. It is
