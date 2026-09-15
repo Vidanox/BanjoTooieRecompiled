@@ -469,15 +469,31 @@ void initialize_launcher_menu(recompui::LauncherMenu* menu) {
     game_options->add_mods_option();
     game_options->add_exit_option();
 
-    // `Right` anchors the column to the bottom-right corner; centre it
-    // vertically instead so it runs down the right edge, and narrow it so the
-    // buttons read as a column rather than a band.
+    // `Right` anchors the column to the bottom-right corner of the menu
+    // container (right/bottom 24dp, which the container has already inset 24dp
+    // from the frame). Narrow it so the buttons read as a column rather than a
+    // band.
     game_options->set_width(30.0f, recompui::Unit::Percent);
-    game_options->unset_bottom();
-    game_options->set_top(50.0f, recompui::Unit::Percent);
-    game_options->set_translate_2D(0.0f, -50.0f, recompui::Unit::Percent);
 
     for (recompui::GameOption* option : game_options->get_options()) {
+        // BanjoRecomp's menu text: family, size and tracking all come from its
+        // launcher_animation.cpp (set_font_family("Suplexmentary Comic NC"),
+        // label set_font_size(56), set_letter_spacing(4)). The plates have an
+        // auto height, so they grow to fit rather than clipping the label.
+        option->set_font_family("Suplexmentary Comic NC");
+        if (recompui::Label* label = option->get_label()) {
+            // Size *and* line box. recompui's typography presets set
+            // `line_height = font_size` as a fixed dp value
+            // (ui_theme.cpp: create_typography_preset), so raising the font size
+            // alone leaves the line box at the preset's 36dp -- the glyphs grow
+            // but the element does not, and the plate stays exactly the height
+            // it was. BanjoRecomp sets only the size because its options carry
+            // 24dp of padding and a taller row to absorb it.
+            label->set_font_size(56.0f);
+            label->set_line_height(56.0f);
+            label->set_letter_spacing(4.0f);
+        }
+
         option->set_background_color(kOptionPlate);
         option->set_color(kOptionText);
         // The column is right-aligned, so centre the label inside its plate --
@@ -499,6 +515,7 @@ void initialize_launcher_menu(recompui::LauncherMenu* menu) {
         option->disabled_style.set_background_color(kOptionPlate);
         option->hover_disabled_style.set_background_color(kOptionPlate);
     }
+
 }
 
 int main(int argc, char** argv) {
@@ -566,8 +583,8 @@ int main(int argc, char** argv) {
     // recompui requires a primary font and the project stylesheet under
     // `assets/` (relative to the working directory on Windows).
     //
-    // Only the Lato family is registered here. `promptfont/promptfont.ttf` and
-    // `NotoEmoji-Regular.ttf` are loaded by recompui itself (see its
+    // Only the Lato family is registered as primary. `promptfont/promptfont.ttf`
+    // and `NotoEmoji-Regular.ttf` are loaded by recompui itself (see its
     // `UIState` font_faces list) -- registering them again is both redundant
     // and, for promptfont, a trap: the file lives in the `promptfont/`
     // subdirectory, so `register_extra_font("promptfont.ttf")` resolved to a
@@ -579,6 +596,11 @@ int main(int argc, char** argv) {
     recompui::register_extra_font("LatoLatin-Bold.ttf");
     recompui::register_extra_font("LatoLatin-Italic.ttf");
     recompui::register_extra_font("LatoLatin-BoldItalic.ttf");
+    // The launcher option font, matching BanjoRecomp's menu text (its
+    // launcher_animation.cpp sets the same family on every option). An extra
+    // font takes no family argument -- RmlUi registers it under the name inside
+    // the TTF, lowercased for matching, which here is "suplexmentary comic nc".
+    recompui::register_extra_font("Suplexmentary Comic NC.ttf");
 
     std::fprintf(stderr, "[tooie] step programconfig\n"); std::fflush(stderr);
 
