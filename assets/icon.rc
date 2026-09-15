@@ -1,0 +1,11 @@
+// Windows executable icon. Referenced from CMakeLists.txt on WIN32 only.
+//
+// The path is relative to this file, so `icon.ico` resolves next to it. The
+// .ico packs several sizes (16/32/48/64/128) so Windows picks the right one for
+// the title bar, taskbar and Explorer instead of downscaling one large image;
+// `icon.png` is the source it was generated from.
+//
+// On Windows the window needs no separate icon: an SDL window created without
+// SDL_SetWindowIcon inherits the executable's first icon resource for both the
+// title bar and the taskbar.
+1 ICON "icon.ico"

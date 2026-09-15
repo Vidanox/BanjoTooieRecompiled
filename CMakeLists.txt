@@ -176,6 +176,12 @@ if (WIN32)
     )
 
     target_link_libraries(BanjoTooieRecompiled PRIVATE SDL2 Winmm.lib)
+
+    # Executable icon. Compiled into the PE's resource section, which is what
+    # Explorer, the taskbar and the window's title bar read; no runtime code is
+    # involved, and an SDL window created without SDL_SetWindowIcon inherits it.
+    # See assets/icon.rc (and assets/icon.png for the source image).
+    target_sources(BanjoTooieRecompiled PRIVATE ${CMAKE_SOURCE_DIR}/assets/icon.rc)
 endif()
 
 if (APPLE)
