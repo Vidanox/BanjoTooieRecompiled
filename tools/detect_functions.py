@@ -66,16 +66,16 @@ def terminator_kind(word):
     return "fallthrough"
 
 
-def preceding_terminator(words, idx):
-    """What ends the function before `words[idx]` -- or that nothing does.
+def terminator_index(words, idx):
+    """Index of the word that decides `words[idx]`'s start verdict.
 
-    Walks back over alignment `nop`s and returns the `terminator_kind` of the
-    instruction the start test examines. A terminator means a function
-    demonstrably ends before `idx`; `'jal'`, `'branch'` or `'fallthrough'` mean
-    `idx` is inside a function.
+    The matching terminator when there is one, otherwise the first word the
+    test examines; None when it examines nothing. This is what a diagnostic
+    should print as evidence -- note it is *not* necessarily `words[idx-1]`,
+    which is normally the terminator's delay slot.
     """
     if idx <= 0:
-        return "fallthrough"
+        return None
     j = idx - 1
     # Functions are frequently padded to a 16-byte boundary, so the word before
     # a start is often an alignment `nop`; a fixed 2-word lookback would stop on
@@ -95,12 +95,22 @@ def preceding_terminator(words, idx):
         # legitimate boundary.
         if k == idx - 1:
             continue
-        kind = terminator_kind(words[k])
         if first is None:
-            first = kind
-        if kind in _TERMINATORS:
-            return kind
-    return first or "fallthrough"
+            first = k
+        if terminator_kind(words[k]) in _TERMINATORS:
+            return k
+    return first
+
+
+def preceding_terminator(words, idx):
+    """What ends the function before `words[idx]` -- or that nothing does.
+
+    Returns the `terminator_kind` of `terminator_index(words, idx)`. A
+    terminator means a function demonstrably ends before `idx`; `'jal'`,
+    `'branch'` or `'fallthrough'` mean `idx` is inside a function.
+    """
+    k = terminator_index(words, idx)
+    return terminator_kind(words[k]) if k is not None else "fallthrough"
 
 
 def is_plausible_function_start(words, idx):

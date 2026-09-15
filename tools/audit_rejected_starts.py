@@ -21,7 +21,7 @@ import rabbitizer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from detect_functions import (core_section_for, core_section_words,
-                             preceding_terminator)
+                             preceding_terminator, terminator_index)
 
 ROOT = os.path.dirname(HERE)
 ROM = os.path.join(ROOT, "build", "decompressed.us.z64")
@@ -96,9 +96,15 @@ def main(log='build/verify7.log'):
             words = core_section_words(data, rom, size)
             idx = (v - base) // 4
             ins = rabbitizer.Instruction(words[idx], vram=v)
-            pins = rabbitizer.Instruction(words[idx - 1], vram=v - 4)
-            print('         0x%08X %-12s prev=%-28s cur=%s'
-                  % (v, _SEG_NAMES.get(rom, '?'), pins.disassemble(None, 0),
+            ti = terminator_index(words, idx)
+            if ti is None:
+                print('         0x%08X %-12s term=<none> cur=%s'
+                      % (v, _SEG_NAMES.get(rom, '?'),
+                         ins.disassemble(None, 0)))
+                continue
+            term = rabbitizer.Instruction(words[ti], vram=base + 4 * ti)
+            print('         0x%08X %-12s term=%-28s cur=%s'
+                  % (v, _SEG_NAMES.get(rom, '?'), term.disassemble(None, 0),
                      ins.disassemble(None, 0)))
 
 
