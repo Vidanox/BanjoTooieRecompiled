@@ -1,0 +1,538 @@
+diff --git a/src/gbi/rt64_gbi_extended.cpp b/src/gbi/rt64_gbi_extended.cpp
+index 20c0d4d..b054be1 100644
+--- a/src/gbi/rt64_gbi_extended.cpp
++++ b/src/gbi/rt64_gbi_extended.cpp
+@@ -4,8 +4,21 @@
+ 
+ #include "rt64_gbi_extended.h"
+ 
++#include <atomic>
++
+ #include "../include/rt64_extended_gbi.h"
+ 
++// TEMPORARY diagnostic (Banjo-Tooie port): what RT64 actually decoded from the
++// transform-group metadata the game emits. The failure mode this exists to
++// catch is silent -- hooks that emit into a display list RT64 does not parse
++// behave exactly like hooks that work -- so the game side reads these to tell
++// "the hooks ran" apart from "RT64 saw them".
++extern "C" {
++std::atomic<uint32_t> g_bt_rt64_decoded_enables{0};
++std::atomic<uint32_t> g_bt_rt64_decoded_groups{0};
++std::atomic<uint32_t> g_bt_rt64_decoded_pops{0};
++}
++
+ namespace RT64 {
+     namespace GBI_EXTENDED {
+         static GBIFunction Map[G_EX_MAX];
+@@ -148,6 +161,7 @@ namespace RT64 {
+             const uint8_t aspect = (*dl)->p0(20, 2);
+             const uint8_t lookat = (*dl)->p0(24, 2);
+             state->rsp->matrixId(id, push, proj, mode, pos, rot, scale, skew, persp, vpos, vtc, tile, lookat, order, aspect, editable, idIsAddress, editGroup);
++            g_bt_rt64_decoded_groups.fetch_add(1, std::memory_order_relaxed);
+         }
+ 
+         void matrixGroupV1(State *state, DisplayList **dl) {
+@@ -158,6 +172,7 @@ namespace RT64 {
+             const uint8_t popCount = (*dl)->p1(0, 8);
+             const uint8_t proj = (*dl)->p0(8, 1);
+             state->rsp->popMatrixId(popCount, proj);
++            g_bt_rt64_decoded_pops.fetch_add(1, std::memory_order_relaxed);
+         }
+ 
+         void forceUpscale2DV1(State *state, DisplayList **dl) {
+@@ -351,6 +366,7 @@ namespace RT64 {
+                     }
+                     
+                     state->enableExtendedGBI(extendedOpCode);
++                    g_bt_rt64_decoded_enables.fetch_add(1, std::memory_order_relaxed);
+                     break;
+                 }
+                 case RT64_HOOK_OP_DISABLE:
+diff --git a/src/hle/rt64_game_frame.cpp b/src/hle/rt64_game_frame.cpp
+index 87392d0..80703c0 100644
+--- a/src/hle/rt64_game_frame.cpp
++++ b/src/hle/rt64_game_frame.cpp
+@@ -9,6 +9,37 @@
+ 
+ #include "xxHash/xxh3.h"
+ 
++#include <atomic>
++
++// TEMPORARY diagnostic (Banjo-Tooie port). Counts the transforms matched by
++// explicit id in the player's id range, which is what tells "the game emitted
++// group metadata" apart from "RT64 decoded it and paired it with the previous
++// frame".
++extern "C" {
++std::atomic<uint32_t> g_bt_rt64_matched_transforms{0};
++// Counts projection pairs RT64 refused to interpolate because the two frames'
++// projections at the same index carry different explicit ids. With the default
++// `G_EX_ID_AUTO` those pairs were blended unconditionally, so a non-zero count
++// is a wrong blend that no longer happens -- and a zero count with the ids
++// implemented would mean the ids are not reaching RT64.
++std::atomic<uint32_t> g_bt_rt64_projection_mismatches{0};
++// Counts the projection ids RT64 actually saw, bucketed by kind. The point is
++// to distinguish "the game emitted the tags" from "RT64 received them": an
++// append into a display list can return success and still be overwritten by the
++// game, which is exactly what happened on the first attempt at projection
++// tagging. A zero in the skybox bucket while the game reports sky tags means the
++// ids never arrived.
++std::atomic<uint32_t> g_bt_rt64_proj_id_auto{0};
++std::atomic<uint32_t> g_bt_rt64_proj_id_gameplay{0};
++std::atomic<uint32_t> g_bt_rt64_proj_id_sky{0};
++std::atomic<uint32_t> g_bt_rt64_proj_id_ortho{0};
++// Counts the skybox's own transforms that were matched against the previous
++// frame. The sky layers are drawn through the same shared model renderer as
++// every other model, so this is what tells "the sky got its identity and was
++// paired" apart from "the sky was decoded and then matched by heuristic".
++std::atomic<uint32_t> g_bt_rt64_matched_sky{0};
++}
++
+ namespace RT64 {
+     // GameFrame
+     
+@@ -310,6 +341,12 @@ namespace RT64 {
+                 }
+                 else {
+                     matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, curIt->second, prevIt->second, modifiedBuffers);
++                    if (curIt->first >= 0x10000000U) {
++                        g_bt_rt64_matched_transforms.fetch_add(1, std::memory_order_relaxed);
++                    }
++                    else if ((curIt->first >= 0x00F20000U) && (curIt->first < 0x00F30000U)) {
++                        g_bt_rt64_matched_sky.fetch_add(1, std::memory_order_relaxed);
++                    }
+                     curIt++;
+                     prevIt++;
+                 }
+@@ -460,6 +497,14 @@ namespace RT64 {
+                 const TransformGroup &curProjGroup = curWorkload.drawData.transformGroups[curProjGroupIndex];
+                 const TransformGroup &prevProjGroup = prevWorkload.drawData.transformGroups[prevProjGroupIndex];
+ 
++                switch (curProjGroup.matrixId) {
++                case 0x00001000U: g_bt_rt64_proj_id_gameplay.fetch_add(1, std::memory_order_relaxed); break;
++                case 0x00001001U: g_bt_rt64_proj_id_sky.fetch_add(1, std::memory_order_relaxed); break;
++                case 0x00001002U: g_bt_rt64_proj_id_ortho.fetch_add(1, std::memory_order_relaxed); break;
++                case G_EX_ID_AUTO: g_bt_rt64_proj_id_auto.fetch_add(1, std::memory_order_relaxed); break;
++                default: break;
++                }
++
+                 // Cameras usually look better with simple interpolation, so default decomposition to off.
+                 bool projectionDecompose = false;
+                 uint8_t projectionLinearComponent = G_EX_COMPONENT_INTERPOLATE;
+@@ -475,6 +520,9 @@ namespace RT64 {
+                     projectionSkewComponent = curProjGroup.skewInterpolation;
+                     projectionPerspectiveComponent = curProjGroup.perspectiveInterpolation;
+                     viewProjMap.mapped = (curProjGroup.matrixId == prevProjGroup.matrixId);
++                    if (!viewProjMap.mapped) {
++                        g_bt_rt64_projection_mismatches.fetch_add(1, std::memory_order_relaxed);
++                    }
+                 }
+                 else {
+                     viewProjMap.mapped = (curProjGroup.matrixId == G_EX_ID_AUTO);
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 9fae0d4..ff85358 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -16,6 +16,9 @@
+ #include "rt64_descriptor_sets.h"
+ #include "rt64_render_worker.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++
+ // TODO: Move to shared.
+ 
+ namespace interop {
+@@ -50,6 +53,28 @@ namespace interop {
+ };
+ 
+ namespace RT64 {
++    // TEMPORARY diagnostic (Banjo-Tooie port). RT64 takes the widescreen decision
++    // twice: the projection processor widens the projection's field of view, and
++    // this file decides whether the viewport is stretched instead. The two must
++    // agree per projection, or that projection renders at a different horizontal
++    // scale than the rest of the frame -- which is how Tooie's skybox ends up not
++    // covering the widened view. The helpers below are defined in
++    // rt64_projection_processor.cpp; the counters are file-local.
++    int traceProjMode();
++    bool traceProjEnabled();
++    extern uint32_t traceProjFrame;
++
++    namespace {
++        uint32_t fbDivergencePrints = 0;
++        uint32_t fbFrameIndex = 0xFFFFFFFFU;
++        bool fbFrameHaveRef = false;
++        uint32_t fbRefTi = 0;
++        float fbRefNet = 0.0f;
++        float fbRefFov = 1.0f;
++        bool fbRefWide = false;
++        bool fbRefAdjust = true;
++    }
++
+     // Helper functions.
+     
+     RenderRect convertFixedRect(FixedRect rect, hlslpp::float2 resScale, int32_t fbWidth, float aspectRatioScale, float extOriginPercentage, int32_t horizontalMisalignment, uint16_t leftOrigin, uint16_t rightOrigin) {
+@@ -1484,6 +1509,11 @@ namespace RT64 {
+             float projInvRatioScale = 1.0f / aspectRatioScale;
+             const int16_t *viewportClipRatios = &drawData.viewportClipRatios[proj.transformsIndex * 4];
+             const uint16_t viewportOrigin = drawData.viewportOrigins[proj.transformsIndex];
++            bool traceUseWideViewport = false; // TEMPORARY diagnostic
++            bool traceCoversWholeWidth = false;
++            bool traceHorizontalRatio = false;
++            bool traceHaveViewportRect = false;
++            float traceVpLeft = 0.0f, traceVpRight = 0.0f;
+             if (proj.usesViewport()) {
+                 // The call's scissor spans the whole width of the framebuffer pair scissor. Custom origin must not be in use to be able to use the stretched viewport.
+                 const auto &viewport = drawData.rspViewports[proj.transformsIndex];
+@@ -1491,6 +1521,13 @@ namespace RT64 {
+                 bool coversWholeWidth = !intersectionRect.isEmpty() && (intersectionRect.ulx <= fbPair.scissorRect.ulx) && (intersectionRect.lrx >= fbPair.scissorRect.lrx);
+                 bool horizontalRatio = !intersectionRect.isEmpty() && (intersectionRect.width(true, true) > intersectionRect.height(true, true));
+                 bool useWideViewport = (viewportOrigin == G_EX_ORIGIN_NONE) && coversWholeWidth && horizontalRatio;
++                traceUseWideViewport = useWideViewport; // TEMPORARY diagnostic
++                const FixedRect traceVpRect = viewport.rect(viewportClipRatios);
++                traceHaveViewportRect = true;
++                traceVpLeft = traceVpRect.left(true);
++                traceVpRight = traceVpRect.right(true);
++                traceCoversWholeWidth = coversWholeWidth;
++                traceHorizontalRatio = horizontalRatio;
+                 if (useWideViewport) {
+                     projInvRatioScale = 1.0f;
+                 }
+@@ -1506,6 +1543,74 @@ namespace RT64 {
+                 viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
+             }
+ 
++            // TEMPORARY diagnostic (Banjo-Tooie port). RT64 decides the widescreen
++            // behaviour in two independent places, and they can disagree: the
++            // projection processor widens a projection's field of view from the
++            // *configuration* scale, while this function decides whether the
++            // viewport is stretched from the *framebuffer pair's own* scissor ratio
++            // (adjustRatio). If two perspective projections in one frame end up at
++            // different effective horizontal scales, one of them is drawn at the
++            // wrong width -- and Tooie's skybox is a separate projection from the
++            // world, so that is what would make it stop covering the view.
++            // net = fovFactor * screenScale.x * (viewport width / framebuffer width).
++            // Only divergences are reported, so a clean run prints nothing here.
++            if (traceProjEnabled() && (proj.type == Projection::Type::Perspective) &&
++                (proj.transformsIndex < drawData.projTransforms.size()) && (proj.transformsIndex < drawData.modProjTransforms.size())) {
++                const interop::float4x4 &traceRawProj = drawData.projTransforms[proj.transformsIndex];
++                const interop::float4x4 &traceModProj = drawData.modProjTransforms[proj.transformsIndex];
++                const float traceFov = (traceRawProj[0][0] != 0.0f) ? (traceModProj[0][0] / traceRawProj[0][0]) : 1.0f;
++                const bool traceHasViewport = proj.usesViewport();
++                const float traceVpWidth = traceHasViewport ? (viewportClip.width / framebuffer.viewport.width) : 1.0f;
++                const float traceNet = traceFov * triangles.screenScale.x * traceVpWidth;
++
++                if (fbFrameIndex != traceProjFrame) {
++                    fbFrameIndex = traceProjFrame;
++                    fbFrameHaveRef = false;
++                }
++
++                if (!fbFrameHaveRef) {
++                    fbFrameHaveRef = true;
++                    fbRefTi = proj.transformsIndex;
++                    fbRefNet = traceNet;
++                    fbRefFov = traceFov;
++                    fbRefWide = traceUseWideViewport;
++                    fbRefAdjust = adjustRatio;
++                }
++                else if ((fbDivergencePrints < 200) && (fbRefNet > 0.05f) &&
++                         ((traceNet > fbRefNet * 1.02f) || (traceNet < fbRefNet * 0.98f) ||
++                          (traceUseWideViewport != fbRefWide) || (adjustRatio != fbRefAdjust))) {
++                    fbDivergencePrints++;
++                    std::fprintf(stderr,
++                        "[fbdiv] f=%u ti=%u net=%.4f fov=%.3f ss=%.3f inv=%.3f vpw=%.3f wide=%d covers=%d horiz=%d vp=%d vpRect=[%.1f,%.1f] origin=0x%04X scissor=[%d,%d] z=[%.4f,%.4f]\n"
++                        "[fbdiv] f=%u ref ti=%u net=%.4f fov=%.3f wide=%d adjust=%d fbScissor=[%d,%d] fbAdjust=%d scissorRatio=%.3f src=%.3f scale=%.3f\n",
++                        traceProjFrame, proj.transformsIndex, traceNet, traceFov, triangles.screenScale.x, projInvRatioScale, traceVpWidth,
++                        traceUseWideViewport ? 1 : 0, traceCoversWholeWidth ? 1 : 0, traceHorizontalRatio ? 1 : 0, traceHasViewport ? 1 : 0,
++                        traceVpLeft, traceVpRight, viewportOrigin, proj.scissorRect.ulx, proj.scissorRect.lrx,
++                        traceModProj[2][2], traceModProj[3][2],
++                        traceProjFrame, fbRefTi, fbRefNet, fbRefFov, fbRefWide ? 1 : 0, fbRefAdjust ? 1 : 0,
++                        fbPair.scissorRect.ulx, fbPair.scissorRect.lrx, adjustRatio ? 1 : 0, scissorRatio, p.aspectRatioSource, aspectRatioScale);
++                }
++            }
++
++            // TEMPORARY diagnostic (Banjo-Tooie port): a periodic sample of every
++            // projection's classification, including orthographic ones. z is the
++            // projection's depth row, which identifies it (Tooie's skybox is the
++            // one with z[1] near -5, the world camera's is much larger).
++            if (traceProjEnabled() && (traceProjMode() >= 2) && ((traceProjFrame % 300) == 0) &&
++                (proj.transformsIndex < drawData.modProjTransforms.size())) {
++                const interop::float4x4 &traceModProj = drawData.modProjTransforms[proj.transformsIndex];
++                const bool traceHasViewport = proj.usesViewport();
++                const float traceVpWidth = traceHasViewport ? (viewportClip.width / framebuffer.viewport.width) : 1.0f;
++                std::fprintf(stderr,
++                    "[fbproj] f=%u fbScissor=[%d,%d] adjust=%d scissorRatio=%.3f src=%.3f scale=%.3f | pr=%u ti=%u %s vp=%d origin=0x%04X wide=%d ss=%.3f inv=%.3f vpw=%.3f | scissor=[%d,%d] z=[%.4f,%.4f]\n",
++                    traceProjFrame, fbPair.scissorRect.ulx, fbPair.scissorRect.lrx,
++                    adjustRatio ? 1 : 0, scissorRatio, p.aspectRatioSource, aspectRatioScale,
++                    pr, proj.transformsIndex, (proj.type == Projection::Type::Perspective) ? "persp" : "ortho",
++                    traceHasViewport ? 1 : 0, viewportOrigin, traceUseWideViewport ? 1 : 0,
++                    triangles.screenScale.x, projInvRatioScale, traceVpWidth,
++                    proj.scissorRect.ulx, proj.scissorRect.lrx, traceModProj[2][2], traceModProj[3][2]);
++            }
++
+             for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
+                 const GameCall &call = proj.gameCalls[d];
+                 renderIndices.instanceIndex = call.callDesc.callIndex;
+diff --git a/src/render/rt64_projection_processor.cpp b/src/render/rt64_projection_processor.cpp
+index e842dcc..41110e5 100644
+--- a/src/render/rt64_projection_processor.cpp
++++ b/src/render/rt64_projection_processor.cpp
+@@ -7,13 +7,96 @@
+ #include "common/rt64_math.h"
+ #include "hle/rt64_workload_queue.h"
+ 
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++
++// TEMPORARY diagnostic (Banjo-Tooie port): how RT64 classified each projection
++// for the widescreen aspect adjustment, bucketed by kind. This is the decision
++// that decides whether a projection is widened, and it is taken per projection
++// from that projection's own scissor/viewport -- so a projection that draws with
++// a different viewport (Tooie's sky draw does) can classify differently from the
++// scene's main camera and end up with a different field of view.
++extern "C" {
++std::atomic<uint32_t> g_bt_rt64_proj_adjusted_sky{0};
++std::atomic<uint32_t> g_bt_rt64_proj_adjusted_other{0};
++std::atomic<uint32_t> g_bt_rt64_proj_skipped_sky{0};
++std::atomic<uint32_t> g_bt_rt64_proj_skipped_other{0};
++}
++
+ namespace RT64 {
++    // TEMPORARY diagnostic (Banjo-Tooie port). TOOIE_TRACE_PROJ=1 dumps, per
++    // projection per frame, the matrices RT64 renders with and how it derived
++    // them. RT64 replaces the game's merged matrix with mul(viewEstimate,
++    // projEstimate) whenever processProjections is on (any aspect-ratio or
++    // refresh-rate setting other than Original), so if the RSP's view/proj split
++    // does not reproduce the matrix the game loaded, the render silently differs
++    // from the game's own. Off by default; inert when unset.
++    int traceProjMode() {
++        static const int mode = [] {
++            const char *value = std::getenv("TOOIE_TRACE_PROJ");
++            return (value != nullptr) ? std::atoi(value) : 0;
++        }();
++        return mode;
++    }
++
++    bool traceProjEnabled() {
++        return traceProjMode() >= 1;
++    }
++
++    static void traceProjPrintMatrix(const char *label, const interop::float4x4 &m) {
++        std::fprintf(stderr,
++            "       %s [%10.4f %10.4f %10.4f %10.4f] [%10.4f %10.4f %10.4f %10.4f] [%10.4f %10.4f %10.4f %10.4f] [%10.4f %10.4f %10.4f %10.4f]\n",
++            label,
++            m[0][0], m[0][1], m[0][2], m[0][3],
++            m[1][0], m[1][1], m[1][2], m[1][3],
++            m[2][0], m[2][1], m[2][2], m[2][3],
++            m[3][0], m[3][1], m[3][2], m[3][3]);
++    }
++
++    uint32_t traceProjFrame = 0;
++    static uint32_t traceMatrixDumps = 0;
++
+     inline void adjustProjectionMatrix(interop::float4x4 &matrix, const float aspectRatioScale) {
+         matrix[0][0] *= aspectRatioScale;
+         matrix[1][0] *= aspectRatioScale;
+         matrix[2][0] *= aspectRatioScale;
+         matrix[3][0] *= aspectRatioScale;
+     }
++
++    // Tooie uses the standard infinite-far-plane form for some of its
++    // projections (in first person, in sustained stretches): m[2][2] == m[2][3]
++    // == -1.0, which makes the far plane genuinely infinite. nearPlaneFromProj /
++    // farPlaneFromProj cannot express that -- far becomes (m32 - m33) / 0, i.e.
++    // -inf, which their std::max clamp reports as 0.000 -- so the trace prints
++    // this flag and the raw depth row instead of relying on those two numbers.
++    static bool isInfiniteFarPlane(const interop::float4x4 &m) {
++        return m[2][2] == m[2][3];
++    }
++
++    static bool skyInfiniteEnabled() {
++        static const bool enabled = [] {
++            const char* value = std::getenv("BT_RT64_SKY_INFINITE");
++            return (value != nullptr) && ((value[0] == 'o') || (value[0] == '1'));
++        }();
++        return enabled;
++    }
++
++    // TEMPORARY diagnostic (Banjo-Tooie port). BT_RT64_SKY_INFINITE=on rewrites
++    // the skybox projection's depth row into the infinite-far-plane form Tooie
++    // uses in first person, keeping its near plane. That form is reachable in the
++    // attract loop (whose sky otherwise uses a modest finite far plane), so this
++    // makes the first-person projection state reproducible locally -- which is
++    // what is needed to test whether the projection's near/far is what breaks the
++    // sky, without a controller.
++    static void makeInfiniteFarPlane(interop::float4x4 &matrix) {
++        const float nearPlane = nearPlaneFromProj(matrix);
++        matrix[2][2] = -1.0f;
++        matrix[2][3] = -1.0f;
++        matrix[3][2] = -2.0f * nearPlane;
++        matrix[3][3] = 0.0f;
++    }
+     
+     // ProjectionProcessor
+ 
+@@ -28,6 +111,7 @@ namespace RT64 {
+     }
+ 
+     void ProjectionProcessor::process(const ProcessParams &p) {
++        traceProjFrame++; // TEMPORARY diagnostic
+         for (uint32_t w : p.curFrame->workloads) {
+             Workload &workload = p.workloadQueue->workloads[w];
+             DrawData &drawData = workload.drawData;
+@@ -69,6 +153,10 @@ namespace RT64 {
+             const interop::float4x4 *prevProjMatrix = nullptr;
+             const interop::float4x4 *prevViewMatrix = nullptr;
+             const RigidBody *rigidBody = nullptr;
++            // TEMPORARY diagnostics: what this projection was paired with.
++            bool traceMapped = false;
++            int32_t tracePrevPairedTi = -1;
++            uint32_t tracePrevPairedId = 0xFFFFFFFFU;
+             const GameFrameMap::WorkloadMap &workloadMap = p.curFrame->frameMap.workloads[sceneProj.workloadIndex];
+             if ((p.prevFrame != nullptr) && workloadMap.mapped && !workload.debuggerCamera.enabled) {
+                 const GameFrameMap::ViewProjectionMap &viewProjMap = workloadMap.viewProjections[proj.transformsIndex];
+@@ -77,6 +165,9 @@ namespace RT64 {
+                     prevViewMatrix = &prevWorkload.drawData.viewTransforms[viewProjMap.prevTransformIndex];
+                     prevProjMatrix = &prevWorkload.drawData.projTransforms[viewProjMap.prevTransformIndex];
+                     rigidBody = &viewProjMap.rigidBody;
++                    traceMapped = true;
++                    tracePrevPairedTi = int32_t(viewProjMap.prevTransformIndex);
++                    tracePrevPairedId = prevWorkload.drawData.transformGroups[prevWorkload.drawData.viewProjTransformGroups[viewProjMap.prevTransformIndex]].matrixId;
+                 }
+             }
+ 
+@@ -98,6 +189,16 @@ namespace RT64 {
+                 }
+             }
+  
++            const bool isSkyboxProjection = (curProjGroup.matrixId == 0x00001001U);
++            if (adjustAspectRatio) {
++                (isSkyboxProjection ? g_bt_rt64_proj_adjusted_sky : g_bt_rt64_proj_adjusted_other)
++                    .fetch_add(1, std::memory_order_relaxed);
++            }
++            else {
++                (isSkyboxProjection ? g_bt_rt64_proj_skipped_sky : g_bt_rt64_proj_skipped_other)
++                    .fetch_add(1, std::memory_order_relaxed);
++            }
++
+             float projRatioScale = adjustAspectRatio ? (1.0f / p.aspectRatioScale) : 1.0f;
+             interop::float4x4 &viewMatrix = drawData.modViewTransforms[proj.transformsIndex];
+             interop::float4x4 &projMatrix = drawData.modProjTransforms[proj.transformsIndex];
+@@ -114,8 +215,16 @@ namespace RT64 {
+ 
+             adjustProjectionMatrix(projMatrix, projRatioScale);
+ 
++            // TEMPORARY diagnostic: give the skybox the first-person
++            // infinite-far-plane projection so its behaviour can be reproduced
++            // from the attract loop.
++            if ((curProjGroup.matrixId == 0x00001001U) && skyInfiniteEnabled()) {
++                makeInfiniteFarPlane(projMatrix);
++            }
++
+             interop::float4x4 &prevViewTransform = drawData.prevViewTransforms[proj.transformsIndex];
+             interop::float4x4 &prevProjTransform = drawData.prevProjTransforms[proj.transformsIndex];
++            bool traceInterpolateProjection = false; // TEMPORARY diagnostic
+             if ((prevProjMatrix != nullptr) && (prevViewMatrix != nullptr) && (rigidBody != nullptr)) {
+                 const interop::float4x4 curViewTransform = viewMatrix;
+                 const interop::float4x4 curProjTransform = projMatrix;
+@@ -126,6 +235,7 @@ namespace RT64 {
+ 
+                 // We only interpolate the projection if the view matrix has been interpolated.
+                 const bool interpolateProjection = rigidBody->lerpTranslation || rigidBody->lerpRotation;
++                traceInterpolateProjection = interpolateProjection;
+                 if (interpolateProjection) {
+                     projMatrix = lerpMatrix(adjustedPrevProj, curProjTransform, p.curFrameWeight);
+                     prevProjTransform = lerpMatrix(adjustedPrevProj, curProjTransform, p.prevFrameWeight);
+@@ -144,6 +254,69 @@ namespace RT64 {
+ 
+             interop::float4x4 &prevViewProjTransform = drawData.prevViewProjTransforms[proj.transformsIndex];
+             prevViewProjTransform = hlslpp::mul(prevViewTransform, prevProjTransform);
++
++            // TEMPORARY diagnostic (Banjo-Tooie port): see traceProjEnabled above.
++            // splitErr0 is the RSP split's own round-trip error before any
++            // modification; splitErr1 is the same after the aspect adjustment and
++            // the interpolation, i.e. exactly how far the matrix RT64 renders
++            // with has moved from the one the game loaded.
++            if (traceProjEnabled()) {
++                const interop::float4x4 &rawView = drawData.viewTransforms[proj.transformsIndex];
++                const interop::float4x4 &rawProj = drawData.projTransforms[proj.transformsIndex];
++                const interop::float4x4 &rawViewProj = drawData.viewProjTransforms[proj.transformsIndex];
++                const interop::float4x4 &modView = drawData.modViewTransforms[proj.transformsIndex];
++                const interop::float4x4 &modProj = drawData.modProjTransforms[proj.transformsIndex];
++                const interop::float4x4 &modViewProj = drawData.modViewProjTransforms[proj.transformsIndex];
++                std::fprintf(stderr,
++                    "[proj] f=%u scene=%zu p=%zu ti=%u id=0x%08X %s adjust=%d scale=%.3f w=%.3f mapped=%d prevTi=%d prevId=0x%08X interp=%d\n",
++                    traceProjFrame, sceneIndex, i, proj.transformsIndex, curProjGroup.matrixId,
++                    (proj.type == Projection::Type::Perspective) ? "persp" : "ortho",
++                    adjustAspectRatio ? 1 : 0, projRatioScale, p.curFrameWeight,
++                    traceMapped ? 1 : 0, tracePrevPairedTi, tracePrevPairedId, traceInterpolateProjection ? 1 : 0);
++                std::fprintf(stderr,
++                    "       splitErr0=%.6f splitErr1=%.6f vpDelta=%.6f rawViewIdent=%d rawProjIdent=%d\n",
++                    matrixDifference(hlslpp::mul(rawView, rawProj), rawViewProj),
++                    matrixDifference(hlslpp::mul(modView, modProj), modViewProj),
++                    matrixDifference(modViewProj, rawViewProj),
++                    isMatrixIdentity(rawView) ? 1 : 0, isMatrixIdentity(rawProj) ? 1 : 0);
++                // `cam` is the camera position the game's own matrix was built
++                // for; `modCam` is the one RT64 will actually render with, and
++                // `camDelta` is the distance between them. For the skybox -- a dome
++                // anchored to the camera -- a non-zero camDelta moves the dome
++                // relative to the frame, which is what reveals the sky draw's own
++                // black fill at the edges.
++                const float camDelta = std::sqrt(
++                    (modView[3][0] - rawView[3][0]) * (modView[3][0] - rawView[3][0]) +
++                    (modView[3][1] - rawView[3][1]) * (modView[3][1] - rawView[3][1]) +
++                    (modView[3][2] - rawView[3][2]) * (modView[3][2] - rawView[3][2]));
++                std::fprintf(stderr,
++                    "       rawProj n=%.3f f=%.3f fov=%.3f infRaw=%d | modProj n=%.3f f=%.3f fov=%.3f infMod=%d | modZ=[%.4f %.4f %.4f %.4f] rawZ=[%.4f %.4f %.4f %.4f] | cam=[%.1f %.1f %.1f] modCam=[%.1f %.1f %.1f] camDelta=%.3f\n",
++                    nearPlaneFromProj(rawProj), farPlaneFromProj(rawProj), fovFromProj(rawProj),
++                    isInfiniteFarPlane(rawProj) ? 1 : 0,
++                    nearPlaneFromProj(modProj), farPlaneFromProj(modProj), fovFromProj(modProj),
++                    isInfiniteFarPlane(modProj) ? 1 : 0,
++                    modProj[2][0], modProj[2][1], modProj[2][2], modProj[2][3],
++                    rawProj[2][0], rawProj[2][1], rawProj[2][2], rawProj[2][3],
++                    rawView[3][0], rawView[3][1], rawView[3][2],
++                    modView[3][0], modView[3][1], modView[3][2], camDelta);
++                // Dump the matrices whenever the projection's far plane is not a
++                // normal finite one -- the infinite-far form, or an interpolated
++                // far plane far outside anything the game itself asked for.
++                const bool traceInteresting = isInfiniteFarPlane(rawProj) || isInfiniteFarPlane(modProj) ||
++                    (farPlaneFromProj(modProj) > 100000.0f);
++                if (traceInteresting && (traceMatrixDumps < 60)) {
++                    traceMatrixDumps++;
++                    std::fprintf(stderr, "       DEGENERATE f=%u scene=%zu p=%zu ti=%u id=0x%08X type=%s adjust=%d w=%.3f mapped=%d prevTi=%d prevId=0x%08X\n",
++                        traceProjFrame, sceneIndex, i, proj.transformsIndex, curProjGroup.matrixId,
++                        (proj.type == Projection::Type::Perspective) ? "persp" : "ortho",
++                        adjustAspectRatio ? 1 : 0, p.curFrameWeight, traceMapped ? 1 : 0, tracePrevPairedTi, tracePrevPairedId);
++                    traceProjPrintMatrix("rawViewProj", rawViewProj);
++                    traceProjPrintMatrix("rawView    ", rawView);
++                    traceProjPrintMatrix("rawProj    ", rawProj);
++                    traceProjPrintMatrix("modView    ", modView);
++                    traceProjPrintMatrix("modProj    ", modProj);
++                }
++            }
+         }
+     }
+ 
+diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+index e7895c3..6655c86 100644
+--- a/src/shaders/RasterPS.hlsl
++++ b/src/shaders/RasterPS.hlsl
+@@ -64,11 +64,12 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+     int2 pixelPosSeed = floor(vertexPosition.xy);
+     uint randomSeed = initRand(FrParams.frameCount, instanceIndex * pixelPosSeed.y * pixelPosSeed.x, 16); // TODO: Review seed.
+ 
+-    // The F3D family of microcodes has a bug where polygons are clipped earlier than expected despite the depth being computed
+-    // in a wider range of values. Not accounting for this can lead to geometry showing up that should otherwise be invisible.
+-    // This max range was determined by using a test ROM against an LLE implementation.
+-    // FIXME: This should be turned off for non-F3D microcodes.
+-    const bool simulateDepthClipF3D = true;
++    // TEMPORARY experiment (Banjo-Tooie port): the F3D depth-clip emulation is
++    // disabled so its effect on Tooie's skybox can be isolated. Tooie's sky is
++    // drawn with a tiny near plane and a huge (or infinite) far plane, which
++    // compresses depth so that the dome's fragments land past the emulated
++    // 1022/1024 limit and are discarded -- leaving the sky draw's own black fill.
++    const bool simulateDepthClipF3D = false;
+     const float MaxDepth = simulateDepthClipF3D && !renderFlagRect(rp.flags) && !zSourcePrim ? (1022.0f / 1024.0f) : 1.0f;
+     
+     // FIXME: This can be implemented by checking feature support for the API and embedding the depth bounds into the pipeline.

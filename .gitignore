@@ -1,8 +1,7 @@
-# Build output and generated code — reproducible, and the build dir alone is
-# ~1.3 GB. See "Version control" in AGENTS.md.
+# Build output. Reproducible from the committed sources, and the build
+# directory alone is ~1.3 GB.
 build/*
 build-cmake/
-RecompiledFuncs/
 *.log
 *.obj
 *.pdb
@@ -15,8 +14,14 @@ RecompiledFuncs/
 # though it lives under build/. See "Traps" in AGENTS.md.
 !build/force_keep*
 
-# A machine-specific symlink to the RecompFrontend checkout.
-lib/
+# RecompiledFuncs/ is deliberately NOT ignored. It is generated, but only by the
+# *patched* N64Recomp (see patches/), so it is not reproducible from a clean
+# clone without building that first. Committing it lets a user build the game
+# with just a compiler, and matches rsp/n_aspMain.cpp, which is committed for
+# the same reason. See README "What is committed".
+
+# lib/ holds the dependencies as git submodules (see .gitmodules), so it must
+# not be ignored.
 
 # Python bytecode from the tools.
 __pycache__/

@@ -36,10 +36,10 @@ from detect_functions import (core_section_for, core_section_words,
                               is_plausible_function_start)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.dirname(ROOT)
 KEEP = os.path.join(ROOT, "build", "force_keep.txt")
 EXE = os.path.join(ROOT, "build-cmake", "BanjoTooieRecompiled.exe")
-RECOMP = os.path.join(REPO, "N64Recomp", "build", "N64Recomp.exe")
+# The recompiler CLI lives in the lib/ submodule (see README "Dependencies").
+RECOMP = os.path.join(ROOT, "lib", "N64Recomp", "build", "N64Recomp.exe")
 ROM = os.path.join(ROOT, "build", "decompressed.us.z64")
 SYMS = os.path.join(ROOT, "build", "banjotooie.us.syms.toml")
 FUNCS_DIR = os.path.join(ROOT, "RecompiledFuncs")

@@ -1,0 +1,630 @@
+diff --git a/LiveRecomp/live_generator.cpp b/LiveRecomp/live_generator.cpp
+index 61e1ff5..696ed0d 100644
+--- a/LiveRecomp/live_generator.cpp
++++ b/LiveRecomp/live_generator.cpp
+@@ -1718,6 +1718,11 @@ void N64Recomp::LiveGenerator::emit_cop0_status_write(int reg) const {
+     sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P,32), SLJIT_IMM, sljit_sw(inputs.cop0_status_write));
+ }
+ 
++void N64Recomp::LiveGenerator::emit_cop0_count_read(int reg) const {
++    (void)reg;
++    // Nothing to do here: live recompilation has no host Count source wired up.
++}
++
+ void N64Recomp::LiveGenerator::emit_cop1_cs_read(int reg) const {
+     // Skip the read if the target is the zero register.
+     if (reg != 0) {
+diff --git a/build_n64recomp.bat b/build_n64recomp.bat
+new file mode 100644
+index 0000000..e86e928
+--- /dev/null
++++ b/build_n64recomp.bat
+@@ -0,0 +1,9 @@
++@echo off
++rem Rebuild the (locally patched) recompiler. Invoked from the N64Recomp root:
++rem   MSYS_NO_PATHCONV=1 cmd /c build_n64recomp.bat
++rem Exists because nested quoting through the shell tool mangles
++rem `cmd /c "...vcvars64.bat" >nul 2>&1 && ninja ...`.
++setlocal
++call "..\BanjoTooieRecomp\msvc_env_use.bat"
++ninja -C build N64Recomp.exe
++endlocal
+diff --git a/include/recomp.h b/include/recomp.h
+index 73f3e73..8379111 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -436,6 +436,9 @@ extern "C" {
+ 
+ void cop0_status_write(recomp_context* ctx, gpr value);
+ gpr cop0_status_read(recomp_context* ctx);
++// Count (cop0 register 9) is the VR4300 cycle counter. It has no host register
++// to read, so the recompiler emits a call and the runtime supplies the value.
++gpr cop0_count_read(recomp_context* ctx);
+ void switch_error(const char* func, uint32_t vram, uint32_t jtbl);
+ void do_break(uint32_t vram);
+ 
+diff --git a/include/recompiler/generator.h b/include/recompiler/generator.h
+index 145bcd0..d054ba0 100644
+--- a/include/recompiler/generator.h
++++ b/include/recompiler/generator.h
+@@ -53,6 +53,7 @@ namespace N64Recomp {
+         virtual void emit_check_nan(int fpr, bool is_double) const = 0;
+         virtual void emit_cop0_status_read(int reg) const = 0;
+         virtual void emit_cop0_status_write(int reg) const = 0;
++        virtual void emit_cop0_count_read(int reg) const = 0;
+         virtual void emit_cop1_cs_read(int reg) const = 0;
+         virtual void emit_cop1_cs_write(int reg) const = 0;
+         virtual void emit_muldiv(InstrId instr_id, int reg1, int reg2) const = 0;
+@@ -90,6 +91,7 @@ namespace N64Recomp {
+         void emit_check_nan(int fpr, bool is_double) const final;
+         void emit_cop0_status_read(int reg) const final;
+         void emit_cop0_status_write(int reg) const final;
++        void emit_cop0_count_read(int reg) const final;
+         void emit_cop1_cs_read(int reg) const final;
+         void emit_cop1_cs_write(int reg) const final;
+         void emit_muldiv(InstrId instr_id, int reg1, int reg2) const final;
+diff --git a/include/recompiler/live_recompiler.h b/include/recompiler/live_recompiler.h
+index d155b83..b878fa0 100644
+--- a/include/recompiler/live_recompiler.h
++++ b/include/recompiler/live_recompiler.h
+@@ -122,6 +122,7 @@ namespace N64Recomp {
+         void emit_check_nan(int fpr, bool is_double) const final;
+         void emit_cop0_status_read(int reg) const final;
+         void emit_cop0_status_write(int reg) const final;
++        void emit_cop0_count_read(int reg) const final;
+         void emit_cop1_cs_read(int reg) const final;
+         void emit_cop1_cs_write(int reg) const final;
+         void emit_muldiv(InstrId instr_id, int reg1, int reg2) const final;
+diff --git a/src/analysis.cpp b/src/analysis.cpp
+index 9eaaa30..871c3ab 100644
+--- a/src/analysis.cpp
++++ b/src/analysis.cpp
+@@ -57,7 +57,8 @@ using InstrId = rabbitizer::InstrId::UniqueId;
+ using RegId = rabbitizer::Registers::Cpu::GprO32;
+ 
+ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recomp::Function& func, N64Recomp::FunctionStats& stats,
+-    RegState reg_states[32], std::vector<RegState>& stack_states, bool is_got_addr_defined) {
++    RegState reg_states[32], std::vector<RegState>& stack_states, bool is_got_addr_defined,
++    const N64Recomp::Context& context, const N64Recomp::Section& section) {
+     // Temporary register state for tracking the register being operated on
+     RegState temp{};
+ 
+@@ -69,6 +70,29 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
+ 
+     uint16_t imm = instr.Get_immediate();
+ 
++    // Resolve a HI16/LO16 relocation at `vram` to the link address it refers to.
++    // Tooie stores overlay addresses unrelocated -- `lui $at, %hi(jtbl)` reads as
++    // `lui $at, 0` in the ROM -- so the analysis has to consult the reloc table
++    // to recover the real address. See the cpu_lui case.
++    auto reloc_target = [&context, &section](uint32_t vram) -> std::optional<uint32_t> {
++        for (const N64Recomp::Reloc& reloc : section.relocs) {
++            if (reloc.address != vram) {
++                continue;
++            }
++            if (reloc.type != N64Recomp::RelocType::R_MIPS_HI16 &&
++                reloc.type != N64Recomp::RelocType::R_MIPS_LO16) {
++                continue;
++            }
++            if (reloc.reference_symbol ||
++                reloc.target_section == N64Recomp::SectionAbsolute) {
++                return std::nullopt;
++            }
++            return context.sections[reloc.target_section].ram_addr +
++                reloc.target_section_offset;
++        }
++        return std::nullopt;
++    };
++
+     auto check_move = [&]() {
+         if (rs == 0) {
+             // rs is zero so copy rt to rd
+@@ -87,6 +111,19 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
+         // rt has been completely overwritten, so invalidate it
+         reg_states[rt].invalidate();
+         reg_states[rt].prev_lui = (int16_t)imm << 16;
++        // Overlay code keeps `lui` immediates unrelocated, so the ROM reads as
++        // `lui $at, 0` and the real target only exists in the reloc table. Use
++        // the relocation's link address for the high half; the low half still
++        // comes from the paired `lw`/`addiu` immediate.
++        //
++        // Without this a relocated jump table base computes as 0x7E0 instead of
++        // 0x808007E0, the table is read from the wrong ROM location, every entry
++        // fails the range check and the table is dropped -- leaving `jr $t7` to
++        // be emitted as a runtime function lookup, which aborts the game with
++        // "Failed to find function at 0x80193B8C" (glcutDll).
++        if (auto target = reloc_target(instr.getVram())) {
++            reg_states[rt].prev_lui = *target & 0xFFFF0000;
++        }
+         reg_states[rt].valid_lui = true;
+         break;
+     case InstrId::cpu_addiu:
+@@ -276,7 +313,7 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+     // Look for jump tables
+     // A linear search through the func won't be accurate due to not taking control flow into account, but it'll work for finding jtables
+     for (const auto& instr : instructions) {
+-        if (!analyze_instruction(instr, func, stats, reg_states, stack_states, got_ram_addr.has_value())) {
++        if (!analyze_instruction(instr, func, stats, reg_states, stack_states, got_ram_addr.has_value(), context, *section)) {
+             return false;
+         }
+     }
+@@ -289,7 +326,11 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+             JumpTable& cur_jtbl = stats.jump_tables[i];
+ 
+             if (cur_jtbl.got_offset.has_value()) {
+-                uint32_t got_word = byteswap(*reinterpret_cast<const uint32_t*>(&context.rom[got_rom_addr + cur_jtbl.got_offset.value()]));
++                uint32_t got_entry_rom_addr = got_rom_addr + cur_jtbl.got_offset.value();
++                if (got_entry_rom_addr + sizeof(uint32_t) > context.rom.size()) {
++                    continue;
++                }
++                uint32_t got_word = byteswap(*reinterpret_cast<const uint32_t*>(&context.rom[got_entry_rom_addr]));
+ 
+                 cur_jtbl.vram += (section->ram_addr + got_word);
+             }
+@@ -322,8 +363,33 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+             // Retrieve the current entry of the jump table
+             // TODO same as above
+             uint32_t rom_addr = vram + func.rom - func.vram;
++            // Guard against out-of-bounds reads. Indirect jumps that aren't
++            // actually jump tables (e.g. overlay dispatch via jalr/jr) can
++            // produce a vram that doesn't map back into the rom, which would
++            // otherwise cause an out-of-bounds access.
++            if (rom_addr + sizeof(uint32_t) > context.rom.size()) {
++                break;
++            }
+             uint32_t jtbl_word = byteswap(*reinterpret_cast<const uint32_t*>(&context.rom[rom_addr]));
+ 
++            // Tooie stores overlay jump table entries as offsets from the
++            // overlay's link base (0x80800000), not as absolute addresses: the
++            // game's loader relocates them at load time through the overlay's
++            // secondary reloc list, which is why they do not appear in the
++            // decomp's reloc file (ordinary overlay data tables do).
++            //
++            // Without this, every entry reads as a small offset (glcutDll's
++            // table holds 0x4C, 0x78, ...), fails the "is this inside the
++            // function" test below, and the whole table is dropped -- so the
++            // `jr` gets emitted as a runtime function lookup and the game aborts
++            // with "Failed to find function at 0x80193B8C". Guarded on
++            // `relocatable` so core sections, whose entries are already absolute,
++            // are untouched.
++            if (!cur_jtbl.got_offset.has_value() && section->relocatable
++                && jtbl_word < section->size) {
++                jtbl_word += section->ram_addr;
++            }
++
+             if (cur_jtbl.got_offset.has_value() && got_ram_addr.has_value()) {
+                 // Position independent jump tables have values that are offsets from the GOT,
+                 // convert those to absolute addresses
+@@ -340,8 +406,12 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+         }
+ 
+         if (cur_jtbl.entries.size() == 0) {
+-            fmt::print("Failed to determine size of jump table at 0x{:08X} for instruction at 0x{:08X}\n", cur_jtbl.vram, cur_jtbl.jr_vram);
+-            return false;
++            // This indirect jump wasn't actually a jump table (e.g. an overlay
++            // dispatch through jalr/jr). Drop it instead of failing so the
++            // recompiler can emit a runtime function-pointer lookup for it.
++            stats.jump_tables.erase(stats.jump_tables.begin() + i);
++            i--;
++            continue;
+         }
+ 
+         //fmt::print("Jtbl at 0x{:08X} (rom 0x{:08X}) with {} entries used by instr at 0x{:08X}\n", cur_jtbl.vram, cur_jtbl.rom, cur_jtbl.entries.size(), cur_jtbl.jr_vram);
+diff --git a/src/cgenerator.cpp b/src/cgenerator.cpp
+index 94f85c5..3fa1cc6 100644
+--- a/src/cgenerator.cpp
++++ b/src/cgenerator.cpp
+@@ -501,6 +501,10 @@ void N64Recomp::CGenerator::emit_cop0_status_write(int reg) const {
+     fmt::print(output_file, "cop0_status_write(ctx, {});", gpr_to_string(reg));
+ }
+ 
++void N64Recomp::CGenerator::emit_cop0_count_read(int reg) const {
++    fmt::print(output_file, "{} = cop0_count_read(ctx);\n", gpr_to_string(reg));
++}
++
+ void N64Recomp::CGenerator::emit_cop1_cs_read(int reg) const {
+     fmt::print(output_file, "{} = get_cop1_cs();\n", gpr_to_string(reg));
+ }
+diff --git a/src/main.cpp b/src/main.cpp
+index 669c4a1..a4ca2b4 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,10 +1,12 @@
+ #include <algorithm>
+ #include <cstdio>
+ #include <cstdlib>
++#include <fstream>
+ #include <unordered_set>
+ #include <span>
+ #include <filesystem>
+ #include <optional>
++#include <vector>
+ 
+ #include "rabbitizer.hpp"
+ #include "fmt/format.h"
+@@ -112,6 +114,45 @@ bool compare_files(const std::filesystem::path& file1_path, const std::filesyste
+     return std::equal(begin1, std::istreambuf_iterator<char>(), begin2); //Second argument is end-of-range iterator
+ }
+ 
++// N64Recomp rewrites every generated file on every run, including files whose
++// contents did not change. The build system only sees the new timestamp, so a
++// no-op recompile invalidates every generated translation unit and forces a
++// full rebuild -- 2343 objects, ~2 minutes for Banjo-Tooie. Verified: two
++// consecutive runs produce byte-identical output for all 2337 funcs_*.c files.
++//
++// `recompile_single_function` above already solves this for the
++// one-function-per-file mode; the multi-function and single-file modes need the
++// same treatment. Generated files are written to a temporary sibling and
++// swapped into place only when the contents differ, so an unchanged
++// regeneration leaves every timestamp alone and the build stays incremental.
++namespace {
++
++std::filesystem::path temp_output_path(const std::filesystem::path& final_path) {
++    std::filesystem::path temp_path = final_path;
++    temp_path.replace_extension(".tmp");
++    return temp_path;
++}
++
++// Move `temp_path` over `final_path`, or discard it when the contents match so
++// the destination keeps its old timestamp.
++void sync_output_file(const std::filesystem::path& temp_path,
++                      const std::filesystem::path& final_path) {
++    if (std::filesystem::exists(final_path) && compare_files(final_path, temp_path)) {
++        std::filesystem::remove(temp_path);
++        return;
++    }
++
++    std::error_code ec;
++    std::filesystem::rename(temp_path, final_path, ec);
++    if (ec) {
++        // rename() does not replace an existing file on every platform.
++        std::filesystem::remove(final_path, ec);
++        std::filesystem::rename(temp_path, final_path, ec);
++    }
++}
++
++}
++
+ bool recompile_single_function(const N64Recomp::Context& context, size_t func_index, const std::string& recomp_include, const std::filesystem::path& output_path, std::span<std::vector<uint32_t>> static_funcs_out) {
+     // Open the temporary output file
+     std::filesystem::path temp_path = output_path;
+@@ -493,7 +534,17 @@ int main(int argc, char** argv) {
+ 
+     std::filesystem::create_directories(config.output_func_path);
+ 
+-    std::ofstream func_header_file{ config.output_func_path / "funcs.h" };
++    // Clear temporaries left behind by a run that aborted mid-write, so a
++    // stale .tmp can never be mistaken for pending output.
++    for (const auto& entry : std::filesystem::directory_iterator(config.output_func_path)) {
++        if (entry.is_regular_file() && entry.path().extension() == ".tmp") {
++            std::error_code ec;
++            std::filesystem::remove(entry.path(), ec);
++        }
++    }
++
++    const std::filesystem::path func_header_path = config.output_func_path / "funcs.h";
++    std::ofstream func_header_file{ temp_output_path(func_header_path) };
+ 
+     fmt::print(func_header_file,
+         "{}\n"
+@@ -516,6 +567,15 @@ int main(int argc, char** argv) {
+         if (func_find == context.functions_by_name.end()) {
+             // Function doesn't exist, present an error to the user instead of silently failing to stub it out.
+             // This helps prevent typos in the config file or functions renamed between versions from causing issues.
++            fmt::print(stderr, "DEBUG functions_by_name size: {}\n", context.functions_by_name.size());
++            size_t count_disp = 0;
++            for (const auto& [k, v] : context.functions_by_name) {
++                if (k.find("ispatch") != std::string::npos) {
++                    fmt::print(stderr, "DEBUG key: [{}]\n", k);
++                    count_disp++;
++                }
++            }
++            fmt::print(stderr, "DEBUG dispatch-like keys: {}\n", count_disp);
+             exit_failure(fmt::format("Function {} is stubbed out in the config file but does not exist!", stubbed_func));
+         }
+         // Mark the function as stubbed.
+@@ -613,9 +673,16 @@ int main(int argc, char** argv) {
+     std::ofstream current_output_file;
+     size_t output_file_count = 0;
+     size_t cur_file_function_count = 0;
+-    
+-    auto open_new_output_file = [&config, &current_output_file, &output_file_count, &cur_file_function_count]() {
+-        current_output_file = std::ofstream{config.output_func_path / fmt::format("funcs_{}.c", output_file_count)};
++    // Final paths of every translation unit written this run, in order, so the
++    // temporaries can be swapped in once all streams are closed.
++    std::vector<std::filesystem::path> generated_func_files{};
++
++    auto open_new_output_file = [&config, &current_output_file, &output_file_count,
++                                 &cur_file_function_count, &generated_func_files]() {
++        const std::filesystem::path output_path =
++            config.output_func_path / fmt::format("funcs_{}.c", output_file_count);
++        generated_func_files.push_back(output_path);
++        current_output_file = std::ofstream{ temp_output_path(output_path) };
+         // Write the file header
+         fmt::print(current_output_file,
+             "{}\n"
+@@ -637,7 +704,10 @@ int main(int argc, char** argv) {
+     };
+ 
+     if (config.single_file_output) {
+-        current_output_file.open(config.output_func_path / config.elf_path.stem().replace_extension(".c"));
++        const std::filesystem::path single_output_path =
++            config.output_func_path / config.elf_path.stem().replace_extension(".c");
++        generated_func_files.push_back(single_output_path);
++        current_output_file.open(temp_output_path(single_output_path));
+         // Write the file header
+         fmt::print(current_output_file,
+             "{}\n"
+@@ -733,6 +803,12 @@ int main(int argc, char** argv) {
+ 
+     bool failed_strict_mode = false;
+ 
++    // Collect every function that fails to recompile instead of aborting on the
++    // first one. Aborting forces a full re-run of the whole recompilation per
++    // failure, which turns fixing N bad functions into N full passes. Reporting
++    // them all at once lets a driver script fix the entire batch in one go.
++    std::vector<std::string> failed_functions{};
++
+     //#pragma omp parallel for
+     for (size_t i = 0; i < context.functions.size(); i++) {
+         const auto& func = context.functions[i];
+@@ -783,7 +859,7 @@ int main(int argc, char** argv) {
+             }
+             if (result == false) {
+                 fmt::print(stderr, "Error recompiling {}\n", func.name);
+-                std::exit(EXIT_FAILURE);
++                failed_functions.push_back(func.name);
+             }
+         } else if (func.reimplemented) {
+             fmt::print(func_header_file,
+@@ -795,7 +871,11 @@ int main(int argc, char** argv) {
+         if (config.single_file_output || config.functions_per_output_file > 1) {
+             current_output_file.close();
+             std::error_code ec;
+-            std::filesystem::remove(config.output_func_path / config.elf_path.stem().replace_extension(".c"), ec);
++            // Discard the temporaries; the previously generated files stay as
++            // they are so a failed validation run does not damage the output.
++            for (const std::filesystem::path& output_path : generated_func_files) {
++                std::filesystem::remove(temp_output_path(output_path), ec);
++            }
+         }
+         exit_failure("Strict mode validation failed!\n");
+     }
+@@ -837,9 +917,18 @@ int main(int argc, char** argv) {
+             }
+ 
+             uint32_t rom_addr = static_cast<uint32_t>(static_func_addr - section.ram_addr + section.rom_addr);
++            // Guard against out-of-bounds rom reads for static functions whose
++            // computed range doesn't map back into the rom.
++            if (rom_addr >= context.rom.size()) {
++                continue;
++            }
++            size_t num_words = (cur_func_end - static_func_addr) / sizeof(uint32_t);
++            if (rom_addr + num_words * sizeof(uint32_t) > context.rom.size()) {
++                num_words = (context.rom.size() - rom_addr) / sizeof(uint32_t);
++            }
+             const uint32_t* func_rom_start = reinterpret_cast<const uint32_t*>(context.rom.data() + rom_addr);
+ 
+-            std::vector<uint32_t> insn_words((cur_func_end - static_func_addr) / sizeof(uint32_t));
++            std::vector<uint32_t> insn_words(num_words);
+             insn_words.assign(func_rom_start, func_rom_start + insn_words.size());
+ 
+             // Create the new function and add it to the context.
+@@ -887,13 +976,37 @@ int main(int argc, char** argv) {
+ 
+             if (result == false) {
+                 fmt::print(stderr, "Error recompiling {}\n", new_func.name);
+-                std::exit(EXIT_FAILURE);
++                failed_functions.push_back(new_func.name);
++            }
++        }
++    }
++
++    // Every translation unit has been written; close the last one and swap the
++    // changed temporaries into place. Unchanged files keep their timestamps, so
++    // the build system only recompiles what actually changed.
++    current_output_file.close();
++    for (const std::filesystem::path& output_path : generated_func_files) {
++        sync_output_file(temp_output_path(output_path), output_path);
++    }
++
++    // Drop translation units left over from a run that produced more files than
++    // this one, so the build does not keep compiling functions that are no
++    // longer in the symbol map.
++    if (!config.single_file_output) {
++        std::error_code ec;
++        for (size_t stale_index = output_file_count; ; stale_index++) {
++            const std::filesystem::path stale_path =
++                config.output_func_path / fmt::format("funcs_{}.c", stale_index);
++            if (!std::filesystem::exists(stale_path, ec)) {
++                break;
+             }
++            std::filesystem::remove(stale_path, ec);
+         }
+     }
+ 
+     if (config.has_entrypoint) {
+-        std::ofstream lookup_file{ config.output_func_path / "lookup.cpp" };
++        const std::filesystem::path lookup_path = config.output_func_path / "lookup.cpp";
++        std::ofstream lookup_file{ temp_output_path(lookup_path) };
+         
+         fmt::print(lookup_file,
+             "{}\n"
+@@ -909,10 +1022,14 @@ int main(int argc, char** argv) {
+             static_cast<uint32_t>(config.entrypoint),
+             config.elf_path.filename().replace_extension(".z64").string()
+         );
++
++        lookup_file.close();
++        sync_output_file(temp_output_path(lookup_path), lookup_path);
+     }
+ 
+     {
+-        std::ofstream overlay_file(config.output_func_path / "recomp_overlays.inl");
++        const std::filesystem::path overlay_path = config.output_func_path / "recomp_overlays.inl";
++        std::ofstream overlay_file(temp_output_path(overlay_path));
+         std::string section_load_table = "static SectionTableEntry section_table[] = {\n";
+ 
+         fmt::print(overlay_file, 
+@@ -995,6 +1112,10 @@ int main(int argc, char** argv) {
+                             else {
+                                 target_section_offset = reloc.target_section_offset;
+                             }
++                            // Guard against relocs whose address isn't within this section.
++                            if (reloc.address < section.ram_addr) {
++                                continue;
++                            }
+                             fmt::print(overlay_file, "    {{ .offset = 0x{:08X}, .target_section_offset = 0x{:08X}, .target_section = {}, .type = {} }}, \n",
+                                 reloc.address - section.ram_addr, target_section_offset, reloc.target_section, reloc_names[static_cast<size_t>(reloc.type)] );
+                         }
+@@ -1096,6 +1217,9 @@ int main(int argc, char** argv) {
+             fmt::print(overlay_file, "    {{ 0, NULL }}\n");
+             fmt::print(overlay_file, "}};\n");
+         }
++
++        overlay_file.close();
++        sync_output_file(temp_output_path(overlay_path), overlay_path);
+     }
+ 
+     fmt::print(func_header_file,
+@@ -1105,10 +1229,23 @@ int main(int argc, char** argv) {
+         "#endif\n"
+     );
+ 
++    func_header_file.close();
++    sync_output_file(temp_output_path(func_header_path), func_header_path);
++
+     if (!config.output_binary_path.empty()) {
+         std::ofstream output_binary{config.output_binary_path, std::ios::binary};
+         output_binary.write(reinterpret_cast<const char*>(context.rom.data()), context.rom.size());
+     }
+ 
++    // Report every function that failed to recompile, as a single
++    // machine-readable block so a driver can fix the whole batch in one pass.
++    if (!failed_functions.empty()) {
++        fmt::print(stderr, "\nRECOMP_FAILED_COUNT {}\n", failed_functions.size());
++        for (const std::string& name : failed_functions) {
++            fmt::print(stderr, "RECOMP_FAILED {}\n", name);
++        }
++        return EXIT_FAILURE;
++    }
++
+     return 0;
+ }
+diff --git a/src/recompilation.cpp b/src/recompilation.cpp
+index c228433..92f0957 100644
+--- a/src/recompilation.cpp
++++ b/src/recompilation.cpp
+@@ -34,6 +34,11 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
+     uint32_t section_vram_end = cur_section.ram_addr + cur_section.size;
+     bool in_current_section = target_func_vram >= section_vram_start && target_func_vram < section_vram_end;
+     bool exact_match_found = false;
++    // Tracks whether any candidate existed at this vram but was rejected purely
++    // for living in a different relocatable section. Games that swap several
++    // overlays into the same vram window (e.g. Banjo-Tooie) legitimately call
++    // between them, and which overlay is resident is only knowable at runtime.
++    bool relocatable_candidate_found = false;
+ 
+     // Use a thread local to prevent reallocation across runs and to allow multi-threading in the future.
+     thread_local std::vector<size_t> matched_funcs{};
+@@ -64,6 +69,9 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
+             if (!target_func_section.relocatable) {
+                 matched_funcs.push_back(target_func_index);
+             }
++            else {
++                relocatable_candidate_found = true;
++            }
+         }
+     }
+ 
+@@ -84,6 +92,13 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
+         // If there were no matches then JAL resolution has failed.
+         // A static can't be created as the target section is unknown.
+         if (matched_funcs.size() == 0) {
++            // Unless candidates did exist at this address but all live in other
++            // relocatable sections. That's a call between overlays that share a
++            // vram window, so which one is resident can only be determined at
++            // runtime; defer to a runtime lookup rather than failing.
++            if (relocatable_candidate_found) {
++                return JalResolutionResult::Ambiguous;
++            }
+             return JalResolutionResult::NoMatch;
+         }
+         // If there was an exact match, use it.
+@@ -300,6 +315,17 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+                 // If this instruction has a reloc and the target section is a normal section, use the section of the reloc when searching for a matching target function. 
+                 if (has_reloc && reloc_section < 65500) {
+                     target_section = reloc_section;
++                    // For an R_MIPS_26 reloc on a jal, the raw jal target field is
++                    // the *unrelocated* offset within the target section. Reconstruct
++                    // the relocated target vram from the reloc's target section and
++                    // offset so the target function can be resolved.
++                    if (reloc_type == N64Recomp::RelocType::R_MIPS_26 && reloc_section < context.sections.size()) {
++                        const auto& rs = context.sections[reloc_section];
++                        uint32_t relocated_vram = rs.ram_addr + reloc_target_section_offset;
++                        if (relocated_vram != 0) {
++                            target_func_vram = relocated_vram;
++                        }
++                    }
+                 }
+                 JalResolutionResult jal_result = resolve_jal(context, target_section, target_func_vram, matched_func_index);
+ 
+@@ -374,6 +400,21 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+                 return true;
+             }
+ 
++            // The target isn't a known function. If it still lands inside this
++            // function's section, treat it as a tail call so a static function
++            // gets created for the target. Emitting a goto here would reference
++            // a label that doesn't exist in the generated function, producing
++            // invalid C.
++            if (branch_target >= section.ram_addr &&
++                branch_target < section.ram_addr + section.size) {
++                if (!print_func_call_by_address(branch_target, true, true)) {
++                    return false;
++                }
++                print_indent();
++                generator.emit_return(context, func_index);
++                return true;
++            }
++
+             fmt::print(stderr, "[Warn] Function {} is branching outside of the function (to 0x{:08X})\n", func.name, branch_target);
+         }
+ 
+@@ -423,6 +464,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+                 print_indent();
+                 generator.emit_cop0_status_read(rt);
+                 break;
++            case Cop0Reg::COP0_Count:
++                print_indent();
++                generator.emit_cop0_count_read(rt);
++                break;
+             default:
+                 fmt::print(stderr, "Unhandled cop0 register in mfc0: {}\n", (int)reg);
+                 return false;
+@@ -519,8 +564,23 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+                 generator.emit_return(context, func_index);
+             }
+             else {
+-                fmt::print(stderr, "Unhandled branch in {} at 0x{:08X} to 0x{:08X}\n", func.name, instr_vram, branch_target);
+-                return false;
++                // The branch target isn't a known function, but if it lands inside
++                // this function's own section then it's a tail call into code that
++                // simply hasn't been identified as a function yet. Route it through
++                // the normal call path, which will create a static function for the
++                // target (JalResolutionResult::CreateStatic) instead of failing.
++                if (branch_target >= section.ram_addr &&
++                    branch_target < section.ram_addr + section.size) {
++                    if (!print_func_call_by_address(branch_target, true)) {
++                        return false;
++                    }
++                    print_indent();
++                    generator.emit_return(context, func_index);
++                }
++                else {
++                    fmt::print(stderr, "Unhandled branch in {} at 0x{:08X} to 0x{:08X}\n", func.name, instr_vram, branch_target);
++                    return false;
++                }
+             }
+         }
+         break;

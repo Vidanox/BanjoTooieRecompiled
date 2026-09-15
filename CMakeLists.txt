@@ -39,13 +39,15 @@ add_compile_definitions(
 )
 
 # --- Runtime dependencies ---------------------------------------------------
-# The runtime repos live beside this project at the repository root.
-set(N64MODERNRUNTIME_DIR ${CMAKE_SOURCE_DIR}/../N64ModernRuntime)
-set(RT64_DIR ${CMAKE_SOURCE_DIR}/../rt64)
+# The runtime repos are git submodules under lib/ (see .gitmodules and
+# README "Dependencies"). Three of them carry local patches that are *required*
+# for the game to boot and render; `tools/setup_deps.py` applies them from
+# patches/. Run it after cloning.
+set(N64MODERNRUNTIME_DIR ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime)
+set(RT64_DIR ${CMAKE_SOURCE_DIR}/lib/rt64)
 # RecompFrontend resolves `../../../../../patches/ui_funcs.h` relative to its own
 # sources, so it must be reached through the same `lib/RecompFrontend` layout
-# the upstream projects use. `lib/RecompFrontend` is a junction to the real
-# checkout beside this project.
+# the upstream projects use.
 set(RECOMPFRONTEND_DIR ${CMAKE_SOURCE_DIR}/lib/RecompFrontend)
 
 add_subdirectory(${RT64_DIR} ${CMAKE_BINARY_DIR}/rt64)
@@ -210,7 +212,7 @@ set(DXC_GS_OPTS "${DXC_COMMON_OPTS}" "-E" "GSMain" "-T gs_6_0")
 set(DXC_RT_OPTS "${DXC_COMMON_OPTS}" "-D" "RT_SHADER" "-T" "lib_6_3" "-fspv-target-env=vulkan1.1spirv1.4" "-fspv-extension=SPV_KHR_ray_tracing" "-fspv-extension=SPV_EXT_descriptor_indexing")
 
 if (${WIN32})
-    set(DXC "${PROJECT_SOURCE_DIR}/../rt64/src/contrib/dxc/bin/x64/dxc.exe")
+    set(DXC "${RT64_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
     add_compile_definitions(NOMINMAX)
 endif()
 

@@ -1,0 +1,298 @@
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 850689d..68f31a2 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -228,14 +228,17 @@ bool recomp::load_stored_rom(const std::u8string& game_id) {
+     }
+     
+     std::vector<uint8_t> stored_rom_data = read_file(config_path / find_it->second.stored_filename());
++    fprintf(stderr, "[probe] load_stored_rom read %zu bytes\n", stored_rom_data.size()); fflush(stderr);
+ 
+     if (!check_hash(stored_rom_data, find_it->second.rom_hash)) {
+         // The ROM no longer has the right hash, delete it.
++        fprintf(stderr, "[probe] load_stored_rom hash mismatch\n"); fflush(stderr);
+         std::filesystem::remove(config_path / find_it->second.stored_filename());
+         return false;
+     }
+ 
+     recomp::set_rom_contents(std::move(stored_rom_data));
++    fprintf(stderr, "[probe] load_stored_rom ok\n"); fflush(stderr);
+     return true;
+ }
+ 
+@@ -442,13 +445,13 @@ extern "C" void cop0_status_write(recomp_context* ctx, gpr value) {
+         changed &= ~(uint32_t)StatusReg::FR;
+     }
+ 
+-    // If any other bits were changed, assert false as they're not handled currently
+-    if (changed) {
+-        printf("Unhandled status register bits changed: 0x%08X\n", changed);
+-        assert(false);
+-        exit(EXIT_FAILURE);
+-    }
+-    
++    // Any other changed bits (interrupt mask, kernel/user mode, and the
++    // coprocessor-usable bits CU0-CU3) have no effect on recompiled execution,
++    // so they are stored without further handling rather than treated as fatal.
++    // Banjo-Tooie's boot code enables the FPU by setting CU1, which used to
++    // abort here.
++    (void)changed;
++
+     // Update the status register in the context
+     ctx->status_reg = new_sr;
+ }
+@@ -492,17 +495,22 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
+ }
+ 
+ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
++    fprintf(stderr, "[probe] init enter\n"); fflush(stderr);
+     // Initialize the overlays
+     recomp::overlays::init_overlays();
++    fprintf(stderr, "[probe] init_overlays done\n"); fflush(stderr);
+ 
+     // Load overlays in the first 1MB
+     load_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
++    fprintf(stderr, "[probe] load_overlays done\n"); fflush(stderr);
+ 
+     // Initial 1MB DMA (rom address 0x1000 = physical address 0x10001000)
+     recomp::do_rom_read(rdram, entrypoint, 0x10001000, 0x100000);
++    fprintf(stderr, "[probe] do_rom_read done\n"); fflush(stderr);
+ 
+     // Read in any extra data from patches
+     recomp::overlays::read_patch_data(rdram, (gpr)recomp::patch_rdram_start);
++    fprintf(stderr, "[probe] read_patch_data done\n"); fflush(stderr);
+ 
+     // Set up context floats
+     ctx->f_odd = &ctx->f0.u32h;
+@@ -521,6 +529,7 @@ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
+     MEM_W(osRomBase, 0) = 0xB0000000u; // standard rom base
+     MEM_W(osResetType, 0) = 0; // cold reset
+     MEM_W(osMemSize, 0) = 8 * 1024 * 1024; // 8MB
++    fprintf(stderr, "[probe] init done\n"); fflush(stderr);
+ }
+ 
+ std::u8string recomp::current_game_id() {
+@@ -536,6 +545,7 @@ std::string recomp::current_mod_game_id() {
+ }
+ 
+ void recomp::start_game(const std::u8string& game_id, const std::string& game_mode_id) {
++    fprintf(stderr, "[probe] start_game called\n"); fflush(stderr);
+     std::lock_guard<std::mutex> lock(current_game_mutex);
+     current_game_mode_id = game_mode_id;
+     current_game = game_id;
+@@ -699,7 +709,9 @@ void recomp::mods::set_mod_index(const std::string &mod_game_id, const std::stri
+ }
+ 
+ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
++    fprintf(stderr, "[probe] game wait_for_game_started enter (status=%d)\n", (int)game_status.load()); fflush(stderr);
+     game_status.wait(GameStatus::None);
++    fprintf(stderr, "[probe] game woke (status=%d)\n", (int)game_status.load()); fflush(stderr);
+ 
+     switch (game_status.load()) {
+         // TODO refactor this to allow a project to specify what entrypoint function to run for a give game.
+@@ -713,9 +725,11 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+                 const recomp::GameEntry& game_entry = find_it->second;
+ 
+                 init(rdram, context, game_entry.entrypoint_address);
++                fprintf(stderr, "[probe] after init, on_init_callback=%p\n", (void*)game_entry.on_init_callback); fflush(stderr);
+                 if (game_entry.on_init_callback) {
+                     game_entry.on_init_callback(rdram, context);
+                 }
++                fprintf(stderr, "[probe] after on_init_callback\n"); fflush(stderr);
+ 
+                 uint32_t mod_ram_used = 0;
+                 if (!game_entry.mod_game_id.empty()) {
+@@ -752,12 +766,14 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+ 
+                 save_type = game_entry.save_type;
+                 ultramodern::init_saving(rdram);
++                fprintf(stderr, "[probe] init_saving done, calling entrypoint\n"); fflush(stderr);
+ 
+                 try {
+                     game_entry.entrypoint(rdram, context);
+                 } catch (ultramodern::thread_terminated& terminated) {
+ 
+                 }
++                fprintf(stderr, "[probe] entrypoint returned\n"); fflush(stderr);
+             }
+             return true;
+ 
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 17d7a47..4ae9b3a 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -339,9 +339,12 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+ 
+     auto old_config = ultramodern::renderer::get_graphics_config();
+ 
++    fprintf(stderr, "[probe] gfx create_render_context enter\n"); fflush(stderr);
+     auto renderer_context = ultramodern::renderer::create_render_context(rdram, window_handle, ultramodern::renderer::get_graphics_config().developer_mode);
++    fprintf(stderr, "[probe] gfx create_render_context returned\n"); fflush(stderr);
+ 
+     renderer_chosen_api.store(renderer_context->get_chosen_api());
++    fprintf(stderr, "[probe] gfx get_chosen_api done\n"); fflush(stderr);
+     if (!renderer_context->valid()) {
+         renderer_setup_result.store(renderer_context->get_setup_result());
+         // Notify the caller thread that this thread is ready.
+@@ -354,9 +357,11 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+     }
+ 
+     ultramodern::rsp::init();
++    fprintf(stderr, "[probe] gfx rsp init done\n"); fflush(stderr);
+ 
+     // Notify the caller thread that this thread is ready.
+     thread_ready->signal();
++    fprintf(stderr, "[probe] gfx ready signalled\n"); fflush(stderr);
+ 
+     while (!exited) {
+         // Try to pull an action from the queue
+diff --git a/ultramodern/src/scheduling.cpp b/ultramodern/src/scheduling.cpp
+index a22f747..78ea025 100644
+--- a/ultramodern/src/scheduling.cpp
++++ b/ultramodern/src/scheduling.cpp
+@@ -1,7 +1,20 @@
+ #include "ultramodern/ultramodern.hpp"
+ 
++// Defined in threadqueue.cpp.
++bool thread_already_queued(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_);
++void report_double_queue(const char* what, RDRAM_ARG PTR(OSThread) t_);
++
+ void ultramodern::schedule_running_thread(RDRAM_ARG PTR(OSThread) t_) {
+     debug_printf("[Scheduling] Adding thread %d to the running queue\n", TO_PTR(OSThread, t_)->id);
++    // A thread that is already in the running queue is already scheduled to run,
++    // so scheduling it again is redundant -- and it is not harmless: the second
++    // insert links the thread to itself, which turns the queue into a cycle and
++    // makes every later walk spin forever. `do_send` unblocking a thread that is
++    // still linked here is the path that reaches it.
++    if (thread_already_queued(PASS_RDRAM running_queue, t_)) {
++        report_double_queue("redundant reschedule refused", PASS_RDRAM t_);
++        return;
++    }
+     thread_queue_insert(PASS_RDRAM running_queue, t_);
+     TO_PTR(OSThread, t_)->state = OSThreadState::QUEUED;
+ }
+diff --git a/ultramodern/src/threadqueue.cpp b/ultramodern/src/threadqueue.cpp
+index f9c0fa1..35bbcfe 100644
+--- a/ultramodern/src/threadqueue.cpp
++++ b/ultramodern/src/threadqueue.cpp
+@@ -11,9 +11,40 @@ static PTR(OSThread)* queue_to_ptr(RDRAM_ARG PTR(PTR(OSThread)) queue) {
+     return TO_PTR(PTR(OSThread), queue);
+ }
+ 
++// A thread must never be linked into a queue twice: the second insert makes its
++// `next` point at itself, and the priority walk below then never terminates --
++// which parks the whole game with every thread waiting. Both entry points refuse
++// the duplicate instead, and report it once, because reaching it means some
++// caller scheduled a thread that was already scheduled.
++bool thread_already_queued(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
++    PTR(PTR(OSThread))* cur = queue_to_ptr(PASS_RDRAM queue_);
++    for (int i = 0; i < 64 && *cur; i++) {
++        if (*cur == t_) {
++            return true;
++        }
++        cur = &TO_PTR(OSThread, *cur)->next;
++    }
++    return false;
++}
++
++void report_double_queue(const char* what, RDRAM_ARG PTR(OSThread) t_) {
++    static bool reported = false;
++    if (reported) {
++        return;
++    }
++    reported = true;
++    fprintf(stderr, "[Tooie] %s: thread %d was already queued\n",
++            what, TO_PTR(OSThread, t_)->id);
++    fflush(stderr);
++}
++
+ void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) toadd_) {
+     PTR(OSThread)* cur = queue_to_ptr(PASS_RDRAM queue_);
+     OSThread* toadd = TO_PTR(OSThread, toadd_); 
++    if (thread_already_queued(PASS_RDRAM queue_, toadd_)) {
++        report_double_queue("duplicate queue insert refused", PASS_RDRAM toadd_);
++        return;
++    }
+     debug_printf("[Thread Queue] Inserting thread %d into queue 0x%08X\n", toadd->id, (uintptr_t)queue_);
+     while (*cur && TO_PTR(OSThread, *cur)->priority > toadd->priority) {
+         cur = &TO_PTR(OSThread, *cur)->next;
+@@ -43,14 +74,28 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
+ bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
+     debug_printf("[Thread Queue] Removing thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
+ 
+-    PTR(PTR(OSThread)) cur = queue_;
+-    while (cur != NULLPTR) {
+-        PTR(OSThread)* cur_ptr = queue_to_ptr(PASS_RDRAM queue_);
+-        if (*cur_ptr == t_) {
+-            *cur_ptr = TO_PTR(OSThread, *cur_ptr)->next;
++    // Walk the list with a pointer to the link that points at the current node,
++    // so the node can be unlinked in place. The previous form re-derived the
++    // list head from `queue_` on every iteration instead of advancing with the
++    // walk, so it only ever tested the head: it returned false when the head was
++    // not the target and the list had a single element, and span forever when
++    // the head was not the target and the list had more than one. `osSetThreadPri`
++    // relies on this to re-sort a queued thread, so the failure mode there was a
++    // hang instead of a re-sort.
++    // A thread that is not queued has a null `queue`, and `queue_to_ptr` maps a
++    // null queue through the guest address space, so test it before dereferencing.
++    if (queue_ == NULLPTR) {
++        return false;
++    }
++
++    PTR(PTR(OSThread))* cur = queue_to_ptr(PASS_RDRAM queue_);
++    while (*cur != NULLPTR) {
++        if (*cur == t_) {
++            *cur = TO_PTR(OSThread, *cur)->next;
++            TO_PTR(OSThread, t_)->queue = NULLPTR;
+             return true;
+         }
+-        cur = TO_PTR(OSThread, *cur_ptr)->next;
++        cur = &TO_PTR(OSThread, *cur)->next;
+     }
+ 
+     return false;
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 6e3ed18..d47a386 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -315,8 +315,12 @@ extern "C" void osSetThreadPri(RDRAM_ARG PTR(OSThread) t_, OSPri pri) {
+         t->priority = pri;
+ 
+         if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
+-            ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+-            ultramodern::thread_queue_insert(PASS_RDRAM t->queue, t_);
++            // Capture the queue before removing: `thread_queue_remove` clears
++            // `t->queue` when it unlinks the thread, and the re-insert has to go
++            // back into the queue the thread came from.
++            PTR(PTR(OSThread)) queue = t->queue;
++            ultramodern::thread_queue_remove(PASS_RDRAM queue, t_);
++            ultramodern::thread_queue_insert(PASS_RDRAM queue, t_);
+         }
+ 
+         ultramodern::check_running_queue(PASS_RDRAM1);
+diff --git a/ultramodern/src/ultrainit.cpp b/ultramodern/src/ultrainit.cpp
+index af5132c..0eeadec 100644
+--- a/ultramodern/src/ultrainit.cpp
++++ b/ultramodern/src/ultrainit.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
+ 
+@@ -22,11 +23,16 @@ void ultramodern::set_callbacks(
+ }
+ 
+ void ultramodern::preinit(RDRAM_ARG ultramodern::renderer::WindowHandle window_handle) {
++    fprintf(stderr, "[probe] preinit enter\n"); fflush(stderr);
+     ultramodern::set_entrypoint_thread();
+     ultramodern::init_events(PASS_RDRAM window_handle);
++    fprintf(stderr, "[probe] preinit init_events done\n"); fflush(stderr);
+     ultramodern::init_timers(PASS_RDRAM1);
++    fprintf(stderr, "[probe] preinit init_timers done\n"); fflush(stderr);
+     ultramodern::init_audio();
++    fprintf(stderr, "[probe] preinit init_audio done\n"); fflush(stderr);
+     ultramodern::init_thread_cleanup();
++    fprintf(stderr, "[probe] preinit init_thread_cleanup done\n"); fflush(stderr);
+ }
+ 
+ extern "C" void osInitialize() {

@@ -21,8 +21,12 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from detect_functions import is_core_function_start
 
-N64RECOMP = r"C:\Users\bigups\Desktop\banjotooie\N64Recomp\build\N64Recomp.exe"
-ROOT = r"C:\Users\bigups\Desktop\banjotooie\BanjoTooieRecomp"
+# Everything is resolved relative to this file, so the repository works from any
+# checkout location. N64Recomp is the recompiler CLI, which lives in the lib/
+# submodule and is only needed to *regenerate* RecompiledFuncs/ -- the committed
+# output is enough to build the game (see README "Building").
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+N64RECOMP = os.path.join(ROOT, "lib", "N64Recomp", "build", "N64Recomp.exe")
 TOML = os.path.join(ROOT, "banjotooie.us.toml")
 GEN = os.path.join(ROOT, "tools", "gen_syms_toml.py")
 KEEP_FILE = os.path.join(ROOT, "build", "force_keep.txt")
