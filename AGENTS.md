@@ -838,7 +838,26 @@ this as the most likely source of a latent bug.
 
 ---
 
-## 12. Status, and what remains
+## 12. Build configuration, status, and what remains
+
+### Release ships as a GUI subsystem binary
+
+**Release is linked `/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup`**, so launching it
+creates no console window. Both flags are required together — the entry point is
+`main`, not `WinMain`. Debug deliberately keeps `/SUBSYSTEM:CONSOLE`.
+
+This does not lose the diagnostics:
+
+* `--show-console` calls `AllocConsole` and rebinds `stdin`/`stdout`/`stderr` to
+  it, so a release build can still be run with a console when needed.
+* output is captured normally when a parent supplies pipes, which is how every
+  tool in `tools/` runs it.
+
+⚠ If you add a build type or touch the link flags, check the PE subsystem field
+afterwards — it must be `2`, not `3`. `/SUBSYSTEM:CONSOLE` silently reintroduces
+the console window for every user who launches the game from Explorer.
+
+### What remains
 
 Working and verified: boot, attract loop, intro cutscene, gameplay, repeated scene
 transitions, audio, controller input, overlay load/unload/heap-shift, save/load
