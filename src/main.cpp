@@ -11,6 +11,8 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 
@@ -352,10 +354,87 @@ void initialize_config() {
     recompui::config::finalize();
 }
 
+// The launcher wallpaper.
+//
+// ⚠ recompui's render interface does NOT read image files. Its
+// `RenderInterface::LoadTexture` (recompui/src/renderer/ui_renderer.cpp) looks
+// the source up in `image_from_bytes_map`, which is only ever populated by
+// `queue_image_from_bytes_file` / `queue_image_from_bytes_rgba32`, and for an
+// unknown source it returns a **1x1 transparent texture and reports success**.
+// So any `<img src="assets/menu.png">` or `decorator: image( assets/menu.png )`
+// renders nothing at all, silently, with no log line. This is the same
+// mechanism the launcher thumbnail uses -- BanjoRecomp registers its icon bytes
+// under a synthetic name and passes that name as the src.
+//
+// Two consequences shape the code below:
+//   * the bytes must be read and registered by us before the texture is used;
+//   * the registered name starts with '?', which makes
+//     `RenderManager::LoadTexture` skip `JoinPath` and use the string verbatim.
+//     Without that the document path ("assets/") is prepended and the lookup
+//     fails.
+//
+// RmlUi's `<img>` has no `object-fit`, so it would stretch the image to the
+// element box. A decorated div with `cover` scales and crops instead, which
+// stays correct at any window aspect ratio.
+class Wallpaper : public recompui::Element {
+protected:
+    std::string_view get_type_name() override { return "Wallpaper"; }
+public:
+    Wallpaper(recompui::ResourceId rid, recompui::Element* parent,
+              std::string_view asset, std::string_view registered_name)
+        : Element(rid, parent, 0, "div", false) {
+        // Read the PNG and hand the bytes to the renderer. This must happen
+        // before the decorator is instanced; `LoadTexture` flushes the queue
+        // itself, so queueing here is enough.
+        const std::string asset_path =
+            recompui::file::get_asset_path(std::string(asset).c_str()).string();
+        std::ifstream file{asset_path, std::ios::binary};
+        if (file) {
+            std::vector<char> bytes{std::istreambuf_iterator<char>(file),
+                                    std::istreambuf_iterator<char>()};
+            if (!bytes.empty()) {
+                recompui::queue_image_from_bytes_file(
+                    std::string(registered_name), bytes);
+            }
+        }
+        else {
+            std::fprintf(stderr, "[tooie] wallpaper: cannot open %s\n",
+                         asset_path.c_str());
+            std::fflush(stderr);
+        }
+
+        // A div has no content, so its auto height is 0 and the decorator would
+        // have nothing to paint into. Fill the parent explicitly.
+        set_position(recompui::Position::Absolute);
+        set_top(0.0f);
+        set_left(0.0f);
+        set_width(100.0f, recompui::Unit::Percent);
+        set_height(100.0f, recompui::Unit::Percent);
+
+        // `set_attribute` is protected in recompui::Element and documented as
+        // "use ... in inherited classes ... unless it's necessary" -- this is
+        // that case: RmlUi has no typed setter for a decorator, and the inline
+        // `style` attribute is the only way to reach one from the port.
+        set_attribute("style", "decorator: image( " +
+                                   std::string(registered_name) + " cover );");
+    }
+};
+
+// Registered image name for the wallpaper; the '?' keeps `JoinPath` out of it.
+static constexpr const char* kWallpaperImage = "?/tooie/wallpaper";
+
 void initialize_launcher_menu(recompui::LauncherMenu* menu) {
     constexpr recompui::Color menu_background{0x24, 0x17, 0x0D, 0xFF};
     menu->set_background_color(menu_background);
     menu->set_font_family("LatoLatin");
+
+    // Behind the menu: `background_wrapper` is the launcher's first child, so
+    // everything created later paints over it. It is also the element
+    // `set_launcher_background_svg` fills, so this is the intended slot.
+    if (recompui::Element* background = menu->get_background_container()) {
+        recompui::get_current_context().create_element<Wallpaper>(
+            background, "menu.png", kWallpaperImage);
+    }
 
     const auto& game = supported_games.front();
     auto* game_options = menu->init_game_options_menu(
