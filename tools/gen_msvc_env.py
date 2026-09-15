@@ -25,8 +25,48 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 OUT = os.path.join(ROOT, "build", "msvc_env.bat")
 
-VCVARS = (r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
-          r"\VC\Auxiliary\Build\vcvars64.bat")
+# Known-good fallback for the layout this project was developed against.
+VCVARS_FALLBACK = (r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+                   r"\VC\Auxiliary\Build\vcvars64.bat")
+
+
+def find_vcvars() -> str:
+    """Locate `vcvars64.bat`, for any Visual Studio edition and install path.
+
+    The path is not fixed: a Build Tools install lands under
+    `Program Files (x86)\\...\\2022\\BuildTools`, but the Community,
+    Professional and Enterprise editions install under
+    `Program Files\\...\\2022\\<Edition>`, and the drive and version can differ.
+    Hardcoding one of those works only on the machine it was written on -- which
+    is why this failed on a CI runner, where Visual Studio is an Enterprise
+    install in the 64-bit Program Files.
+
+    `vswhere` ships with every VS 2017+ installer and knows all of them, so ask
+    it first and keep the historical path only as a last resort.
+    """
+    vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                           "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if os.path.exists(vswhere):
+        try:
+            proc = subprocess.run(
+                [vswhere, "-latest", "-products", "*",
+                 "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"],
+                capture_output=True, text=True, timeout=60)
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                candidate = os.path.join(line, "VC", "Auxiliary", "Build", "vcvars64.bat")
+                if os.path.exists(candidate):
+                    return candidate
+        except (OSError, subprocess.SubprocessError):
+            pass        # fall through to the known path
+
+    return VCVARS_FALLBACK
+
+
+VCVARS = find_vcvars()
 
 # Variables vcvars sets that are irrelevant to compiling: prompt decoration and
 # the saved pre-init PATH it uses to restore the caller's environment.
@@ -65,7 +105,12 @@ def capture() -> dict:
     whole environment is also exactly what `vcvars64.bat` itself does.
     """
     if not os.path.exists(VCVARS):
-        raise SystemExit(f"vcvars64.bat not found: {VCVARS}")
+        raise SystemExit(
+            "Could not find vcvars64.bat.\n"
+            "Install Visual Studio 2022 (any edition) with the "
+            "'Desktop development with C++' workload, or the standalone "
+            "Build Tools, then re-run this script.\n"
+            "  looked for: " + VCVARS)
 
     bat = os.path.join(ROOT, "build", "_capture_msvc_env.bat")
     with open(bat, "w", newline="\r\n") as f:

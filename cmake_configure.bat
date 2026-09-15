@@ -6,5 +6,8 @@ rem "undefined symbol: static_N_..." errors.
 rem   MSYS_NO_PATHCONV=1 cmd /c cmake_configure.bat
 setlocal
 call "%~dp0msvc_env_use.bat"
+if errorlevel 1 exit /b 1
 cmake -S . -B build-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+if errorlevel 1 exit /b 1
 endlocal
+exit /b 0

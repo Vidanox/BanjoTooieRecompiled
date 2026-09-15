@@ -1,0 +1,157 @@
+name: Build
+
+# Builds the port and uploads a runnable package. On a version tag it also
+# publishes a GitHub Release with the same package attached, which is how the
+# executable is "deployed" -- there is no server component, so a release asset
+# is the deliverable.
+#
+# The shipped package is not just the .exe: it needs the three DLLs the
+# POST_BUILD step copies next to it (SDL2 and DXC) and the assets/ directory the
+# launcher reads fonts, icons and the wallpaper from.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # required to create the Release on a tag
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out, with submodules
+        uses: actions/checkout@v4
+        with:
+          # Recursive: the runtime and rt64 pull in their own nested submodules
+          # (rabbitizer, fmt, ELFIO, plume, mupen64plus, ...), which the build
+          # needs. Roughly 640 MB of upstream source.
+          submodules: recursive
+
+      - name: Apply the dependency patches
+        # Three of the four submodules are patched, and the game does not boot,
+        # or renders a black skybox, without them. See README "Dependencies".
+        run: python tools/setup_deps.py
+
+      - name: Verify dependencies are in the required state
+        run: python tools/setup_deps.py --check
+
+      - name: Make sure clang-cl is available
+        # The project needs LLVM >= 19: MSVC 14.44's standard library rejects
+        # older clang with STL1000. The runner image ships LLVM, but it is not
+        # guaranteed to be on PATH.
+        shell: pwsh
+        run: |
+          function Get-ClangCl {
+            $c = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
+            if ($c) { return $c.Source }
+            foreach ($p in @("$env:ProgramFiles\LLVM\bin\clang-cl.exe",
+                             "${env:ProgramFiles(x86)}\LLVM\bin\clang-cl.exe")) {
+              if (Test-Path $p) { return $p }
+            }
+            return $null
+          }
+          $clang = Get-ClangCl
+          if (-not $clang) { throw "clang-cl.exe not found on this runner." }
+          $dir = Split-Path $clang -Parent
+          if ($dir -notin ($env:PATH -split ';')) { Add-Content $env:GITHUB_PATH $dir }
+          $v = & $clang --version | Select-Object -First 1
+          Write-Host "using $clang"
+          Write-Host $v
+          if ($v -notmatch 'version (\d+)') { throw "Could not parse clang-cl version: $v" }
+          if ([int]$Matches[1] -lt 19) { throw "LLVM 19+ required (MSVC 14.44 rejects older clang); found $v" }
+
+      - name: Configure
+        run: cmd /c cmake_configure.bat
+
+      - name: Build
+        run: cmd /c build_bt.bat
+
+      - name: Verify the executable
+        shell: pwsh
+        run: |
+          $exe = "build-cmake/BanjoTooieRecompiled.exe"
+          if (-not (Test-Path $exe)) { throw "build produced no executable" }
+
+          # PE subsystem must be 2 (WINDOWS/GUI). 3 (CONSOLE) makes Windows
+          # allocate a console, so every user who launches the game from
+          # Explorer gets a cmd window for the whole session.
+          $b = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $sub = [BitConverter]::ToUInt16($b, $pe + 24 + 68)
+          if ($sub -ne 2) { throw "PE subsystem is $sub, expected 2 (no console window)" }
+          Write-Host "PE subsystem = $sub (GUI, no console)"
+
+          # The icon must be in the resource section.
+          $nsec = [BitConverter]::ToUInt16($b, $pe + 6)
+          $opt = [BitConverter]::ToUInt16($b, $pe + 20)
+          $sec0 = $pe + 24 + $opt
+          $names = @()
+          for ($i = 0; $i -lt $nsec; $i++) {
+            $o = $sec0 + 40 * $i
+            $names += ([Text.Encoding]::ASCII.GetString($b, $o, 8)).Trim([char]0)
+          }
+          if ($names -notcontains ".rsrc") { throw "no .rsrc section: the executable icon is missing" }
+          Write-Host "sections: $($names -join ' ')"
+
+          foreach ($f in "build-cmake/SDL2.dll","build-cmake/dxcompiler.dll",
+                         "build-cmake/dxil.dll","build-cmake/assets/recomp.rcss") {
+            if (-not (Test-Path $f)) { throw "missing runtime file: $f" }
+          }
+          Write-Host "runtime dependencies present"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "package/BanjoTooieRecompiled"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          Copy-Item build-cmake/BanjoTooieRecompiled.exe $stage
+          Copy-Item build-cmake/SDL2.dll,
+                    build-cmake/dxcompiler.dll,
+                    build-cmake/dxil.dll $stage
+          Copy-Item -Recurse build-cmake/assets $stage/assets
+          Copy-Item README.md, COPYING, AGENTS.md $stage
+
+          Compress-Archive -Path "$stage/*" -DestinationPath package/BanjoTooieRecompiled-windows-x64.zip -Force
+          Get-ChildItem package | Format-Table Name, Length
+
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: BanjoTooieRecompiled-windows-x64
+          path: package/BanjoTooieRecompiled-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Publish the release
+        # A release asset is the deployment: the port has no server component,
+        # and it does not ship game assets, so users supply their own ROM.
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: package/BanjoTooieRecompiled-windows-x64.zip
+          generate_release_notes: true
+          body: |
+            Windows x64 build. Extract the archive and run
+            `BanjoTooieRecompiled.exe`.
+
+            **This does not include the game.** You need your own copy of
+            Banjo-Tooie (USA) and will be asked for it on first launch:
+
+            | | |
+            |---|---|
+            | Format | `.z64` (big-endian, unbyteswapped) |
+            | SHA-1 | `AF1A89E12B638B8D82CC4C085C8E01D4CBA03FB3` |
+            | Internal name | `BANJO TOOIE` |
+
+            Requires a GPU with Direct3D 12 (Shader Model 6) or Vulkan 1.2.
+            See `README.md` for details.
