@@ -19,57 +19,25 @@ This script rebuilds the file deterministically as the union of:
      that is decoded from real (non-overlay) code.
 
   2. Validated survivors of the previous file -- addresses that are NOT
-     harvest targets but still look like genuine function starts, i.e. the
-     preceding instruction (skipping alignment nops) is `jr $ra`, `j`, or `b`.
-     This recovers tail-call-only entry points without re-importing phantoms.
-
-Every candidate must additionally live inside a known code segment.
+     harvest targets but still look like genuine function starts. This
+     recovers tail-call-only entry points without re-importing phantoms. The
+     test is the generator's own (`detect_functions.is_core_function_start`),
+     so a survivor is an address `gen_syms_toml.py` will actually turn into a
+     function; a local copy of that test is how this tool and the generator
+     drifted apart before. It also enforces "inside a known code segment",
+     since a vram outside every core segment has no address to check.
 """
 import os
-import struct
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from detect_functions import is_core_function_start
+
 ROOT = os.path.dirname(HERE)
 ROM = os.path.join(ROOT, "build", "decompressed.us.z64")
 KEEP = os.path.join(ROOT, "build", "force_keep.txt")
-
-# (rom_lo, vram_lo, vram_hi)
-SEGS = [
-    (0x1000, 0x80000400, 0x800050E0 - 0x400),
-    (0x1E29B60, 0x80012030, 0x800815C0),
-    (0x1E5AEB0, 0x800815C0, 0x80200000),
-]
-
-
-def rom_for(vram):
-    for rom, lo, hi in SEGS:
-        if lo <= vram < hi:
-            return rom + (vram - lo)
-    return None
-
-
-def looks_like_start(data, vram):
-    """True if the word before `vram` (skipping nops) ends a function."""
-    r = rom_for(vram)
-    if r is None or r < 8:
-        return False
-    j = r - 4
-    while j > 0 and struct.unpack_from(">I", data, j)[0] == 0:
-        j -= 4
-    for back in range(0, 2):
-        k = j - 4 * back
-        if k < 0:
-            break
-        w = struct.unpack_from(">I", data, k)[0]
-        if w == 0x03E00008:          # jr $ra
-            return True
-        op = w >> 26
-        if op == 0x2 or w == 0x10000000:  # j / b
-            return True
-    return False
-
 
 def main():
     prev = set()
@@ -85,9 +53,7 @@ def main():
     data = open(ROM, "rb").read()
     recovered = set()
     for v in sorted(prev - harvested):
-        if rom_for(v) is None:
-            continue
-        if looks_like_start(data, v):
+        if is_core_function_start(data, v):
             recovered.add(v)
 
     final = sorted(harvested | recovered)

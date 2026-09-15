@@ -18,6 +18,9 @@ import subprocess
 import sys
 import os
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from detect_functions import is_core_function_start
+
 N64RECOMP = r"C:\Users\bigups\Desktop\banjotooie\N64Recomp\build\N64Recomp.exe"
 ROOT = r"C:\Users\bigups\Desktop\banjotooie\BanjoTooieRecomp"
 TOML = os.path.join(ROOT, "banjotooie.us.toml")
@@ -127,60 +130,6 @@ def _real_call_targets():
     return out
 
 
-# (rom_lo, vram_lo, vram_hi) for the statically-placed code segments.
-_SEGS = (
-    (0x1000, 0x80000400, 0x800050E0 - 0x400),
-    (0x1E29B60, 0x80012030, 0x800815C0),
-    (0x1E5AEB0, 0x800815C0, 0x80200000),
-)
-
-
-def _looks_like_function_start(vram):
-    """True if `vram` is preceded by a function terminator.
-
-    Some real functions are entered only through a relocated overlay call, so
-    no `jal` to them exists in any statically-decodable form. Rather than
-    rejecting those as phantoms, accept an address whose preceding instruction
-    (skipping alignment nops) is `jr $ra`, `j`, or `b` -- i.e. the previous
-    function demonstrably ended there.
-    """
-    import struct
-
-    rom = None
-    for seg_rom, lo, hi in _SEGS:
-        if lo <= vram < hi:
-            rom = seg_rom + (vram - lo)
-            break
-    if rom is None or rom < 8:
-        return False
-
-    data = _rom_bytes()
-    j = rom - 4
-    while j > 0 and struct.unpack_from(">I", data, j)[0] == 0:
-        j -= 4
-    for back in range(0, 2):
-        k = j - 4 * back
-        if k < 0:
-            break
-        # A branch/jump immediately before `vram` means `vram` is its delay
-        # slot, not a function start. Keep in sync with detect_functions.py.
-        if k == rom - 4:
-            continue
-        w = struct.unpack_from(">I", data, k)[0]
-        if w == 0x03E00008:  # jr $ra
-            return True
-        op = w >> 26
-        # `j`, or an unconditional `b` (= `beq $zero, $zero, offset`). The
-        # branch offset lives in the low 16 bits and must be masked off; the
-        # old `w == 0x10000000` test only matched offset 0, which is 5 of the
-        # 4852 unconditional branches in boot/core1/core2. Keep this in sync
-        # with the identical check in detect_functions.py.
-        is_b = op == 0x4 and ((w >> 21) & 0x1F) == 0 and ((w >> 16) & 0x1F) == 0
-        if op == 0x2 or is_b:
-            return True
-    return False
-
-
 def read_keep():
     if not os.path.exists(KEEP_FILE):
         return set()
@@ -254,8 +203,15 @@ def main():
         # Only force targets that some real instruction actually calls;
         # otherwise we re-import the overlay phantom targets forever.
         real = _real_call_targets()
+        # A target no real instruction calls is only worth forcing if a
+        # function demonstrably ends right before it -- some real functions are
+        # entered only through a relocated overlay call, so no statically
+        # decodable `jal` to them exists anywhere. That verdict is the
+        # generator's own test, so this pass and `gen_syms_toml.py` cannot
+        # disagree about what a function start is.
         phantom = {t for t in targets
-                   if t not in real and not _looks_like_function_start(t)}
+                   if t not in real
+                   and not is_core_function_start(_rom_bytes(), t)}
         targets -= phantom
         new_targets = targets - read_keep()
         if phantom and not new_targets:

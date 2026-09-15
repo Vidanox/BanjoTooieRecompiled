@@ -11,7 +11,7 @@ protocol"). It is deliberately conservative about what it adds:
   * the address must fall inside a core code section,
   * it must NOT already be inside a generated function (adding one there would
     split that function in half -- see the `force_keep` traps in AGENTS.md),
-  * the word before it must be a function terminator (`jr $ra` / `j` /
+  * the word before it must be a function terminator (`jr $reg` / `j` /
     unconditional `b`), skipping alignment nops, and must not itself be a
     branch (that would make the candidate the branch's delay slot).
 
@@ -28,12 +28,12 @@ file(GLOB), so new files are otherwise invisible and the link fails with
 """
 import os
 import re
-import struct
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from detect_functions import is_plausible_function_start
+from detect_functions import (core_section_for, core_section_words,
+                              is_plausible_function_start)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(ROOT)
@@ -43,13 +43,6 @@ RECOMP = os.path.join(REPO, "N64Recomp", "build", "N64Recomp.exe")
 ROM = os.path.join(ROOT, "build", "decompressed.us.z64")
 SYMS = os.path.join(ROOT, "build", "banjotooie.us.syms.toml")
 FUNCS_DIR = os.path.join(ROOT, "RecompiledFuncs")
-
-# Core code sections: (rom, vram, size). Mirrors the static segment layout.
-CORE_SECTIONS = [
-    (0x00001050, 0x80000450, 0x00004090),   # .boot
-    (0x01E29B60, 0x80012030, 0x00031350),   # .core1
-    (0x01E5AEB0, 0x800815C0, 0x000A5170),   # .core2
-]
 
 
 def run(cmd, cwd=ROOT, timeout=600):
@@ -83,13 +76,6 @@ def generated_core_funcs():
     return funcs
 
 
-def section_for(vram):
-    for rom, base, size in CORE_SECTIONS:
-        if base <= vram < base + size:
-            return rom, base, size
-    return None
-
-
 def validate(vram, rom_bytes, funcs):
     """Returns (ok, explanation).
 
@@ -97,7 +83,7 @@ def validate(vram, rom_bytes, funcs):
     address this accepts is an address `detect_functions` will actually turn
     into a function rather than silently drop.
     """
-    section = section_for(vram)
+    section = core_section_for(vram)
     if section is None:
         return False, "address is not inside any core code section"
     if vram % 4:
@@ -110,8 +96,7 @@ def validate(vram, rom_bytes, funcs):
                            % (start, vram - start))
 
     rom, base, size = section
-    words = [struct.unpack_from(">I", rom_bytes, rom + 4 * i)[0]
-             for i in range(size // 4)]
+    words = core_section_words(rom_bytes, rom, size)
     idx = (vram - base) // 4
     if not is_plausible_function_start(words, idx):
         prev = words[idx - 1] if idx else None

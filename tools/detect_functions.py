@@ -25,22 +25,57 @@ def be32(b, off):
     return struct.unpack_from(">I", b, off)[0]
 
 
-def is_plausible_function_start(words, idx):
-    """True if `words[idx]` looks like a function start rather than the middle
-    of a larger function.
+# The kinds that end a function's straight-line flow, i.e. the accept set of
+# `is_plausible_function_start`.
+_TERMINATORS = ("jr", "j", "b")
 
-    A real start is normally reached by control flow, so the word before it --
-    skipping alignment `nop`s and allowing one delay slot -- is a function
-    terminator (`jr $ra`, `j`, or an unconditional `b`). If instead the
-    preceding bytes are ordinary fall-through instructions, this candidate is
-    really the middle of a larger function, and forcing it would split that
-    function in half.
 
-    Shared by `detect_functions`, `autostub.py` and `keep_loop.py` so the
-    address a bring-up pass validates is exactly the one the generator accepts.
+def terminator_kind(word):
+    """Classify what a single instruction does to control flow.
+
+    `'jr'` / `'j'` / `'b'` end a function; the rest (`'jal'`, `'branch'`,
+    `'fallthrough'`) mean the following word is still inside a function. The
+    rejection kinds exist so a diagnostic can say *why* a start was refused.
+    """
+    # Any `jr $reg` ends a function's straight-line flow. `jr $ra` is the normal
+    # return, but Tooie's software-FPU trampolines return through a scratch
+    # register (`or $a3, $ra, $zero` ... `jr $a3`), and without this the
+    # function after one (0x80013A7C, reached from an FPU op table) is never
+    # recognised and its code is swallowed by the previous function.
+    if (word >> 26) == 0 and (word & 0x3F) == 8 and ((word >> 21) & 0x1F) != 0:
+        return "jr"
+    op = word >> 26
+    if op == 0x2:
+        return "j"
+    if op == 0x3:
+        return "jal"
+    if op == 0x1 and ((word >> 16) & 0x1F) in (0x10, 0x11):
+        return "jal"        # bltzal / bgezal are calls too
+    # An unconditional `b` is `beq $zero, $zero, offset`.
+    #
+    # This used to be tested as `word == 0x10000000`, which only matches a `b`
+    # whose branch offset happens to be 0. Of the 4852 unconditional branches in
+    # boot/core1/core2, exactly 5 have offset 0, so that test missed 99.9% of
+    # them and rejected every forced start that followed one. The offset is the
+    # low 16 bits and must be ignored; what identifies the instruction is opcode
+    # BEQ with both register fields == $zero.
+    if op == 0x4 and ((word >> 21) & 0x1F) == 0 and ((word >> 16) & 0x1F) == 0:
+        return "b"
+    if op in (0x1, 0x4, 0x5, 0x6, 0x7):
+        return "branch"
+    return "fallthrough"
+
+
+def preceding_terminator(words, idx):
+    """What ends the function before `words[idx]` -- or that nothing does.
+
+    Walks back over alignment `nop`s and returns the `terminator_kind` of the
+    instruction the start test examines. A terminator means a function
+    demonstrably ends before `idx`; `'jal'`, `'branch'` or `'fallthrough'` mean
+    `idx` is inside a function.
     """
     if idx <= 0:
-        return False
+        return "fallthrough"
     j = idx - 1
     # Functions are frequently padded to a 16-byte boundary, so the word before
     # a start is often an alignment `nop`; a fixed 2-word lookback would stop on
@@ -48,7 +83,8 @@ def is_plausible_function_start(words, idx):
     while j >= 0 and words[j] == 0:
         j -= 1
 
-    for back in range(0, 2):
+    first = None
+    for back in (0, 1):
         k = j - back
         if k < 0:
             break
@@ -59,27 +95,79 @@ def is_plausible_function_start(words, idx):
         # legitimate boundary.
         if k == idx - 1:
             continue
-        pw = words[k]
-        # Any `jr $reg` ends a function's straight-line flow. `jr $ra` is the
-        # normal return, but Tooie's software-FPU trampolines return through a
-        # scratch register (`or $a3, $ra, $zero` ... `jr $a3`), and without this
-        # the function after one (0x80013A7C, reached from an FPU op table) is
-        # never recognised and its code is swallowed by the previous function.
-        if (pw >> 26) == 0 and (pw & 0x3F) == 8 and ((pw >> 21) & 0x1F) != 0:
-            return True
-        op = pw >> 26
-        # `j`, or an unconditional `b` (= `beq $zero, $zero, offset`).
-        #
-        # This used to test `pw == 0x10000000`, which only matches a `b` whose
-        # branch offset happens to be 0. Of the 4852 unconditional branches in
-        # boot/core1/core2, exactly 5 have offset 0, so the test missed 99.9% of
-        # them and rejected every forced start that followed one. The offset is
-        # the low 16 bits and must be ignored; what identifies the instruction
-        # is opcode BEQ with both register fields == $zero.
-        is_b = op == 0x4 and ((pw >> 21) & 0x1F) == 0 and ((pw >> 16) & 0x1F) == 0
-        if op == 0x2 or is_b:
-            return True
-    return False
+        kind = terminator_kind(words[k])
+        if first is None:
+            first = kind
+        if kind in _TERMINATORS:
+            return kind
+    return first or "fallthrough"
+
+
+def is_plausible_function_start(words, idx):
+    """True if `words[idx]` looks like a function start rather than the middle
+    of a larger function.
+
+    True exactly when a terminator precedes it -- see `preceding_terminator`
+    for what counts and why. If the preceding bytes are ordinary fall-through
+    instructions instead, this candidate is really the middle of a larger
+    function, and forcing it would split that function in half.
+
+    Shared by `detect_functions`, `gen_syms_toml.py`, `keep_loop.py`,
+    `autostub.py`, `rebuild_force_keep.py` and `audit_rejected_starts.py`, so
+    the address a bring-up pass validates is exactly the one the generator
+    accepts. Keep it that way: a caller's local re-implementation drifts, and
+    each of the three historical bugs here (the `b` offset test, the delay-slot
+    guard, the `jr $reg` relaxation) was missing from one copy or another.
+    """
+    return preceding_terminator(words, idx) in _TERMINATORS
+
+
+# Statically-placed core code segments: (rom, vram, size). Mirrors the layout
+# `gen_syms_toml.py` derives from the splat yaml. `.entry` is folded into the
+# boot entry deliberately -- the first boot function's predecessor instruction
+# lives there, so a candidate at the very start of `.boot` must be able to look
+# back at it.
+CORE_SECTIONS = (
+    (0x00001000, 0x80000400, 0x0040E0),    # .entry + .boot (rom 0x1000..0x50E0)
+    (0x01E29B60, 0x80012030, 0x031350),    # .core1
+    (0x01E5AEB0, 0x800815C0, 0x0A5170),    # .core2
+)
+
+_words_cache = {}
+
+
+def core_section_for(vram):
+    """`(rom, vram, size)` of the core segment containing `vram`, or None."""
+    for rom, base, size in CORE_SECTIONS:
+        if base <= vram < base + size:
+            return rom, base, size
+    return None
+
+
+def core_section_words(rom_bytes, rom, size):
+    """The segment's words. Cached -- callers validate one address at a time."""
+    cached = _words_cache.get(rom)
+    if cached is None or cached[0] is not rom_bytes:
+        cached = (rom_bytes,
+                  [be32(rom_bytes, rom + 4 * i) for i in range(size // 4)])
+        _words_cache[rom] = cached
+    return cached[1]
+
+
+def is_core_function_start(rom_bytes, vram):
+    """`is_plausible_function_start` for a vram address in a core segment.
+
+    False for an address outside every core segment (the overlays are relocated
+    at load time, so a vram in their window is ambiguous) or not word-aligned.
+    """
+    if vram % 4:
+        return False
+    section = core_section_for(vram)
+    if section is None:
+        return False
+    rom, base, size = section
+    return is_plausible_function_start(
+        core_section_words(rom_bytes, rom, size), (vram - base) // 4)
 
 
 def branch_target_index(word, idx):
