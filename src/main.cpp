@@ -433,11 +433,20 @@ int main(int argc, char** argv) {
 
     // recompui requires a primary font and the project stylesheet under
     // `assets/` (relative to the working directory on Windows).
+    //
+    // Only the Lato family is registered here. `promptfont/promptfont.ttf` and
+    // `NotoEmoji-Regular.ttf` are loaded by recompui itself (see its
+    // `UIState` font_faces list) -- registering them again is both redundant
+    // and, for promptfont, a trap: the file lives in the `promptfont/`
+    // subdirectory, so `register_extra_font("promptfont.ttf")` resolved to a
+    // path that does not exist and logged
+    // `Failed to load font face from assets\promptfont.ttf, could not open
+    // file` on every launch while the correctly-pathed load right next to it
+    // succeeded.
     recompui::register_primary_font("LatoLatin-Regular.ttf", "LatoLatin");
     recompui::register_extra_font("LatoLatin-Bold.ttf");
     recompui::register_extra_font("LatoLatin-Italic.ttf");
     recompui::register_extra_font("LatoLatin-BoldItalic.ttf");
-    recompui::register_extra_font("promptfont.ttf");
 
     std::fprintf(stderr, "[tooie] step programconfig\n"); std::fflush(stderr);
 
