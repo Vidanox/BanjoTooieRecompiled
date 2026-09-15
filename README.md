@@ -186,8 +186,10 @@ ROM to have been selected once.
 
 ```
 BanjoTooieRecomp/
-├── CMakeLists.txt          build definition (clang-cl, Ninja)
+├── README.md               this file
+├── AGENTS.md               engineering notes: findings, decisions, traps
 ├── COPYING                 GPL-3.0
+├── CMakeLists.txt          build definition (clang-cl, Ninja)
 ├── banjotooie.us.toml      N64Recomp config: entrypoint, stubs, patches, hooks
 ├── n_aspMain.us.toml       RSPRecomp config for the audio microcode
 ├── build_bt.bat            ninja wrapper using a cached MSVC environment
@@ -203,12 +205,18 @@ BanjoTooieRecomp/
 ├── rsp/n_aspMain.cpp       recompiled RSP audio microcode
 ├── RecompiledFuncs/        the recompiled game code (83 files, committed)
 │
-├── assets/                 fonts, icons, stylesheet, launcher wallpaper
+├── assets/                 fonts, menu icons, wallpaper, stylesheet
+│   ├── icon.png / .ico / .rc   executable icon (see AGENTS.md)
+│   └── menu.png            launcher wallpaper
 ├── decomp/                 symbol/relocation tables from the WIP decompilation
 ├── patches/                the three dependency patches
 ├── lib/                    dependencies as git submodules
 └── tools/                  build and diagnostics scripts (see below)
 ```
+
+**Before changing anything, read [`AGENTS.md`](AGENTS.md).** It records why the
+code is shaped the way it is — the overlay subsystem, the boundary-detection
+rules, the three dependency patches, and the traps that cost real time to find.
 
 Useful `tools/` scripts:
 
