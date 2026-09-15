@@ -423,10 +423,31 @@ public:
 // Registered image name for the wallpaper; the '?' keeps `JoinPath` out of it.
 static constexpr const char* kWallpaperImage = "?/tooie/wallpaper";
 
+// Option plates.
+//
+// The wallpaper is bright and busy, and the theme's stock option look (dim grey
+// label on a transparent background, a light grey hover) all but disappears
+// against it. Each option instead carries its own dark, mostly-opaque plate, so
+// the labels stay legible over any part of the image.
+//
+// The active plate is a near-opaque dark blue (the theme's PrimaryD) rather
+// than the theme's brighter Primary: on a bright wallpaper a bright blue plate
+// measures only ~1.9:1 against the image behind it, i.e. *worse* than the idle
+// plate, which is backwards for a highlight. Dark blue keeps the luminance
+// separation (~4.9:1) while the hue shift still reads as "selected".
+static constexpr recompui::Color kOptionPlate{10, 12, 18, 205};
+static constexpr recompui::Color kOptionPlateActive{0, 38, 117, 240};
+static constexpr recompui::Color kOptionText{245, 245, 245, 255};
+
 void initialize_launcher_menu(recompui::LauncherMenu* menu) {
     constexpr recompui::Color menu_background{0x24, 0x17, 0x0D, 0xFF};
     menu->set_background_color(menu_background);
     menu->set_font_family("LatoLatin");
+
+    // The program name is drawn across the middle of the wallpaper, where it
+    // competes with the art for attention and adds nothing the window title does
+    // not already say. The option column is the whole menu.
+    menu->remove_default_title();
 
     // Behind the menu: `background_wrapper` is the launcher's first child, so
     // everything created later paints over it. It is also the element
@@ -439,13 +460,45 @@ void initialize_launcher_menu(recompui::LauncherMenu* menu) {
     const auto& game = supported_games.front();
     auto* game_options = menu->init_game_options_menu(
         game.game_id, game.mod_game_id, game.display_name,
-        game.thumbnail_bytes);
+        game.thumbnail_bytes,
+        recompui::GameOptionsMenuLayout::Right);
     game_options->add_start_game_or_load_rom_option("Select ROM",
                                                     "Start Game");
     game_options->add_setup_controls_option();
     game_options->add_settings_option();
     game_options->add_mods_option();
     game_options->add_exit_option();
+
+    // `Right` anchors the column to the bottom-right corner; centre it
+    // vertically instead so it runs down the right edge, and narrow it so the
+    // buttons read as a column rather than a band.
+    game_options->set_width(30.0f, recompui::Unit::Percent);
+    game_options->unset_bottom();
+    game_options->set_top(50.0f, recompui::Unit::Percent);
+    game_options->set_translate_2D(0.0f, -50.0f, recompui::Unit::Percent);
+
+    for (recompui::GameOption* option : game_options->get_options()) {
+        option->set_background_color(kOptionPlate);
+        option->set_color(kOptionText);
+        // The column is right-aligned, so centre the label inside its plate --
+        // right-aligning it would leave the left padding visibly larger.
+        option->set_justify_content(recompui::JustifyContent::Center);
+
+        option->hover_style.set_background_color(kOptionPlateActive);
+        option->hover_style.set_color(kOptionText);
+        // The focus colour is deliberately not set here: `GameOption`'s own
+        // Update handler reassigns `focus_style`'s colour every frame from
+        // `get_pulse_color` (an orange pulse between Secondary and SecondaryL),
+        // so anything set here is overwritten before it is ever seen. That pulse
+        // is legible on this plate (~7.7:1), so it is left alone.
+        option->focus_style.set_background_color(kOptionPlateActive);
+
+        // `GameOption`'s own disabled states reset the background to
+        // transparent, which would drop the plate entirely. Keep it -- the
+        // element's 0.5 opacity is what marks the option unavailable.
+        option->disabled_style.set_background_color(kOptionPlate);
+        option->hover_disabled_style.set_background_color(kOptionPlate);
+    }
 }
 
 int main(int argc, char** argv) {
