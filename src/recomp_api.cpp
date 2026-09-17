@@ -49,6 +49,19 @@ extern "C" {
 #include "ultramodern/config.hpp"
 #include "ultramodern/ultramodern.hpp"
 
+// --- Host backtraces, for the diagnostics below -----------------------------
+//
+// Several probes print the *host* call stack, because the generated C calls the
+// guest's callees as plain C functions: the host stack names the recompiled
+// functions that led to a call, where the guest `$ra` cannot (see the note in
+// `tooie_probe_slot_table`).
+//
+// The two platforms need different primitives, so the probes go through these
+// two helpers rather than calling either directly. On Windows the frames are
+// made image-relative with the linker's `__ImageBase`, so they symbolize
+// against `build-cmake/BanjoTooieRecompiled.map`; on ELF there is no image base
+// and the values are absolute, for `addr2line`.
+#if defined(_WIN32)
 // The linker-provided image base, used to turn a host return address into
 // an image RVA that `build-cmake/BanjoTooieRecompiled.map` can symbolize.
 extern "C" const char __ImageBase;
@@ -58,6 +71,24 @@ extern "C" __declspec(dllimport) unsigned short __stdcall
 RtlCaptureStackBackTrace(unsigned long frames_to_skip,
                          unsigned long frames_to_capture,
                          void** back_trace, unsigned long* back_trace_hash);
+
+inline unsigned short host_backtrace(void** frames, unsigned count) {
+    return RtlCaptureStackBackTrace(0, count, frames, nullptr);
+}
+
+inline uintptr_t host_image_base() {
+    return reinterpret_cast<uintptr_t>(&__ImageBase);
+}
+#else
+#include <execinfo.h>
+
+inline unsigned short host_backtrace(void** frames, unsigned count) {
+    const int captured = ::backtrace(frames, static_cast<int>(count));
+    return captured > 0 ? static_cast<unsigned short>(captured) : 0;
+}
+
+inline uintptr_t host_image_base() { return 0; }
+#endif
 
 namespace {
 
@@ -344,10 +375,9 @@ extern "C" void tooie_probe_task_dispatch(uint8_t* rdram, recomp_context* ctx,
                      seen[id], static_cast<uint32_t>(frame),
                      static_cast<uint32_t>(ctx->r4));
         if (id == 1U && calls[id] < 12U) {
-            const uintptr_t base = reinterpret_cast<uintptr_t>(&__ImageBase);
+            const uintptr_t base = host_image_base();
             void* frames[10]{};
-            const unsigned short n =
-                RtlCaptureStackBackTrace(0, 10, frames, nullptr);
+            const unsigned short n = host_backtrace(frames, 10);
             std::fprintf(stderr, "[task%u] host frames=%u:", id, n);
             for (unsigned i = 0; i < n; ++i) {
                 std::fprintf(stderr, " 0x%zX",
@@ -444,8 +474,8 @@ extern "C" void tooie_probe_kseg1_entry(uint8_t* rdram, recomp_context* ctx) {
         (unsigned long long)ctx->r6, (unsigned long long)ctx->r7,
         (unsigned long long)ctx->r29, (uint32_t)ctx->r31);
     void* frames[16]{};
-    const unsigned short n = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
-    const uintptr_t base = reinterpret_cast<uintptr_t>(&__ImageBase);
+    const unsigned short n = host_backtrace(frames, 16);
+    const uintptr_t base = host_image_base();
     std::fprintf(stderr, "[entry-probe] host frames=%u:", n);
     for (unsigned i = 0; i < n; ++i) {
         std::fprintf(stderr, " 0x%zX",
@@ -510,8 +540,8 @@ extern "C" void tooie_probe_actor_setup(uint8_t* rdram, recomp_context* ctx) {
         return;
     }
     void* frames[20]{};
-    const unsigned short n = RtlCaptureStackBackTrace(0, 20, frames, nullptr);
-    const uintptr_t base = reinterpret_cast<uintptr_t>(&__ImageBase);
+    const unsigned short n = host_backtrace(frames, 20);
+    const uintptr_t base = host_image_base();
     std::fprintf(stderr, "[setup] a0=0x%08X type=0x%04X host frames=%u:",
                  static_cast<uint32_t>(ctx->r4),
                  static_cast<uint32_t>(MEM_HU(0x76, ctx->r4)), n);
@@ -597,8 +627,8 @@ extern "C" void tooie_probe_slot_table(uint8_t* rdram, recomp_context* ctx) {
     // the guest stack, because it can be left unbalanced by a mis-detected
     // boundary (see AGENTS.md "core boundaries are heuristic").
     void* frames[24]{};
-    const unsigned short frame_count = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
-    const uintptr_t base = reinterpret_cast<uintptr_t>(&__ImageBase);
+    const unsigned short frame_count = host_backtrace(frames, 24);
+    const uintptr_t base = host_image_base();
     std::fprintf(stderr, "[slot] host frames=%u:", frame_count);
     for (unsigned i = 0; i < frame_count; ++i) {
         std::fprintf(stderr, " 0x%zX",
@@ -640,8 +670,7 @@ bool lookup_trace_enabled() {
 
 extern "C" recomp_func_t* tooie_lookup_func(int32_t vram) {
     if (lookup_trace_enabled()) {
-        static const uintptr_t image_base =
-            reinterpret_cast<uintptr_t>(&__ImageBase);
+        static const uintptr_t image_base = host_image_base();
         const uintptr_t caller =
             reinterpret_cast<uintptr_t>(__builtin_return_address(0));
         std::fprintf(stderr, "[lookup] 0x%08X from rva 0x%zX\n",
