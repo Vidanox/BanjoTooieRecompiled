@@ -195,6 +195,14 @@ def overlay_pointer_function_starts(rom_data, code_rom, code_size,
         for i in range(0, code_size, 4)
     ]
 
+    # Reloc offset -> the section offset the reloc's target names. A relocated
+    # `lw` is how a dispatch loads its table base, so this maps the load to the
+    # table. Built once: both `jump_table_arms` and `dispatches_resolved` need
+    # it, and the latter must agree with the former about what "resolved" means.
+    table_of = {}
+    for r in relocs:
+        table_of[r["offset"]] = r["target_vram"] - OVERLAY_VRAM
+
     def has_indirect_transfer(lo, hi):
         for i in range(lo, min(hi, len(words))):
             word = words[i]
@@ -253,9 +261,6 @@ def overlay_pointer_function_starts(rom_data, code_rom, code_size,
         (0x64..0xE8) are in the table at 0x470 and stay with their dispatcher.
         """
         arms = set()
-        table_of = {}
-        for r in relocs:
-            table_of[r["offset"]] = r["target_vram"] - OVERLAY_VRAM
         for i in range(lo, min(hi, len(words))):
             word = words[i]
             if (word >> 26) != 0 or (word & 0x3F) != 8:
@@ -343,6 +348,39 @@ def overlay_pointer_function_starts(rom_data, code_rom, code_size,
                     return i
         return None
 
+    def dispatches_resolved(lo, hi):
+        """True when every `jr $reg` in the host has a resolvable table base.
+
+        The positional test below (`past the host's first epilogue`) is a proxy
+        for "this pointer might be a case body whose table we could not
+        resolve". When every dispatch in the host resolves, the arm set is
+        complete, the proxy is unnecessary -- and it is wrong for a host whose
+        declared extent holds several whole functions, because then the "first
+        epilogue" it finds belongs to a function that is not the dispatcher.
+
+        `bskazhatch` is the case that made this necessary: `func_80800000_bskazhatch`
+        is declared 0..0x1E4, but the ROM holds a complete function ending at
+        0xD0, another at 0xA8..0xD4, and only then the dispatcher at 0x154. The
+        overlay's accessor at 0x470 returns `{ 0xA8, 0xD4, 0x220, 0x108 }`, so
+        the game calls `code_base + 0xA8` -- which the epilogue bound (0xD4)
+        rejected. The host's only dispatch resolves (its table is relocated and
+        guarded by `sltiu $at, $t6, 0x11`), so 0xA8 cannot be a case body.
+        """
+        for i in range(lo, min(hi, len(words))):
+            word = words[i]
+            if (word >> 26) != 0 or (word & 0x3F) != 8:
+                continue
+            if ((word >> 21) & 0x1F) in (0, 31):
+                continue
+            for j in range(i - 1, max(lo - 1, i - 9), -1):
+                if (words[j] >> 26) == 0x23:  # lw
+                    if table_of.get(j * 4) is None:
+                        return False
+                    break
+            else:
+                return False
+        return True
+
     def head_is_stub_runs(lo, ptr):
         """True when `[lo, ptr)` is whole `jr $ra` + delay-slot runs, no frame.
 
@@ -420,7 +458,7 @@ def overlay_pointer_function_starts(rom_data, code_rom, code_size,
                     and offset // 4 < indirect
                     and head_is_stub_runs(lo, offset // 4)
                 )
-                if not head_is_stub:
+                if not head_is_stub and not dispatches_resolved(lo, hi):
                     epilogue = first_epilogue_end(lo, hi)
                     if epilogue is None or offset // 4 < epilogue:
                         # `first_epilogue_end` assumes the host's arms all
