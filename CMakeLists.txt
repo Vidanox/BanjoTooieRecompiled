@@ -231,9 +231,39 @@ set(DXC_CS_OPTS "${DXC_COMMON_OPTS}" "-E" "CSMain" "-T cs_6_0")
 set(DXC_GS_OPTS "${DXC_COMMON_OPTS}" "-E" "GSMain" "-T gs_6_0")
 set(DXC_RT_OPTS "${DXC_COMMON_OPTS}" "-D" "RT_SHADER" "-T" "lib_6_3" "-fspv-target-env=vulkan1.1spirv1.4" "-fspv-extension=SPV_KHR_ray_tracing" "-fspv-extension=SPV_EXT_descriptor_indexing")
 
-if (${WIN32})
-    set(DXC "${RT64_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
+if (WIN32)
     add_compile_definitions(NOMINMAX)
+endif()
+
+# The shader compiler. It must be set for every platform, not just Windows:
+# RecompFrontend compiles its own shaders through rt64's `build_shader`, which
+# always emits SPIR-V (and additionally DXIL on Windows, MSL on macOS), so a
+# Linux build needs dxc-linux just as much as a Windows build needs dxc.exe.
+#
+# ⚠ This mirrors rt64's own selection deliberately. rt64 sets `DXC` in *its*
+# directory scope, and a CMake function resolves variables from its *call site*,
+# so RecompFrontend's calls do not see rt64's copy -- they see this one. Without
+# it the command line starts with the first option and the shell reports
+# `-spirv: not found`.
+if (WIN32)
+    set(DXC "${RT64_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
+elseif (APPLE)
+    # dxc-macos is a shell script that finds its libraries through DYLD_LIBRARY_PATH.
+    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        set(DXC "DYLD_LIBRARY_PATH=${RT64_DIR}/src/contrib/dxc/lib/x64" "${RT64_DIR}/src/contrib/dxc/bin/x64/dxc-macos")
+    else()
+        set(DXC "DYLD_LIBRARY_PATH=${RT64_DIR}/src/contrib/dxc/lib/arm64" "${RT64_DIR}/src/contrib/dxc/bin/arm64/dxc-macos")
+    endif()
+else()
+    # libdxcompiler.so lives beside the binary, not in the system library path,
+    # so the leading `VAR=value` element is load-bearing: CMake emits it
+    # unquoted, and the shell reads it as an environment assignment for the
+    # command that follows.
+    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        set(DXC "LD_LIBRARY_PATH=${RT64_DIR}/src/contrib/dxc/lib/x64" "${RT64_DIR}/src/contrib/dxc/bin/x64/dxc-linux")
+    else()
+        set(DXC "LD_LIBRARY_PATH=${RT64_DIR}/src/contrib/dxc/lib/arm64" "${RT64_DIR}/src/contrib/dxc/bin/arm64/dxc-linux")
+    endif()
 endif()
 
 # --- RecompFrontend ---------------------------------------------------------
