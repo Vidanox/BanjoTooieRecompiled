@@ -888,12 +888,63 @@ written; only the CI job was missing. What the Linux job needs, and why:
 |`libfreetype-dev`|RmlUi's font engine (`Freetype::Freetype`).|
 |`libgtk-3-dev`|nativefiledialog-extended's Linux backend, GTK3 unless `NFD_PORTAL` is set.|
 
-The Linux job verifies what it can without a GPU (the runner has none, so the
-game cannot be launched): the file is an x86-64 ELF, **every shared library
-resolves** under `ldd` — the check that catches a link which quietly picked up a
-build-time-only library — the runtime assets are present, and the version stamp
-is in the binary. It does **not** prove the game runs; that needs a real GPU and
-has not been done.
+⚠ **The first Linux run failed twice, and both causes were ours.** Neither was
+visible from Windows, which is the point of building both:
+
+1. **`-spirv: not found`.** `CMakeLists.txt` set `DXC` inside `if (${WIN32})`, so
+   on Linux it was empty and the generated command line began with its first
+   option. `RecompFrontend` compiles its own shaders through rt64's
+   `build_shader`, which always emits SPIR-V (plus DXIL on Windows, MSL on
+   macOS), so the shader compiler is needed on every platform. ⚠ **rt64 sets
+   `DXC` in its own directory scope, and a CMake function resolves variables
+   from its *call site*** — so RecompFrontend's calls never saw rt64's copy and
+   the top-level one is the one they use. It now mirrors rt64's selection:
+   `dxc.exe`, `dxc-macos` under `DYLD_LIBRARY_PATH`, `dxc-linux` under
+   `LD_LIBRARY_PATH`, per-architecture. The leading `VAR=value` element is
+   load-bearing on Linux (libdxcompiler.so is not on the system library path)
+   and CMake emits it unquoted, which the shell reads as an environment
+   assignment.
+2. **`undefined reference to RtlCaptureStackBackTrace` / `__ImageBase`.**
+   `recomp_api.cpp` called both unconditionally. Six diagnostics print the
+   *host* call stack (the generated C calls the guest's callees as plain C
+   functions, so the host stack names the recompiled callers where the guest
+   `$ra` cannot), and all six went through those symbols directly. They now go
+   through `host_backtrace()` / `host_image_base()` — the Windows pair on
+   Windows, `backtrace(3)` with no image base elsewhere. On Windows the
+   substitution is a pure rename, so the output is unchanged; on ELF the frames
+   are absolute for `addr2line` rather than map-relative RVAs. The rest of the
+   port's own sources were audited for the same problem and have none.
+
+**Verified by CI, not locally.** Run 6 (commit `ed44f6b`) went green end to end
+and published `v1.0.0-build.6` with both assets. The Linux job's checks all
+passed on the real artifact:
+
+```
+build-cmake/BanjoTooieRecompiled: ELF 64-bit LSB pie executable, x86-64, ... dynamically linked
+all shared libraries resolve
+runtime assets present
+version stamp present: 1.0.0-build.6
+```
+
+and both published archives were downloaded and inspected: the Windows zip has
+the 21.3 MB GUI-subsystem exe (subsystem 2), SDL2/dxcompiler/dxil, 23 assets and
+the docs; the Linux tar.gz has a 27.9 MB ELF64 x86-64 exe, `run.sh` and the exe
+both mode 0755, and 25 assets. Both binaries carry the version string.
+
+⚠ **What that does not establish: that the game runs on Linux.** The runner has
+no GPU, so the Linux job verifies that it links, that every shared library
+resolves, that the assets are present and that the version stamp is in the
+binary — nothing more. "Builds" and "runs" are different bars here as everywhere
+else in this file.
+
+⚠ **GTK3 is a runtime dependency of the Linux binary, and it is not obvious.**
+`ldd` on the artifact resolves `libgtk-3.so.0` (plus `libgdk-3`, `libpango`,
+`libcairo`, `libglib`, …) as a direct `DT_NEEDED`: nativefiledialog-extended's
+GTK backend is statically linked in, so its libraries are dependencies of the
+executable rather than something loaded on demand. The full set is
+`libSDL2-2.0.so.0`, `libfreetype.so.6`, `libgtk-3.so.0` and their transitive
+dependencies. Building with `-DNFD_PORTAL=ON` swaps GTK for the
+xdg-desktop-portal backend (`libdbus-1-3`) if that is preferable.
 
 ⚠ **The Linux package ships a `run.sh` for a reason.** `recompui`'s
 `file::get_program_path()` returns `""` on Linux as well as on Windows (the
@@ -936,14 +987,15 @@ trade-off.
 
 Open work, roughly in priority order:
 
-1. **Play the Linux build.** CI builds it and checks that it links, that every
-   shared library resolves, and that the version stamp is present — but the
-   runner has no GPU, so the game has never been launched on Linux. Nothing
-   platform-specific is known to be missing (`src/main.cpp` guards every Win32
-   call; `CMakeLists.txt` has had the Linux branch since it was written), but
-   "builds" and "runs" are different bars here as everywhere else in this file.
-   The first thing to check is that `run.sh` is what the tester uses, because
-   the assets are resolved against the working directory.
+1. **Play the Linux build.** CI builds it green and checks that it links, that
+   every shared library resolves, that the assets are present and that the
+   version stamp is in the binary — but the runner has no GPU, so the game has
+   never been launched on Linux. The two defects the first Linux run did expose
+   were both build-time and are fixed (see §11: the shader compiler was only
+   selected on Windows, and `recomp_api.cpp` used `RtlCaptureStackBackTrace`
+   unconditionally). The first thing to check is that `run.sh` is what the
+   tester uses, because the assets are resolved against the working directory,
+   and the second is `libgtk-3-0`, which `ldd` shows as a direct dependency.
 2. **Licensing on shipped assets.** `assets/Suplexmentary Comic NC.ttf` carries
    "All rights reserved" with no license, and the 11 icons in `assets/icons/`
    came from the same source. This blocks a public release.

@@ -391,9 +391,10 @@ jobs:
 
             On Linux, run it through `run.sh` rather than the executable
             directly: the launcher looks for its `assets/` directory relative to
-            the working directory. It needs a working Vulkan driver and the SDL2
-            runtime (`libsdl2-2.0-0`, present on essentially every desktop
-            install).
+            the working directory. It needs a working Vulkan driver and the
+            shared libraries it links against — SDL2, FreeType and GTK3, the
+            last for the **Select ROM** dialog. See `README.md` for the exact
+            list and the packages that provide them.
 
             Requires a GPU with Direct3D 12 (Shader Model 6) or Vulkan 1.2.
             See `README.md` for details.

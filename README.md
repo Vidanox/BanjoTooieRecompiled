@@ -230,10 +230,30 @@ ROM to have been selected once.
 **Windows:** nothing to install. The release archive carries the SDL2 and DXC
 DLLs the executable loads.
 
-**Linux:** the release archive carries no shared libraries, so the SDL2 runtime
-is required — `libsdl2-2.0-0` on Debian/Ubuntu, `sdl2-compat` or `SDL2` on Arch,
-`SDL2` on Fedora. It is present on essentially every desktop install. A working
-Vulkan driver is required as well, since RT64 has no OpenGL backend on Linux.
+**Linux:** the release archive carries no shared libraries, so it needs the
+libraries it links against. A working Vulkan driver is required too — RT64 has
+no OpenGL backend on Linux.
+
+|Library|Package (Debian/Ubuntu)|For|
+|---|---|---|
+|`libSDL2-2.0.so.0`|`libsdl2-2.0-0`|window, input, audio|
+|`libfreetype.so.6`|`libfreetype6`|font rasterisation|
+|`libgtk-3.so.0` and its dependencies (`libgdk-3`, `libpango`, `libcairo`, `libglib`, …)|`libgtk-3-0`|the **Select ROM** file dialog|
+
+The GTK3 requirement is worth calling out, because it is not obvious: the
+`Select ROM` dialog is nativefiledialog-extended's GTK backend, statically
+linked into the executable, so its libraries become direct dependencies of the
+binary rather than something loaded on demand. GTK3 is present on GNOME and most
+desktop installs; on a minimal or non-GTK system install `libgtk-3-0`, or build
+with `-DNFD_PORTAL=ON` to use the xdg-desktop-portal backend (which needs
+`libdbus-1-3` instead).
+
+Everything else in the list is either the C/C++ runtime or a dependency of those
+three. Check what is missing on your system with:
+
+```bash
+ldd BanjoTooieRecompiled | grep 'not found'
+```
 
 ## Releases
 
@@ -245,6 +265,10 @@ release step. Every release carries both packages, built from the same commit:
 |---|---|
 |`BanjoTooieRecompiled-windows-x64.zip`|the executable, the SDL2/DXC DLLs it loads, and `assets/`|
 |`BanjoTooieRecompiled-linux-x64.tar.gz`|the executable, `assets/`, and `run.sh`|
+
+Both are built from the same commit by the same workflow run, and published
+together. The Windows archive carries the DLLs it loads; the Linux one carries
+none, so see [Runtime dependencies](#runtime-dependencies) for what to install.
 
 |You push|You get|
 |---|---|
