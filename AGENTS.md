@@ -836,6 +836,74 @@ cleanly, but clean output is not proof of correct boundaries. ~929 functions /
 69 KB of core code were originally unnamed and recovered by gap-filling; treat
 this as the most likely source of a latent bug.
 
+### Releases are published by CI, and the version is stamped into the binary
+
+`.github/workflows/build.yml`. Every push to `main` publishes a release; a `v*`
+tag publishes one for that tag; pull requests only build and upload an artifact.
+Both Windows x64 and Linux x64 are built, and **one** `release` job publishes
+them together, so the two builds cannot race to create the release and a release
+is never published missing one of its assets.
+
+* **The tag** for a `main` push is `v<base>-build.<run number>`, where `<base>`
+  is the highest plain `vX.Y.Z` tag. It is read with `git ls-remote --tags`
+  rather than `git tag`, because the checkout is `fetch-depth: 1` — a shallow
+  clone has no tags in it at all. (The step is Python, run with `shell: python`,
+  so the same code runs on both runners.)
+* **The version is stamped into the executable**, so the launcher's label — and
+  any bug report that quotes it — identifies the build. The workflow sets
+  `BT_VERSION`; `CMakeLists.txt` turns it into the `BT_VERSION` define; and
+  `src/main.cpp` uses that as `version_string`. A local build has no such
+  variable and reports `1.0.0`.
+* ⚠ **The string must be `MAJOR.MINOR.PATCH`**, optionally with a `+suffix` or
+  `-suffix`. `recomp::Version::from_string` accepts nothing else and `main`
+  exits with `Invalid version string` on anything else, so the workflow rejects
+  a non-conforming tag *before* building rather than shipping an executable that
+  cannot start. `1.0.0-build.7` is fine — the suffix is explicitly allowed.
+  Verified end to end: a build stamped `1.0.0-build.99` boots past
+  `[tooie] step version` with no error.
+* ⚠ **It is an environment variable rather than a `-D` cache entry on purpose.**
+  A cache entry persists in `build-cmake/`, so it would keep stamping a stale
+  version into local builds long after the workflow that set it had gone.
+* The build steps **assert** the stamp is in the binary (a substring search over
+  the executable), because a release whose binary reports a different version
+  sends every bug report to the wrong build. That check is verified to fail when
+  the stamp is absent, not just to pass when it is present.
+* `cancel-in-progress` is deliberately **off**: a run that has started is about
+  to create a tag and a release, and killing it mid-flight can leave a tag with
+  no asset behind it. GitHub keeps only the newest pending run per group, so a
+  burst of pushes collapses instead of queueing.
+* Tags the workflow creates with its own `GITHUB_TOKEN` do not trigger further
+  workflow runs, so the auto-tag cannot loop back into the `tags: ['v*']`
+  trigger.
+
+**Linux build.** The port's own code is platform-neutral — `src/main.cpp` guards
+every Win32 call behind `#ifdef _WIN32`, and `CMakeLists.txt` has had the Linux
+branch (`find_package(SDL2)`, Freetype, `PLUME_SDL_VULKAN_ENABLED`) since it was
+written; only the CI job was missing. What the Linux job needs, and why:
+
+|Package|For|
+|---|---|
+|`clang`|rt64 and N64ModernRuntime pass GCC-style flags and are clang-only by construction. Ubuntu 24.04's clang is 18, which is enough — the LLVM 19 floor is MSVC's STL check, not the code.|
+|`libsdl2-dev`|SDL2, and transitively the X11/Wayland/ALSA headers `SDL_syswm.h` includes.|
+|`libfreetype-dev`|RmlUi's font engine (`Freetype::Freetype`).|
+|`libgtk-3-dev`|nativefiledialog-extended's Linux backend, GTK3 unless `NFD_PORTAL` is set.|
+
+The Linux job verifies what it can without a GPU (the runner has none, so the
+game cannot be launched): the file is an x86-64 ELF, **every shared library
+resolves** under `ldd` — the check that catches a link which quietly picked up a
+build-time-only library — the runtime assets are present, and the version stamp
+is in the binary. It does **not** prove the game runs; that needs a real GPU and
+has not been done.
+
+⚠ **The Linux package ships a `run.sh` for a reason.** `recompui`'s
+`file::get_program_path()` returns `""` on Linux as well as on Windows (the
+`/app/bin` case is Flatpak-only), so `assets/` resolves against the *working
+directory*. On Windows that is invisible — Explorer sets the working directory
+to the executable's own folder — but on Linux it is not, and the failure is
+`Failed to load font face from assets/LatoLatin-Regular.ttf` followed by a
+throw. `run.sh` `cd`s to its own directory first. Anything that launches the
+Linux binary must do the same.
+
 ---
 
 ## 12. Build configuration, status, and what remains
@@ -861,33 +929,41 @@ the console window for every user who launches the game from Explorer.
 
 Working and verified: boot, attract loop, intro cutscene, gameplay, repeated scene
 transitions, audio, controller input, overlay load/unload/heap-shift, save/load
-(EEPROM). Multi-minute soaks run clean.
+(EEPROM). Multi-minute soaks run clean. **All of that is Windows x64.**
 
 Known limitations are in `README.md` — chiefly the `Expand` skybox coverage
 trade-off.
 
 Open work, roughly in priority order:
 
-1. **Licensing on shipped assets.** `assets/Suplexmentary Comic NC.ttf` carries
+1. **Play the Linux build.** CI builds it and checks that it links, that every
+   shared library resolves, and that the version stamp is present — but the
+   runner has no GPU, so the game has never been launched on Linux. Nothing
+   platform-specific is known to be missing (`src/main.cpp` guards every Win32
+   call; `CMakeLists.txt` has had the Linux branch since it was written), but
+   "builds" and "runs" are different bars here as everywhere else in this file.
+   The first thing to check is that `run.sh` is what the tester uses, because
+   the assets are resolved against the working directory.
+2. **Licensing on shipped assets.** `assets/Suplexmentary Comic NC.ttf` carries
    "All rights reserved" with no license, and the 11 icons in `assets/icons/`
    came from the same source. This blocks a public release.
-2. **Audit the `_recomp` shims in `src/recomp_api.cpp`** — 60 macro-generated plus
+3. **Audit the `_recomp` shims in `src/recomp_api.cpp`** — 60 macro-generated plus
    hand-written ones, of which the runtime supplies only some. They are
    approximations, and the most likely remaining source of silently wrong
    behaviour. The PI/EPi DMA family is the top suspect: a no-op DMA returns
    success having transferred nothing, which is the `__osSiRawStartDma` bug's
    exact shape. Method that worked for the stub audit: one-shot fire counters,
    one normal session, see which actually execute.
-3. **Review the `boot_*` stubs** against what the runtime provides. Do not
+4. **Review the `boot_*` stubs** against what the runtime provides. Do not
    un-stub without testing — they are load-bearing for boot.
-4. **Strip the development instrumentation** before a release: probe hooks in
+5. **Strip the development instrumentation** before a release: probe hooks in
    `banjotooie.us.toml`, the `LOOKUP_FUNC` override in `include/tooie_recomp.h`,
    `[probe]` prints inside the runtime patch, and the rt64 diagnostics commit.
    ⚠ Removing the `LOOKUP_FUNC` override changes dispatch for *every* generated
    file, so do it **after** the audits above and soak afterwards, or a failure
    gets misattributed.
-5. **Scene correctness has never been diffed against original hardware.** Every
+6. **Scene correctness has never been diffed against original hardware.** Every
    check in this project proves the frame *changes*, not that it is *right*.
-6. **Broad coverage for the depth-clip fix** (see §7.4).
-7. **CPU-skinned alternate character forms** (`dbanim_entrypoint_0/1`) are not
+7. **Broad coverage for the depth-clip fix** (see §7.4).
+8. **CPU-skinned alternate character forms** (`dbanim_entrypoint_0/1`) are not
    covered by the interpolation metadata; they would need `G_EX_VERTEX_POSITION`.

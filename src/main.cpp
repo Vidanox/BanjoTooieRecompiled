@@ -62,7 +62,19 @@
 #include <timeapi.h>
 #endif
 
+// The release workflow stamps the version it is publishing into the binary
+// (CMakeLists.txt turns the BT_VERSION environment variable into this define),
+// so the launcher's version label -- and any bug report that quotes it --
+// identifies the build. A local build keeps the default.
+//
+// The string must stay MAJOR.MINOR.PATCH, optionally followed by `+suffix` or
+// `-suffix`: it is parsed by recomp::Version::from_string, which rejects
+// anything else and takes the process down with "Invalid version string".
+#ifdef BT_VERSION
+const std::string version_string = BT_VERSION;
+#else
 const std::string version_string = "1.0.0";
+#endif
 
 SDL_Window* window = nullptr;
 

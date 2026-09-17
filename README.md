@@ -23,6 +23,7 @@ widescreen, high refresh rates, and an in-game settings menu.
 * [Dependencies](#dependencies)
 * [Building](#building)
 * [Running](#running)
+* [Releases](#releases)
 * [Repository Layout](#repository-layout)
 * [What Is Committed, and Why](#what-is-committed-and-why)
 * [Regenerating the Recompiled Code](#regenerating-the-recompiled-code)
@@ -35,7 +36,8 @@ widescreen, high refresh rates, and an in-game settings menu.
 Playable end to end. Verified working: boot, attract loop, the intro cutscene,
 gameplay, repeated scene transitions, audio, controller input, overlay
 load/unload, and save/load. Multi-minute soaks run without crashes, stalls, or
-missing-function lookups.
+missing-function lookups. That verification is on Windows x64; the Linux x64
+build is newer — see [Known Limitations](#known-limitations).
 
 The one known visual limitation is described under
 [Known Limitations](#known-limitations).
@@ -111,14 +113,30 @@ port, resolve that yourself.
 
 ### Prerequisites
 
-* **CMake** 3.20+
-* **Ninja**
-* **clang-cl** (LLVM) **19 or newer** — not optional. MSVC 14.44's standard
-  library rejects clang older than 19 with `STL1000: Unexpected compiler
-  version`. GCC-style flags are passed through, so MSVC's `cl` will not work
-  either.
-* **Visual Studio Build Tools 2022** for the Windows SDK and libraries
-* **Python 3.8+** (tools only)
+Common: **CMake** 3.20+, **Ninja**, and **Python 3.8+** (tools only).
+
+**clang is not optional on either platform.** `rt64` and `N64ModernRuntime` pass
+GCC-style flags through `target_compile_options`, which MSVC's `cl` rejects
+outright with `D8021: invalid numeric argument '/Wno-unused-parameter'`.
+
+**Windows:**
+
+* **clang-cl** (LLVM) **19 or newer**. MSVC 14.44's standard library rejects
+  older clang with `STL1000: Unexpected compiler version`.
+* **Visual Studio Build Tools 2022** for the Windows SDK and libraries.
+
+**Linux (x64):**
+
+* **clang** — Ubuntu 24.04's 18 is fine. The LLVM 19 floor above is a Windows
+  one: it is MSVC's standard library that refuses older clang, not the code.
+* **libsdl2-dev**, **libfreetype-dev** (RmlUi's font engine) and
+  **libgtk-3-dev** (nativefiledialog-extended's Linux backend). `libsdl2-dev`
+  pulls in the X11/Wayland/ALSA headers that `SDL_syswm.h` includes.
+
+```bash
+sudo apt-get install -y clang ninja-build pkg-config \
+    libsdl2-dev libfreetype-dev libgtk-3-dev
+```
 
 ### Steps
 
@@ -135,15 +153,22 @@ cmake_configure.bat
 build_bt.bat
 ```
 
-Or directly, on any platform:
+On Linux, or by hand on either platform:
 
 ```bash
+# Windows: use clang-cl for both compilers.
 cmake -S . -B build-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+
+# Linux: use clang.
+cmake -S . -B build-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
 cmake --build build-cmake --target BanjoTooieRecompiled
 ```
 
-The executable is `build-cmake/BanjoTooieRecompiled.exe`.
+The executable is `build-cmake/BanjoTooieRecompiled.exe` on Windows and
+`build-cmake/BanjoTooieRecompiled` on Linux.
 
 **The ROM is not needed to build.** The recompiled game code is committed (see
 below), so building requires only a compiler and the dependencies. You will be
@@ -153,17 +178,34 @@ asked for the ROM the first time you run the game.
 
 * `build_bt.bat` sources a cached MSVC environment (~30 ms) rather than
   re-running `vcvars64.bat` (~1600 ms) on every invocation.
-* `cmake_configure.bat` is only needed when the *set* of files in
-  `RecompiledFuncs/` changes — `CMakeLists.txt` uses `file(GLOB)`, so new files
-  are otherwise invisible to an existing build directory.
+* `cmake_configure.bat` (or re-running the `cmake -S . -B build-cmake` line) is
+  only needed when the *set* of files in `RecompiledFuncs/` changes —
+  `CMakeLists.txt` uses `file(GLOB)`, so new files are otherwise invisible to an
+  existing build directory.
 * ⚠ `build_bt.bat` returns exit code 0 even when ninja fails. Check its output
   for `error`, not its exit status.
 
 ## Running
 
 ```
-build-cmake\BanjoTooieRecompiled.exe
+build-cmake\BanjoTooieRecompiled.exe          # Windows
+build-cmake/BanjoTooieRecompiled              # Linux
 ```
+
+⚠ **Run it from the directory containing `assets/`** — the launcher resolves its
+fonts, icons and wallpaper against the *working directory*, not against the
+executable's location. On Windows, launching from Explorer or from
+`build-cmake/` does this for you; on Linux, `cd` into the directory first. The
+release archive's `run.sh` does it for you:
+
+```bash
+tar xzf BanjoTooieRecompiled-linux-x64.tar.gz
+cd BanjoTooieRecompiled
+./run.sh
+```
+
+Running the executable from elsewhere without doing this fails on startup with
+`Failed to load font face from assets\LatoLatin-Regular.ttf`.
 
 On first launch, choose **Select ROM** and point it at your Banjo-Tooie (USA)
 ROM. The supported dump is:
@@ -177,10 +219,50 @@ ROM. The supported dump is:
 | Cartridge ID | `NB7E` |
 
 The ROM is read directly — there is no separate extraction step. Settings are
-stored in `%LOCALAPPDATA%\BanjoTooieRecompiled\`.
+stored in `%LOCALAPPDATA%\BanjoTooieRecompiled\` on Windows and
+`~/.config/BanjoTooieRecompiled/` on Linux.
 
 `--game bt` skips the launcher and starts the game immediately; it still needs a
 ROM to have been selected once.
+
+### Runtime dependencies
+
+**Windows:** nothing to install. The release archive carries the SDL2 and DXC
+DLLs the executable loads.
+
+**Linux:** the release archive carries no shared libraries, so the SDL2 runtime
+is required — `libsdl2-2.0-0` on Debian/Ubuntu, `sdl2-compat` or `SDL2` on Arch,
+`SDL2` on Fedora. It is present on essentially every desktop install. A working
+Vulkan driver is required as well, since RT64 has no OpenGL backend on Linux.
+
+## Releases
+
+Releases are built and published by
+[`.github/workflows/build.yml`](.github/workflows/build.yml); there is no manual
+release step. Every release carries both packages, built from the same commit:
+
+|Archive|Platform|
+|---|---|
+|`BanjoTooieRecompiled-windows-x64.zip`|the executable, the SDL2/DXC DLLs it loads, and `assets/`|
+|`BanjoTooieRecompiled-linux-x64.tar.gz`|the executable, `assets/`, and `run.sh`|
+
+|You push|You get|
+|---|---|
+|a commit to `main`|a release tagged `v<base>-build.<run number>`, created at that commit|
+|a `v*` tag|a release for that tag, versioned exactly as the tag says|
+
+`<base>` is the highest plain `vX.Y.Z` tag in the repository, so tagging `v1.1.0`
+moves the base and later builds become `v1.1.0-build.<n>`. Releases from `main`
+are ordinary releases, not pre-releases, so **`releases/latest` is always the
+newest build**. Pull requests build and upload a workflow artifact but publish
+nothing.
+
+The version a release is built as is stamped into the executable, and the
+launcher shows it in the bottom-left corner (`v1.0.0-build.12`). A local build,
+which has no stamp, reports `1.0.0`. The workflow passes it in as the
+`BT_VERSION` environment variable, which `CMakeLists.txt` turns into a define;
+a tag that is not `vMAJOR.MINOR.PATCH` is rejected before anything is built,
+because the game refuses to start on a version string it cannot parse.
 
 ## Repository Layout
 
@@ -189,7 +271,8 @@ BanjoTooieRecomp/
 ├── README.md               this file
 ├── AGENTS.md               engineering notes: findings, decisions, traps
 ├── COPYING                 GPL-3.0
-├── CMakeLists.txt          build definition (clang-cl, Ninja)
+├── CMakeLists.txt          build definition (clang-cl on Windows, clang on Linux)
+├── .github/workflows/      CI: builds both platforms, publishes the release
 ├── banjotooie.us.toml      N64Recomp config: entrypoint, stubs, patches, hooks
 ├── n_aspMain.us.toml       RSPRecomp config for the audio microcode
 ├── build_bt.bat            ninja wrapper using a cached MSVC environment
@@ -249,7 +332,8 @@ it means:
 `rsp/n_aspMain.cpp` is committed for the same reason. `build/force_keep.txt` is
 committed because it is *accumulated state* that cannot be regenerated.
 
-Not committed: `build/`, `build-cmake/`, and the ROM (which you supply).
+Not committed: `build/`, `build-cmake/`, `package/`, and the ROM (which you
+supply).
 
 ## Regenerating the Recompiled Code
 
@@ -289,6 +373,12 @@ limitation of the original game, not a port defect.
 
 Also worth knowing:
 
+* **The Linux build is newer and less exercised than the Windows one.** CI
+  builds it and checks that it links, that every shared library resolves, and
+  that it carries the version stamp, but it has not been played through. The
+  port's own code is platform-neutral (`src/main.cpp` guards every Win32 call
+  behind `#ifdef _WIN32`), and RT64 has no OpenGL backend on Linux — Vulkan is
+  required.
 * Scene correctness has not been diffed against the original hardware.
 * The alternate CPU-skinned character forms are not covered by the high-refresh
   interpolation metadata (the ordinary Banjo/Kazooie form is).

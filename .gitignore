@@ -2,6 +2,7 @@
 # directory alone is ~1.3 GB.
 build/*
 build-cmake/
+package/
 *.log
 *.obj
 *.pdb

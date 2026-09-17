@@ -1,13 +1,28 @@
 name: Build
 
-# Builds the port and uploads a runnable package. On a version tag it also
-# publishes a GitHub Release with the same package attached, which is how the
-# executable is "deployed" -- there is no server component, so a release asset
-# is the deliverable.
+# Builds the port for Windows x64 and Linux x64, and publishes a GitHub Release
+# carrying both packages. A release asset *is* the deployment here: there is no
+# server component, and the repository ships no game content, so users supply
+# their own ROM.
 #
-# The shipped package is not just the .exe: it needs the three DLLs the
-# POST_BUILD step copies next to it (SDL2 and DXC) and the assets/ directory the
-# launcher reads fonts, icons and the wallpaper from.
+# Two ways a release is produced:
+#
+#   * push to `main`  -> a build-stamped release, `v<base>-build.<run number>`,
+#                        tagged automatically at the pushed commit. `<base>` is
+#                        the highest plain `vX.Y.Z` tag, so a human tagging
+#                        `v1.1.0` moves the base and builds become
+#                        `v1.1.0-build.<n>` from then on.
+#   * push of a `v*` tag -> a release for that tag, versioned exactly as the tag
+#                        says.
+#
+# Both are ordinary releases, so `releases/latest` is the newest build. Pull
+# requests build and upload artifacts but publish nothing.
+#
+# The shipped package is not just the executable: it needs the DLLs the
+# POST_BUILD step copies next to it on Windows (SDL2 and DXC) and the assets/
+# directory the launcher reads fonts, icons and the wallpaper from. On Linux the
+# DLLs are replaced by the system libSDL2, and a `run.sh` is added because the
+# launcher resolves `assets/` against the working directory.
 
 on:
   push:
@@ -18,14 +33,78 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write        # required to create the Release on a tag
+  contents: write        # required to create the tag and the Release
 
 concurrency:
+  # One run per ref at a time. `cancel-in-progress` is deliberately off: a run
+  # that has started is about to publish a release, and killing it mid-flight
+  # can leave a tag created with no asset behind it. GitHub keeps only the
+  # newest pending run per group, so a burst of pushes still collapses instead
+  # of queueing.
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  build:
+  # The version is worked out once, in one place, so the Windows and Linux
+  # builds cannot disagree about what they are building.
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Work out the version to build
+        id: version
+        shell: python
+        run: |
+          import os, re, subprocess
+
+          # The one shape recomp::Version::from_string accepts. Anything else
+          # makes main() exit with "Invalid version string" before the window
+          # opens, so it is rejected here rather than shipped.
+          version_re = r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?(?:\+[0-9A-Za-z.\-]+)?"
+
+          ref = os.environ["GITHUB_REF"]
+          if ref.startswith("refs/tags/"):
+              # A human pushed a version tag. That tag is the release, and the
+              # version is whatever it says.
+              tag = ref[len("refs/tags/"):]
+              version = tag[1:] if tag.startswith("v") else ""
+              if not re.fullmatch(version_re, version):
+                  raise SystemExit(
+                      "tag %r is not vMAJOR.MINOR.PATCH: the game parses its "
+                      "version with recomp::Version::from_string and refuses "
+                      "to start on anything else" % tag)
+          else:
+              # A build off a branch. Base the version on the highest plain
+              # vX.Y.Z tag and append the run number, which is unique and
+              # monotonic across the repository.
+              #
+              # `ls-remote` rather than `git tag`, because the checkout is
+              # shallow and has no tags in it. Sorting on the parsed tuple
+              # rather than the string, so v1.10.0 outranks v1.9.0.
+              out = subprocess.run(["git", "ls-remote", "--tags", "--refs", "origin"],
+                                   capture_output=True, text=True, check=True).stdout
+              tags = [line.split("\t")[1][len("refs/tags/"):]
+                      for line in out.splitlines() if "\t" in line]
+              plain = sorted((t for t in tags if re.fullmatch(r"v\d+\.\d+\.\d+", t)),
+                             key=lambda t: tuple(int(p) for p in t[1:].split(".")))
+              base = plain[-1][1:] if plain else "1.0.0"
+              version = "%s-build.%s" % (base, os.environ["GITHUB_RUN_NUMBER"])
+              tag = "v" + version
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("version=%s\n" % version)
+              fh.write("tag=%s\n" % tag)
+          print("version=%s tag=%s" % (version, tag))
+
+  build-windows:
+    needs: version
     runs-on: windows-latest
 
     steps:
@@ -36,6 +115,11 @@ jobs:
           # (rabbitizer, fmt, ELFIO, plume, mupen64plus, ...), which the build
           # needs. Roughly 640 MB of upstream source.
           submodules: recursive
+          # Shallow: the history is large (RecompiledFuncs/ is committed, so
+          # every commit that touches it adds ~85 MB of blobs) and the build
+          # does not need it. The version job reads tags with `ls-remote`
+          # instead, which downloads nothing.
+          fetch-depth: 1
 
       - name: Apply the dependency patches
         # Three of the four submodules are patched, and the game does not boot,
@@ -71,6 +155,11 @@ jobs:
           if ([int]$Matches[1] -lt 19) { throw "LLVM 19+ required (MSVC 14.44 rejects older clang); found $v" }
 
       - name: Configure
+        env:
+          # CMakeLists.txt turns this into the BT_VERSION define, so the
+          # executable reports the version being released. Set here rather than
+          # as a -D cache entry so it cannot go stale in build-cmake/.
+          BT_VERSION: ${{ needs.version.outputs.version }}
         run: cmd /c cmake_configure.bat
 
       - name: Build
@@ -109,6 +198,16 @@ jobs:
           }
           Write-Host "runtime dependencies present"
 
+          # The version stamp is the whole point of passing BT_VERSION: the
+          # launcher shows this string, and it is what a bug report quotes. A
+          # release whose binary reports a different version sends every report
+          # to the wrong build.
+          $want = "${{ needs.version.outputs.version }}"
+          if (-not ([Text.Encoding]::ASCII.GetString($b)).Contains($want)) {
+            throw "the executable does not carry the version string '$want'"
+          }
+          Write-Host "version stamp present: $want"
+
       - name: Package
         shell: pwsh
         run: |
@@ -132,17 +231,149 @@ jobs:
           path: package/BanjoTooieRecompiled-windows-x64.zip
           if-no-files-found: error
 
+  build-linux:
+    needs: version
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out, with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install the build dependencies
+        # What the tree actually asks for, not a superset:
+        #   clang            rt64 and N64ModernRuntime pass GCC-style flags and
+        #                    are clang-only by construction. Ubuntu 24.04's
+        #                    clang is 18, which is enough here -- the LLVM 19
+        #                    floor is a Windows one (MSVC 14.44's standard
+        #                    library rejects older clang with STL1000).
+        #   libsdl2-dev      SDL2, and transitively the X11/Wayland/ALSA
+        #                    headers SDL_syswm.h and SDL_video.h include.
+        #   libfreetype-dev  RmlUi's font engine (Freetype::Freetype).
+        #   libgtk-3-dev     nativefiledialog-extended's Linux backend, which
+        #                    is GTK3 unless NFD_PORTAL is set.
+        #   pkg-config       nfd finds GTK through pkg_check_modules.
+        # cmake and ninja come with the runner image.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang ninja-build pkg-config \
+            libsdl2-dev libfreetype-dev libgtk-3-dev
+
+      - name: Apply the dependency patches
+        run: python tools/setup_deps.py
+
+      - name: Verify dependencies are in the required state
+        run: python tools/setup_deps.py --check
+
+      - name: Configure
+        env:
+          BT_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          clang --version | head -1
+          cmake -S . -B build-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build-cmake --target BanjoTooieRecompiled
+
+      - name: Verify the executable
+        run: |
+          set -eu
+          exe=build-cmake/BanjoTooieRecompiled
+          if [ ! -x "$exe" ]; then echo "build produced no executable"; exit 1; fi
+
+          # ELF64, little-endian, x86-64.
+          file "$exe"
+          file "$exe" | grep -q 'ELF 64-bit LSB.*x86-64' || {
+            echo "not an x86-64 ELF executable"; exit 1; }
+
+          # Every shared library must resolve on a stock image. This is the
+          # check that catches a link that quietly picked up a build-time-only
+          # library, or a -static-libstdc++ that did not take.
+          missing=$(ldd "$exe" | grep 'not found' || true)
+          if [ -n "$missing" ]; then echo "unresolved shared libraries:"; echo "$missing"; exit 1; fi
+          echo "all shared libraries resolve"
+
+          for f in build-cmake/assets/recomp.rcss build-cmake/assets/LatoLatin-Regular.ttf \
+                   build-cmake/assets/menu.png; do
+            if [ ! -f "$f" ]; then echo "missing runtime file: $f"; exit 1; fi
+          done
+          echo "runtime assets present"
+
+          # The version stamp is the whole point of passing BT_VERSION: the
+          # launcher shows this string, and it is what a bug report quotes.
+          want="${{ needs.version.outputs.version }}"
+          if ! grep -qa -- "$want" "$exe"; then
+            echo "the executable does not carry the version string '$want'"; exit 1
+          fi
+          echo "version stamp present: $want"
+
+      - name: Package
+        run: |
+          set -eu
+          stage=package/BanjoTooieRecompiled
+          mkdir -p "$stage"
+
+          cp build-cmake/BanjoTooieRecompiled "$stage/"
+          cp -r build-cmake/assets "$stage/assets"
+          cp README.md COPYING AGENTS.md "$stage/"
+
+          # The launcher resolves `assets/` against the working directory (see
+          # "Known Limitations" in the README), so the package ships a wrapper
+          # that makes the directory it lives in the working directory first.
+          cat > "$stage/run.sh" <<'EOF'
+          #!/bin/sh
+          # Banjo-Tooie: Recompiled resolves its assets relative to the working
+          # directory, so run it from the directory this script is in.
+          cd "$(dirname "$(readlink -f "$0")")" || exit 1
+          exec ./BanjoTooieRecompiled "$@"
+          EOF
+          chmod +x "$stage/run.sh" "$stage/BanjoTooieRecompiled"
+
+          (cd package && tar czf BanjoTooieRecompiled-linux-x64.tar.gz BanjoTooieRecompiled)
+          ls -l package
+
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: BanjoTooieRecompiled-linux-x64
+          path: package/BanjoTooieRecompiled-linux-x64.tar.gz
+          if-no-files-found: error
+
+  # One publisher, so the two builds cannot race to create the release and a
+  # release is never published missing one of its assets.
+  release:
+    needs: [version, build-windows, build-linux]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Collect the packages
+        uses: actions/download-artifact@v4
+        with:
+          path: package
+          merge-multiple: true
+
       - name: Publish the release
-        # A release asset is the deployment: the port has no server component,
-        # and it does not ship game assets, so users supply their own ROM.
-        if: startsWith(github.ref, 'refs/tags/')
+        # The tag is created here when it does not exist yet (the push-to-main
+        # case), at the commit that was just built. Tags created with the
+        # workflow's own GITHUB_TOKEN do not trigger further workflow runs, so
+        # this cannot loop back into the `tags: ['v*']` trigger above.
         uses: softprops/action-gh-release@v2
         with:
-          files: package/BanjoTooieRecompiled-windows-x64.zip
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.version.outputs.tag }}
+          make_latest: true
           generate_release_notes: true
+          files: |
+            package/BanjoTooieRecompiled-windows-x64.zip
+            package/BanjoTooieRecompiled-linux-x64.tar.gz
           body: |
-            Windows x64 build. Extract the archive and run
-            `BanjoTooieRecompiled.exe`.
+            Built from
+            [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}).
 
             **This does not include the game.** You need your own copy of
             Banjo-Tooie (USA) and will be asked for it on first launch:
@@ -152,6 +383,17 @@ jobs:
             | Format | `.z64` (big-endian, unbyteswapped) |
             | SHA-1 | `AF1A89E12B638B8D82CC4C085C8E01D4CBA03FB3` |
             | Internal name | `BANJO TOOIE` |
+
+            | Platform | Archive | Run |
+            |---|---|---|
+            | Windows x64 | `BanjoTooieRecompiled-windows-x64.zip` | extract, run `BanjoTooieRecompiled.exe` |
+            | Linux x64 | `BanjoTooieRecompiled-linux-x64.tar.gz` | extract, run `./run.sh` from inside the extracted directory |
+
+            On Linux, run it through `run.sh` rather than the executable
+            directly: the launcher looks for its `assets/` directory relative to
+            the working directory. It needs a working Vulkan driver and the SDL2
+            runtime (`libsdl2-2.0-0`, present on essentially every desktop
+            install).
 
             Requires a GPU with Direct3D 12 (Shader Model 6) or Vulkan 1.2.
             See `README.md` for details.

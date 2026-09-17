@@ -253,6 +253,21 @@ target_link_libraries(BanjoTooieRecompiled PRIVATE
 
 target_sources(BanjoTooieRecompiled PRIVATE ${SOURCES})
 
+# The version the executable reports. The release workflow sets BT_VERSION to
+# the version it is publishing so the launcher's label identifies the build;
+# without it main.cpp falls back to its own default.
+#
+# An environment variable rather than a cache entry on purpose: a cache entry
+# would persist in build-cmake/ and keep stamping a stale version into local
+# builds after the workflow that set it had gone.
+#
+# The emptiness test matters: an empty define would make the version string "",
+# which recomp::Version::from_string rejects, and main() would exit before the
+# window opened. An exported-but-empty BT_VERSION must mean "no stamp".
+if (DEFINED ENV{BT_VERSION} AND NOT "$ENV{BT_VERSION}" STREQUAL "")
+    target_compile_definitions(BanjoTooieRecompiled PRIVATE "BT_VERSION=\"$ENV{BT_VERSION}\"")
+endif()
+
 # recompui loads its stylesheet and fonts from `assets/` relative to the
 # working directory.
 add_custom_command(TARGET BanjoTooieRecompiled POST_BUILD
