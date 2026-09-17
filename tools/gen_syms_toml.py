@@ -37,11 +37,25 @@ ROM = os.path.join(ROOT, "build", "decompressed.us.z64")
 
 OVERLAY_VRAM = 0x80800000
 
+# Functions the symbol files do not name, recovered from what the ROM says the
+# game actually calls. Counted so the figures quoted in AGENTS.md are
+# reproducible from a run rather than hand-counted: `overlay_heads` and
+# `core_gaps` come from `detect_gap_functions`, `pointer_tables` from
+# `overlay_pointer_function_starts` (data pointers and export tables together).
+RECOVERED = {"overlay_heads": 0, "core_gaps": 0, "pointer_tables": 0,
+              "export_tables": 0}
+
 # Safety bound on how far a jump table may be scanned when collecting its arms.
 # The scan stops at the table's real end (the first word that is not a valid
 # in-section code offset); this only prevents a runaway read if that never
 # happens. Tooie's largest observed dispatch table has 73 entries.
 ARM_SCAN_LIMIT = 1024
+
+# How far back from a dispatch's index load its `sltiu`/`slti` bound may sit.
+# Measured over Tooie's dispatchers: `bsbbarge`'s two are 8 and 5 words before
+# the load, `bsbbuster`'s 5 and 6. A window this wide costs nothing and the
+# branch-on-`$at` requirement keeps a match precise.
+ARM_GUARD_WINDOW = 16
 
 sys.path.insert(0, HERE)
 from detect_functions import detect_functions, is_plausible_function_start
@@ -246,15 +260,51 @@ def overlay_pointer_function_starts(rom_data, code_rom, code_size,
             word = words[i]
             if (word >> 26) != 0 or (word & 0x3F) != 8:
                 continue
-            if ((word >> 21) & 0x1F) in (0, 31):
+            reg = (word >> 21) & 0x1F
+            if reg in (0, 31):
                 continue
             base = None
+            lw_index = None
             for j in range(i - 1, max(lo - 1, i - 9), -1):
                 if (words[j] >> 26) == 0x23:  # lw
                     base = table_of.get(j * 4)
+                    lw_index = j
                     break
             if base is None:
                 continue
+            # The dispatcher's own index guard bounds the table exactly, and it
+            # has to be used before the scan below: that scan finds the table's
+            # end by "first word that is not a valid code offset", and a table
+            # immediately followed by *another* table of code offsets reads past
+            # its own end. `bsbbarge` is the case -- its switch table at 0x61C
+            # has 5 entries (`sltiu $at, $t7, 0x5` at 0x384 bounds the index) and
+            # the overlay's end/init/update pointer table at 0x630 follows it
+            # with three more valid code offsets (0x180, 0x1CC, 0x344). Those
+            # were read as arms 5..7, so the splitter below rejected all three
+            # real functions as "switch arms" and never split them out, while
+            # `bsbbarge_entrypoint_0` returns exactly those three for the game to
+            # call -- so performing Beak Barge aborted with `Failed to find
+            # function at <code_base + 0x180>`. Same shape in `bsbbuster`
+            # (table 0x71C, pointer table 0x730).
+            #
+            # `sltiu $at, $reg, N` (or `slti`) on the register this `jr` jumps
+            # through means the table has N entries. Requiring a branch on `$at`
+            # before the index load keeps the match to a real dispatch bound
+            # rather than any comparison that happens to name the register.
+            limit = ARM_SCAN_LIMIT
+            if lw_index is not None:
+                for j in range(lw_index - 1, max(lo - 1, lw_index - 1 - ARM_GUARD_WINDOW), -1):
+                    guard = words[j]
+                    if (guard >> 26) not in (0x0A, 0x0B):  # slti, sltiu
+                        continue
+                    if ((guard >> 21) & 0x1F) != reg or (guard & 0xFFFF) == 0:
+                        continue
+                    for k in range(j + 1, lw_index):
+                        branch = words[k]
+                        if (branch >> 26) in (0x4, 0x5, 0x6, 0x7) and ((branch >> 21) & 0x1F) == 1:
+                            limit = min(limit, guard & 0xFFFF)
+                            break
+                    break
             # Read the table to its real end, not a fixed number of entries.
             # An arm is a code offset, so the first word that is not a valid
             # in-section code offset terminates the table -- the same rule
@@ -267,7 +317,7 @@ def overlay_pointer_function_starts(rom_data, code_rom, code_size,
             # ended at 0xAA4, so N64Recomp truncated the switch to the two arms
             # that happened to remain inside it and the game aborted in
             # `switch_error` on the third dispatch.
-            for k in range(ARM_SCAN_LIMIT):
+            for k in range(limit):
                 # The table itself lives in the overlay's *data*, past the code
                 # (chalienkids' five tables sit at 0x1C50..0x1E30 with a code
                 # size of 0x1C50), so only the ROM read is bounded here -- the
@@ -575,6 +625,7 @@ def fill_gap_functions(rom_data, sec_rom, sec_vram, sec_size, funcs):
         for start_rom, length in found:
             vram = sec_vram + (start_rom - sec_rom)
             out.append({"name": f"func_{vram:08X}", "vram": vram, "size": length})
+            RECOVERED["core_gaps"] += 1
     out.sort(key=lambda f: f["vram"])
     return out
 
@@ -1033,6 +1084,7 @@ def main():
                     "vram": vram,
                     "size": length,
                 })
+                RECOVERED["overlay_heads"] += 1
         # infer sizes
         sec_end = base_vram + size
         for i, f in enumerate(out_funcs):
@@ -1062,6 +1114,7 @@ def main():
         # The overlay's export table is passed alongside it: the decomp's
         # `_entrypoint_N` symbols are incomplete, so an exported function the
         # decomp never named is reachable only from that table.
+        exported = set(ovl_relocs.get(name, {}).get("entrypoint_offsets", ()))
         extra_starts = overlay_pointer_function_starts(
             rom_data, code_rom, size,
             ovl_relocs.get(name, {}).get("code_pointers", ()), out_funcs,
@@ -1075,6 +1128,8 @@ def main():
                     "vram": vram,
                     "size": None,
                 })
+                RECOVERED["export_tables" if offset in exported else
+                          "pointer_tables"] += 1
             out_funcs.sort(key=lambda f: f["vram"])
             # New starts cut the functions that contained them short.
             for i, f in enumerate(out_funcs):
@@ -1172,6 +1227,13 @@ def main():
     print(f"  sections: {len(sections)}  functions: {total_funcs}  relocs: {total_relocs}")
     print(
         f"  core1 funcs: {len(core1_funcs)}  core2 funcs: {len(core2_funcs)}  boot funcs: {len(boot_funcs)}  overlay sections: {len(by_seg)}"
+    )
+    print(
+        "  recovered (unnamed in the decomp): "
+        f"{RECOVERED['pointer_tables']} from data pointer tables, "
+        f"{RECOVERED['export_tables']} from export tables, "
+        f"{RECOVERED['overlay_heads']} at overlay heads, "
+        f"{RECOVERED['core_gaps']} in core gaps"
     )
 
     # Emit the relocatable-sections list in `overlays.us.toml` order. N64Recomp

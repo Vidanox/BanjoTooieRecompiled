@@ -12175,7 +12175,10 @@ static RelocEntry section_68_ovl_bsbanswim_relocs[] = {
     { .offset = 0x00000A20, .target_section_offset = 0x00000A60, .target_section = 68, .type = R_MIPS_LO16 }, 
 };
 static FuncEntry section_69_ovl_bsbbarge_funcs[] = {
-    { .func = bsbbarge_setSubstate, .offset = 0x00000000, .rom_size = 0x000005E4 },
+    { .func = bsbbarge_setSubstate, .offset = 0x00000000, .rom_size = 0x00000180 },
+    { .func = func_80800180_bsbbarge, .offset = 0x00000180, .rom_size = 0x0000004C },
+    { .func = func_808001CC_bsbbarge, .offset = 0x000001CC, .rom_size = 0x00000178 },
+    { .func = func_80800344_bsbbarge, .offset = 0x00000344, .rom_size = 0x000002A0 },
     { .func = bsbbarge_entrypoint_0, .offset = 0x000005E4, .rom_size = 0x0000001C },
 };
 static RelocEntry section_69_ovl_bsbbarge_relocs[] = {
@@ -12265,7 +12268,10 @@ static RelocEntry section_70_ovl_bsbbilldrill_relocs[] = {
     { .offset = 0x00000A5C, .target_section_offset = 0x00000B68, .target_section = 70, .type = R_MIPS_LO16 }, 
 };
 static FuncEntry section_71_ovl_bsbbuster_funcs[] = {
-    { .func = bsbbuster_setSubstate, .offset = 0x00000000, .rom_size = 0x000006E4 },
+    { .func = bsbbuster_setSubstate, .offset = 0x00000000, .rom_size = 0x000001A4 },
+    { .func = func_808001A4_bsbbuster, .offset = 0x000001A4, .rom_size = 0x00000054 },
+    { .func = func_808001F8_bsbbuster, .offset = 0x000001F8, .rom_size = 0x0000012C },
+    { .func = func_80800324_bsbbuster, .offset = 0x00000324, .rom_size = 0x000003C0 },
     { .func = bsbbuster_entrypoint_0, .offset = 0x000006E4, .rom_size = 0x00000014 },
 };
 static RelocEntry section_71_ovl_bsbbuster_relocs[] = {
@@ -15317,7 +15323,9 @@ static RelocEntry section_118_ovl_bskazglide_relocs[] = {
     { .offset = 0x00000A80, .target_section_offset = 0x00000AF0, .target_section = 118, .type = R_MIPS_LO16 }, 
 };
 static FuncEntry section_119_ovl_bskazhatch_funcs[] = {
-    { .func = func_80800000_bskazhatch, .offset = 0x00000000, .rom_size = 0x000001E4 },
+    { .func = func_80800000_bskazhatch, .offset = 0x00000000, .rom_size = 0x000000D4 },
+    { .func = func_808000D4_bskazhatch, .offset = 0x000000D4, .rom_size = 0x00000034 },
+    { .func = func_80800108_bskazhatch, .offset = 0x00000108, .rom_size = 0x000000DC },
     { .func = func_808001E4_bskazhatch, .offset = 0x000001E4, .rom_size = 0x0000003C },
     { .func = func_80800220_bskazhatch, .offset = 0x00000220, .rom_size = 0x00000250 },
     { .func = bskazhatch_entrypoint_0, .offset = 0x00000470, .rom_size = 0x00000020 },
@@ -25976,7 +25984,9 @@ static FuncEntry section_283_ovl_chdinofamilysick_funcs[] = {
     { .func = chdinofamilysick_entrypoint_0, .offset = 0x00000000, .rom_size = 0x0000000C },
     { .func = func_8080000C_chdinofamilysick, .offset = 0x0000000C, .rom_size = 0x000001F0 },
     { .func = func_808001FC_chdinofamilysick, .offset = 0x000001FC, .rom_size = 0x00000048 },
-    { .func = func_80800244_chdinofamilysick, .offset = 0x00000244, .rom_size = 0x0000016C },
+    { .func = func_80800244_chdinofamilysick, .offset = 0x00000244, .rom_size = 0x000000C8 },
+    { .func = func_8080030C_chdinofamilysick, .offset = 0x0000030C, .rom_size = 0x0000005C },
+    { .func = func_80800368_chdinofamilysick, .offset = 0x00000368, .rom_size = 0x00000048 },
     { .func = func_808003B0_chdinofamilysick, .offset = 0x000003B0, .rom_size = 0x0000023C },
     { .func = chdinofamilysick_entrypoint_1, .offset = 0x000005EC, .rom_size = 0x0000000C },
     { .func = func_808005F8_chdinofamilysick, .offset = 0x000005F8, .rom_size = 0x00000170 },
@@ -26941,7 +26951,8 @@ static FuncEntry section_296_ovl_chdragonbrothers_funcs[] = {
     { .func = chdragonbrothers_entrypoint_2, .offset = 0x00004490, .rom_size = 0x0000000C },
     { .func = func_8080449C_chdragonbrothers, .offset = 0x0000449C, .rom_size = 0x00000174 },
     { .func = func_80804610_chdragonbrothers, .offset = 0x00004610, .rom_size = 0x000000BC },
-    { .func = func_808046CC_chdragonbrothers, .offset = 0x000046CC, .rom_size = 0x000001E0 },
+    { .func = func_808046CC_chdragonbrothers, .offset = 0x000046CC, .rom_size = 0x000001D8 },
+    { .func = func_808048A4_chdragonbrothers, .offset = 0x000048A4, .rom_size = 0x00000008 },
     { .func = func_808048AC_chdragonbrothers, .offset = 0x000048AC, .rom_size = 0x00000128 },
     { .func = func_808049D4_chdragonbrothers, .offset = 0x000049D4, .rom_size = 0x000000D0 },
     { .func = func_80804AA4_chdragonbrothers, .offset = 0x00004AA4, .rom_size = 0x000001C8 },
@@ -29898,7 +29909,8 @@ static FuncEntry section_340_ovl_chfactoryworkerdirty_funcs[] = {
     { .func = func_8080000C_chfactoryworkerdirty, .offset = 0x0000000C, .rom_size = 0x00000020 },
     { .func = func_8080002C_chfactoryworkerdirty, .offset = 0x0000002C, .rom_size = 0x0000003C },
     { .func = func_80800068_chfactoryworkerdirty, .offset = 0x00000068, .rom_size = 0x00000044 },
-    { .func = func_808000AC_chfactoryworkerdirty, .offset = 0x000000AC, .rom_size = 0x00000294 },
+    { .func = func_808000AC_chfactoryworkerdirty, .offset = 0x000000AC, .rom_size = 0x000001B0 },
+    { .func = func_8080025C_chfactoryworkerdirty, .offset = 0x0000025C, .rom_size = 0x000000E4 },
     { .func = func_80800340_chfactoryworkerdirty, .offset = 0x00000340, .rom_size = 0x0000002C },
     { .func = func_8080036C_chfactoryworkerdirty, .offset = 0x0000036C, .rom_size = 0x00000028 },
     { .func = func_80800394_chfactoryworkerdirty, .offset = 0x00000394, .rom_size = 0x00000288 },
@@ -32503,7 +32515,10 @@ static FuncEntry section_375_ovl_chgameselect_funcs[] = {
     { .func = func_80806B5C_chgameselect, .offset = 0x00006B5C, .rom_size = 0x00000078 },
     { .func = func_80806BD4_chgameselect, .offset = 0x00006BD4, .rom_size = 0x00000074 },
     { .func = chgameselect_entrypoint_6, .offset = 0x00006C48, .rom_size = 0x0000000C },
-    { .func = func_80806C54_chgameselect, .offset = 0x00006C54, .rom_size = 0x000004F8 },
+    { .func = func_80806C54_chgameselect, .offset = 0x00006C54, .rom_size = 0x00000358 },
+    { .func = func_80806FAC_chgameselect, .offset = 0x00006FAC, .rom_size = 0x00000084 },
+    { .func = func_80807030_chgameselect, .offset = 0x00007030, .rom_size = 0x00000090 },
+    { .func = func_808070C0_chgameselect, .offset = 0x000070C0, .rom_size = 0x0000008C },
     { .func = func_8080714C_chgameselect, .offset = 0x0000714C, .rom_size = 0x00000260 },
     { .func = func_808073AC_chgameselect, .offset = 0x000073AC, .rom_size = 0x0000011C },
     { .func = func_808074C8_chgameselect, .offset = 0x000074C8, .rom_size = 0x00000108 },
