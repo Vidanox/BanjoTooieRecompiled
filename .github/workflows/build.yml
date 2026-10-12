@@ -252,15 +252,16 @@ jobs:
         #   libsdl2-dev      SDL2, and transitively the X11/Wayland/ALSA
         #                    headers SDL_syswm.h and SDL_video.h include.
         #   libfreetype-dev  RmlUi's font engine (Freetype::Freetype).
-        #   libgtk-3-dev     nativefiledialog-extended's Linux backend, which
-        #                    is GTK3 unless NFD_PORTAL is set.
-        #   pkg-config       nfd finds GTK through pkg_check_modules.
+        #   libdbus-1-dev    nativefiledialog-extended's xdg-desktop-portal
+        #                    backend; CMakeLists.txt sets NFD_PORTAL on Linux
+        #                    because the GTK backend crashes off-main-thread.
+        #   pkg-config       nfd finds D-Bus through pkg_check_modules.
         # cmake and ninja come with the runner image.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang ninja-build pkg-config \
-            libsdl2-dev libfreetype-dev libgtk-3-dev
+            libsdl2-dev libfreetype-dev libdbus-1-dev
 
       - name: Apply the dependency patches
         run: python tools/setup_deps.py
@@ -392,8 +393,9 @@ jobs:
             On Linux, run it through `run.sh` rather than the executable
             directly: the launcher looks for its `assets/` directory relative to
             the working directory. It needs a working Vulkan driver and the
-            shared libraries it links against — SDL2, FreeType and GTK3, the
-            last for the **Select ROM** dialog. See `README.md` for the exact
+            shared libraries it links against — SDL2, FreeType and libdbus —
+            and, for the **Select ROM** dialog, a running xdg-desktop-portal
+            (standard on GNOME and KDE). See `README.md` for the exact
             list and the packages that provide them.
 
             Requires a GPU with Direct3D 12 (Shader Model 6) or Vulkan 1.2.

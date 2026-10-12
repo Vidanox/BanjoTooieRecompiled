@@ -50,6 +50,16 @@ set(RT64_DIR ${CMAKE_SOURCE_DIR}/lib/rt64)
 # the upstream projects use.
 set(RECOMPFRONTEND_DIR ${CMAKE_SOURCE_DIR}/lib/RecompFrontend)
 
+# Linux file dialog: xdg-desktop-portal, not GTK. recompui opens the dialog
+# from the UI thread, but NFD_Init (gtk_init) runs on the main thread, and GTK
+# is single-threaded -- "Select ROM" segfaulted inside
+# gtk_file_chooser_dialog_new on a non-main thread. The portal backend talks
+# D-Bus, has no thread affinity, and drops the GTK runtime dependency. It must
+# be set before rt64, which owns the nfd subdirectory.
+if (UNIX AND NOT APPLE)
+    set(NFD_PORTAL ON CACHE BOOL "Use xdg-desktop-portal instead of GTK")
+endif()
+
 add_subdirectory(${RT64_DIR} ${CMAKE_BINARY_DIR}/rt64)
 
 set(BUILD_SHARED_LIBS OFF)

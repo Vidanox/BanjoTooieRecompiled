@@ -130,12 +130,13 @@ outright with `D8021: invalid numeric argument '/Wno-unused-parameter'`.
 * **clang** — Ubuntu 24.04's 18 is fine. The LLVM 19 floor above is a Windows
   one: it is MSVC's standard library that refuses older clang, not the code.
 * **libsdl2-dev**, **libfreetype-dev** (RmlUi's font engine) and
-  **libgtk-3-dev** (nativefiledialog-extended's Linux backend). `libsdl2-dev`
-  pulls in the X11/Wayland/ALSA headers that `SDL_syswm.h` includes.
+  **libdbus-1-dev** (nativefiledialog-extended's xdg-desktop-portal backend).
+  `libsdl2-dev` pulls in the X11/Wayland/ALSA headers that `SDL_syswm.h`
+  includes.
 
 ```bash
 sudo apt-get install -y clang ninja-build pkg-config \
-    libsdl2-dev libfreetype-dev libgtk-3-dev
+    libsdl2-dev libfreetype-dev libdbus-1-dev
 ```
 
 ### Steps
@@ -238,15 +239,12 @@ no OpenGL backend on Linux.
 |---|---|---|
 |`libSDL2-2.0.so.0`|`libsdl2-2.0-0`|window, input, audio|
 |`libfreetype.so.6`|`libfreetype6`|font rasterisation|
-|`libgtk-3.so.0` and its dependencies (`libgdk-3`, `libpango`, `libcairo`, `libglib`, …)|`libgtk-3-0`|the **Select ROM** file dialog|
+|`libdbus-1.so.3`|`libdbus-1-3`|the **Select ROM** file dialog|
 
-The GTK3 requirement is worth calling out, because it is not obvious: the
-`Select ROM` dialog is nativefiledialog-extended's GTK backend, statically
-linked into the executable, so its libraries become direct dependencies of the
-binary rather than something loaded on demand. GTK3 is present on GNOME and most
-desktop installs; on a minimal or non-GTK system install `libgtk-3-0`, or build
-with `-DNFD_PORTAL=ON` to use the xdg-desktop-portal backend (which needs
-`libdbus-1-3` instead).
+The **Select ROM** dialog goes through xdg-desktop-portal, so a portal service
+must be running (`xdg-desktop-portal` plus a desktop backend such as
+`xdg-desktop-portal-gnome`, `-kde` or `-gtk`). Every mainstream desktop ships
+one; on a bare window manager, install one or the dialog will not open.
 
 Everything else in the list is either the C/C++ runtime or a dependency of those
 three. Check what is missing on your system with:
