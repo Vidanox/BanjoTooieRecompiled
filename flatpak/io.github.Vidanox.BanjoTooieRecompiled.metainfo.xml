@@ -19,8 +19,8 @@
     </p>
   </description>
   <launchable type="desktop-id">io.github.Vidanox.BanjoTooieRecompiled.desktop</launchable>
-  <url type="homepage">https://github.com/Superredstone/BanjoTooieRecompiled</url>
-  <url type="bugtracker">https://github.com/Superredstone/BanjoTooieRecompiled/issues</url>
+  <url type="homepage">https://github.com/Vidanox/BanjoTooieRecompiled</url>
+  <url type="bugtracker">https://github.com/Vidanox/BanjoTooieRecompiled/issues</url>
   <provides>
     <binary>BanjoTooieRecompiled</binary>
   </provides>

@@ -498,19 +498,31 @@ regression in the default configuration.
 
 `Expand` widens only RT64's *rendering* viewport. Tooie's own CPU-side visibility
 test still builds a **4:3 frustum**, so anything outside the original view is
-discarded by the game before RT64 sees a display list. The three wrappers are in
+discarded by the game before RT64 sees a display list. The three consumers are in
 **core2**, not in the `bainvisible` overlay:
 
-|Wrapper|Kind|
+|Consumer|Kind|
 |---|---|
 |`func_800E3D0C`|float AABB|
 |`func_800E3DC0`|s16 AABB|
 |`func_800E3E8C`|sphere|
 
-Each sets `$v0 = $v1` immediately before `jr $ra`; `$v0 == 0` means culled, and
-callers branch straight on it. `tooie_expand_visibility` flips that verdict **only
-when `ar_option == Expand`**, reading the applied graphics config directly rather
-than mirroring the frontend's option callback.
+Their verdicts are **not** overridden any more: turning every rejection visible
+defeated selective culling and could exhaust model allocation space. Instead
+`func_800CAF34` — the routine that rebuilds the camera's four planes — is hooked
+before it restores `s0`, and `tooie_expand_frustum` widens and renormalizes only
+the two horizontal planes by `window aspect / (4:3)`. The vertical planes, the
+zoomed FOV and every box/sphere consumer keep their original behaviour; the game
+rebuilds the planes from its cached normals, so widening never accumulates. The
+window size is published from the SDL thread through an atomic. Original, Manual
+and portrait views keep the original planes.
+
+Two further Expand-only defects in the added side regions are fixed separately:
+RT64 tracks framebuffer write bounds against the full viewport/scissor
+intersection for world triangles (`patches/rt64.patch`), and the shared composite
+pickup bowl draw uses the complete model radius so its larger contents are not
+skipped when the bowl alone is culled. Each has a ROM-free regression check under
+`tools/tests/` (`frustum`, `bounds`, `pickups`, `blaster`).
 
 ### 7.2 `Display`/`Manual` refresh distorted the player model
 
