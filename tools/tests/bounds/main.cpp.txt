@@ -1,0 +1,18 @@
+int main(){
+ FixedRect missing{1255,797,1492,932};
+ const int capturedMode=0;
+ assert(capturedMode==G_EX_ASPECT_AUTO);
+ assert(run(missing,false,0x1000,true,capturedMode).isNull());
+ auto fixed=run(missing,true,0x1000,true,capturedMode);
+ assert(!fixed.isEmpty() && fixed.bottom(true)==228 && fixed.right(true)==304);
+ assert(run(missing,true,0x1000,true,G_EX_ASPECT_ADJUST).bottom(true)==228);
+ assert(run(missing,true,0x1000,true,G_EX_ASPECT_STRETCH).isNull());
+ assert(run(missing,true,0x1001,true,capturedMode).isNull());
+ assert(run(missing,true,0x1000,false,capturedMode).isNull());
+ assert(run(missing,true,0x1000,true,capturedMode,0).isNull());
+ assert(run(missing,true,0x1000,true,capturedMode,G_EX_ORIGIN_NONE,{0,0,400,912}).isNull());
+ for(auto box:{FixedRect{756,474,932,572},FixedRect{779,550,952,652}}){
+  auto old=run(box,false,0x1000,true,capturedMode);assert(old.ulx==box.ulx&&old.uly==box.uly&&old.lrx==box.lrx&&old.lry==box.lry);
+ }
+ puts("PASS: production bounds gate + FixedRect methods with observed AUTO flags and header constants; captured failure/control, Original, ADJUST/STRETCH, sky, ortho, custom origin and narrow viewport.");
+}

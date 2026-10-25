@@ -1,0 +1,14 @@
+struct UserConfiguration {enum class AspectRatio {Original,Expand};AspectRatio aspectRatio;};
+struct Projection {enum class Type {Perspective,Orthographic};};
+struct TransformGroup {uint32_t matrixId;int aspectMode;};
+FixedRect run(FixedRect raw,bool expand,uint32_t id,bool perspective,int mode,int origin=G_EX_ORIGIN_NONE,FixedRect clip={0,0,1216,912}) {
+ struct Data {std::vector<uint32_t> viewProjTransformGroups;std::vector<TransformGroup> transformGroups;};
+ struct Workload {Data drawData;uint64_t workloadId=0;}workload{{{0},{{id,mode}}}};
+ struct Pair {FixedRect scissorRect;}fbPair{{0,0,1216,912}};
+ struct Extended {struct Global {int viewportOrigin;}global;}extended{{origin}};
+ UserConfiguration config{expand?UserConfiguration::AspectRatio::Expand:UserConfiguration::AspectRatio::Original};
+ struct State {struct Ext {UserConfiguration* userConfig;}ext;}owner{{&config}};
+ auto*state=&owner;uint32_t curViewProjIndex=0;
+ auto projType=perspective?Projection::Type::Perspective:Projection::Type::Orthographic;
+ FixedRect viewportClipRect=clip,scissorRect{0,0,1216,912};
+ FixedRect drawRect=viewportClipRect.intersection(scissorRect.intersection(raw));

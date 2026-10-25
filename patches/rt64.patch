@@ -536,3 +536,35 @@ index e7895c3..6655c86 100644
      const float MaxDepth = simulateDepthClipF3D && !renderFlagRect(rp.flags) && !zSourcePrim ? (1022.0f / 1024.0f) : 1.0f;
      
      // FIXME: This can be implemented by checking feature support for the API and embedding the depth bounds into the pipeline.
+diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
+--- a/src/hle/rt64_rsp.cpp
++++ b/src/hle/rt64_rsp.cpp
+@@ -1153,6 +1153,28 @@
+             const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
+             const FixedRect viewportClipRect = viewport.rect(clipRatios.data());
+             drawRect = viewportClipRect.intersection(scissorRect.intersection(drawRect));
++            // Tooie's world projection is expanded later by ProjectionProcessor.
++            // posScreen still describes the original 4:3 view here. Geometry in
++            // the added side regions can therefore contribute no write bounds,
++            // making a later framebuffer pass too short or entirely empty.
++            // Keep a conservative full viewport for submitted Expand world tris.
++            // This changes render-target tracking, not guest object visibility.
++            const uint32_t groupIndex = workload.drawData.viewProjTransformGroups[curViewProjIndex];
++            const TransformGroup &group = workload.drawData.transformGroups[groupIndex];
++            const FixedRect fullViewport = viewportClipRect.intersection(scissorRect);
++            // Tooie emits AUTO, not ADJUST. Match the automatic full-width,
++            // landscape viewport rule used by ProjectionProcessor as well.
++            const bool autoAdjust = (group.aspectMode == G_EX_ASPECT_AUTO) &&
++                !fullViewport.isEmpty() &&
++                (extended.global.viewportOrigin == G_EX_ORIGIN_NONE) &&
++                (fullViewport.ulx <= fbPair.scissorRect.ulx) &&
++                (fullViewport.lrx >= fbPair.scissorRect.lrx) &&
++                (fullViewport.width(true, true) > fullViewport.height(true, true));
++            if ((state->ext.userConfig->aspectRatio == UserConfiguration::AspectRatio::Expand) &&
++                (projType == Projection::Type::Perspective) && (group.matrixId == 0x00001000U) &&
++                ((group.aspectMode == G_EX_ASPECT_ADJUST) || autoAdjust)) {
++                drawRect = fullViewport;
++            }
+             if (!drawRect.isNull()) {
+                 fbPair.drawColorRect.merge(drawRect);
+                 if (otherModeStack[otherModeStackSize - 1].zUpd()) {
