@@ -886,7 +886,7 @@ written; only the CI job was missing. What the Linux job needs, and why:
 |`clang`|rt64 and N64ModernRuntime pass GCC-style flags and are clang-only by construction. Ubuntu 24.04's clang is 18, which is enough — the LLVM 19 floor is MSVC's STL check, not the code.|
 |`libsdl2-dev`|SDL2, and transitively the X11/Wayland/ALSA headers `SDL_syswm.h` includes.|
 |`libfreetype-dev`|RmlUi's font engine (`Freetype::Freetype`).|
-|`libgtk-3-dev`|nativefiledialog-extended's Linux backend, GTK3 unless `NFD_PORTAL` is set.|
+|`libdbus-1-dev`|nativefiledialog-extended's xdg-desktop-portal backend (`NFD_PORTAL`, forced on for Linux — see below).|
 
 ⚠ **The first Linux run failed twice, and both causes were ours.** Neither was
 visible from Windows, which is the point of building both:
@@ -937,14 +937,19 @@ resolves, that the assets are present and that the version stamp is in the
 binary — nothing more. "Builds" and "runs" are different bars here as everywhere
 else in this file.
 
-⚠ **GTK3 is a runtime dependency of the Linux binary, and it is not obvious.**
-`ldd` on the artifact resolves `libgtk-3.so.0` (plus `libgdk-3`, `libpango`,
-`libcairo`, `libglib`, …) as a direct `DT_NEEDED`: nativefiledialog-extended's
-GTK backend is statically linked in, so its libraries are dependencies of the
-executable rather than something loaded on demand. The full set is
-`libSDL2-2.0.so.0`, `libfreetype.so.6`, `libgtk-3.so.0` and their transitive
-dependencies. Building with `-DNFD_PORTAL=ON` swaps GTK for the
-xdg-desktop-portal backend (`libdbus-1-3`) if that is preferable.
+⚠ **The GTK file dialog segfaulted on "Select ROM"; Linux uses the portal.**
+`NFD_Init` (→ `gtk_init`) runs on the main thread, but recompui opens the
+dialog from its UI thread, and GTK is single-threaded. Three coredumps on the
+first real Linux run all died in `gtk_box_get_content_size` under
+`gtk_file_chooser_dialog_new` ← `NFD_OpenDialogU8`, on a thread that was not
+the main one. `CMakeLists.txt` now sets `NFD_PORTAL=ON` for Linux before
+`add_subdirectory(rt64)` (which owns nfd): the xdg-desktop-portal backend
+talks D-Bus with no thread affinity, and GTK drops out of the binary entirely.
+`DT_NEEDED` is now `libSDL2-2.0.so.0`, `libfreetype.so.6`, `libdbus-1.so.3`
+plus libc/libm/libgcc_s/libatomic. The cost is a running portal service at
+runtime (standard on GNOME/KDE, absent on a bare window manager).
+⚠ It is a non-`FORCE` cache entry, so an *existing* `build-cmake/` configured
+before the change keeps `NFD_PORTAL=OFF` — reconfigure with `-U NFD_PORTAL`.
 
 ⚠ **The Linux package ships a `run.sh` for a reason.** `recompui`'s
 `file::get_program_path()` returns `""` on Linux as well as on Windows (the
@@ -994,8 +999,9 @@ Open work, roughly in priority order:
    were both build-time and are fixed (see §11: the shader compiler was only
    selected on Windows, and `recomp_api.cpp` used `RtlCaptureStackBackTrace`
    unconditionally). The first thing to check is that `run.sh` is what the
-   tester uses, because the assets are resolved against the working directory,
-   and the second is `libgtk-3-0`, which `ldd` shows as a direct dependency.
+   tester uses, because the assets are resolved against the working directory.
+   The first run crashed on **Select ROM** (GTK called off its thread); that is
+   fixed by the portal backend (§11) but has not yet been re-tested by hand.
 2. **Licensing on shipped assets.** `assets/Suplexmentary Comic NC.ttf` carries
    "All rights reserved" with no license, and the 11 icons in `assets/icons/`
    came from the same source. This blocks a public release.
