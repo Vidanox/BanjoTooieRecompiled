@@ -1,0 +1,57 @@
+{
+  "id": "io.github.Vidanox.BanjoTooieRecompiled",
+  "runtime": "org.freedesktop.Platform",
+  "runtime-version": "24.08",
+  "sdk": "org.freedesktop.Sdk",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.llvm18"
+  ],
+  "command": "BanjoTooieRecompiled",
+  "finish-args": [
+    "--share=network",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--socket=pulseaudio",
+    "--device=all",
+    "--filesystem=host",
+    "--filesystem=/media",
+    "--filesystem=/run/media",
+    "--filesystem=/mnt"
+  ],
+  "modules": [
+    {
+      "name": "BanjoTooieRecompiled",
+      "buildsystem": "simple",
+      "build-commands": [
+        "if [ -f lib/rt64/src/contrib/dxc/bin/x64/dxc-linux ] && ! lib/rt64/src/contrib/dxc/bin/x64/dxc-linux --help >/dev/null 2>&1; then mv lib/rt64/src/contrib/dxc/bin/x64/dxc-linux lib/rt64/src/contrib/dxc/bin/x64/dxc-linux-raw && printf '#!/bin/sh\\nexec /lib64/ld-linux-x86-64.so.2 \"$(dirname \"$0\")/dxc-linux-raw\" \"$@\"\\n' > lib/rt64/src/contrib/dxc/bin/x64/dxc-linux && chmod +x lib/rt64/src/contrib/dxc/bin/x64/dxc-linux; fi",
+        "cmake -S . -B build-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DRECOMP_FLATPAK=ON -DNFD_PORTAL=ON",
+        "cmake --build build-cmake --target BanjoTooieRecompiled --parallel",
+        "mkdir -p /app/bin",
+        "cp build-cmake/BanjoTooieRecompiled /app/bin/BanjoTooieRecompiled",
+        "cp -r assets /app/bin/assets",
+        "install -Dm644 assets/icon.png /app/share/icons/hicolor/128x128/apps/${FLATPAK_ID}.png",
+        "install -Dm644 flatpak/io.github.Vidanox.BanjoTooieRecompiled.metainfo.xml /app/share/metainfo/${FLATPAK_ID}.metainfo.xml",
+        "install -Dm644 flatpak/io.github.Vidanox.BanjoTooieRecompiled.desktop /app/share/applications/${FLATPAK_ID}.desktop"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": "../",
+          "skip": [
+            ".git",
+            ".flatpak-builder",
+            "builddir",
+            "build-cmake",
+            "repo",
+            "package"
+          ]
+        }
+      ],
+      "build-options": {
+        "append-path": "/usr/lib/sdk/llvm18/bin",
+        "prepend-ld-library-path": "/usr/lib/sdk/llvm18/lib",
+        "no-debuginfo": true
+      }
+    }
+  ]
+}

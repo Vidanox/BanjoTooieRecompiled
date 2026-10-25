@@ -253,16 +253,29 @@ three. Check what is missing on your system with:
 ldd BanjoTooieRecompiled | grep 'not found'
 ```
 
+### Flatpak
+
+A standalone Flatpak bundle (`BanjoTooieRecompiled.flatpak`) is available in [Releases](#releases) for Linux and Steam Deck.
+
+To install and run:
+```bash
+flatpak install BanjoTooieRecompiled.flatpak
+flatpak run io.github.Vidanox.BanjoTooieRecompiled
+```
+
+Flatpak bundles its runtime dependencies and uses the desktop portal for the **Select ROM** file dialog. Save data and configurations are stored in `~/.var/app/io.github.Vidanox.BanjoTooieRecompiled/config/BanjoTooieRecompiled/`. See [`flatpak/README.md`](flatpak/README.md) for build instructions.
+
 ## Releases
 
 Releases are built and published by
 [`.github/workflows/build.yml`](.github/workflows/build.yml); there is no manual
-release step. Every release carries both packages, built from the same commit:
+release step. Every release carries packages built from the same commit:
 
 |Archive|Platform|
 |---|---|
 |`BanjoTooieRecompiled-windows-x64.zip`|the executable, the SDL2/DXC DLLs it loads, and `assets/`|
 |`BanjoTooieRecompiled-linux-x64.tar.gz`|the executable, `assets/`, and `run.sh`|
+|`BanjoTooieRecompiled.flatpak`|standalone Flatpak bundle for Linux and Steam Deck|
 
 Both are built from the same commit by the same workflow run, and published
 together. The Windows archive carries the DLLs it loads; the Linux one carries
@@ -314,6 +327,7 @@ BanjoTooieRecomp/
 │   ├── icon.png / .ico / .rc   executable icon (see AGENTS.md)
 │   └── menu.png            launcher wallpaper
 ├── decomp/                 symbol/relocation tables from the WIP decompilation
+├── flatpak/                Flatpak packaging: manifest, desktop entry, metainfo
 ├── patches/                the three dependency patches
 ├── lib/                    dependencies as git submodules
 └── tools/                  build and diagnostics scripts (see below)

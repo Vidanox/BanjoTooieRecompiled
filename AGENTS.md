@@ -960,6 +960,13 @@ to the executable's own folder — but on Linux it is not, and the failure is
 throw. `run.sh` `cd`s to its own directory first. Anything that launches the
 Linux binary must do the same.
 
+**Flatpak packaging (`flatpak/`).** App ID `io.github.Vidanox.BanjoTooieRecompiled`.
+Built with `-DRECOMP_FLATPAK=ON` and `-DNFD_PORTAL=ON`. This defines
+`RECOMP_FLATPAK` so `recompui::file::get_program_path()` resolves assets directly
+from `/app/bin/assets/`, and configures nativefiledialog-extended to use
+`xdg-desktop-portal` over DBus for the ROM selection dialog. CI builds the
+standalone `.flatpak` bundle after the native Windows and Linux builds succeed.
+
 ---
 
 ## 12. Build configuration, status, and what remains

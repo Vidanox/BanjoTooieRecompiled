@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.Vidanox.BanjoTooieRecompiled</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Banjo-Tooie: Recompiled</name>
+  <summary>Static recompilation of Banjo-Tooie (USA) for PC</summary>
+  <developer id="vidanox.github.io">
+    <name>Vidanox</name>
+  </developer>
+  <description>
+    <p>
+      Banjo-Tooie: Recompiled is an ahead-of-time static recompilation of Banjo-Tooie (USA)
+      into native code for modern PC platforms, utilizing RT64 for high-performance rendering.
+    </p>
+    <p>
+      Note: This project does not contain copyrighted game assets. You must provide a copy of
+      the original Banjo-Tooie (USA) Nintendo 64 ROM (.z64) upon initial launch.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.Vidanox.BanjoTooieRecompiled.desktop</launchable>
+  <url type="homepage">https://github.com/Superredstone/BanjoTooieRecompiled</url>
+  <url type="bugtracker">https://github.com/Superredstone/BanjoTooieRecompiled/issues</url>
+  <provides>
+    <binary>BanjoTooieRecompiled</binary>
+  </provides>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>gamepad</control>
+  </supports>
+  <categories>
+    <category>Game</category>
+    <category>ActionGame</category>
+    <category>AdventureGame</category>
+  </categories>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="1.0.0" date="2026-10-08"/>
+  </releases>
+</component>

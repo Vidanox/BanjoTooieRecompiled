@@ -344,10 +344,76 @@ jobs:
           path: package/BanjoTooieRecompiled-linux-x64.tar.gz
           if-no-files-found: error
 
+  build-flatpak:
+    needs: [version, build-windows, build-linux]
+    runs-on: ubuntu-24.04
+    env:
+      FLATPAK_ID: io.github.Vidanox.BanjoTooieRecompiled
+      FREEDESKTOP_VERSION: "24.08"
+      LLVM_VERSION: "18"
+
+    steps:
+      - name: Check out, with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install flatpak tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder elfutils appstream
+
+      - name: Apply the dependency patches
+        run: python tools/setup_deps.py
+
+      - name: Verify dependencies are in the required state
+        run: python tools/setup_deps.py --check
+
+      - name: Set up Flathub runtimes
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub \
+            org.freedesktop.Platform//${{ env.FREEDESKTOP_VERSION }} \
+            org.freedesktop.Sdk//${{ env.FREEDESKTOP_VERSION }} \
+            org.freedesktop.Sdk.Extension.llvm${{ env.LLVM_VERSION }}//${{ env.FREEDESKTOP_VERSION }}
+
+      - name: Build Flatpak
+        env:
+          BT_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          if [ -n "${BT_VERSION:-}" ]; then
+            sed -i "s|-DRECOMP_FLATPAK=ON|-DRECOMP_FLATPAK=ON -DBT_VERSION=${BT_VERSION}|" "flatpak/${FLATPAK_ID}.json"
+          fi
+          flatpak-builder --user --force-clean --repo=repo builddir "flatpak/${FLATPAK_ID}.json"
+
+          exe="builddir/files/bin/BanjoTooieRecompiled"
+          if [ ! -x "$exe" ]; then echo "Flatpak build produced no executable"; exit 1; fi
+          file "$exe"
+
+          want="${{ needs.version.outputs.version }}"
+          if ! grep -qa -- "$want" "$exe"; then
+            echo "the executable does not carry the version string '$want'"; exit 1
+          fi
+          echo "version stamp present: $want"
+
+          mkdir -p package
+          flatpak build-bundle repo "package/BanjoTooieRecompiled.flatpak" "${FLATPAK_ID}" \
+            --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
+          ls -l package
+
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: BanjoTooieRecompiled-flatpak
+          path: package/BanjoTooieRecompiled.flatpak
+          if-no-files-found: error
+
   # One publisher, so the two builds cannot race to create the release and a
   # release is never published missing one of its assets.
   release:
-    needs: [version, build-windows, build-linux]
+    needs: [version, build-windows, build-linux, build-flatpak]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -372,6 +438,7 @@ jobs:
           files: |
             package/BanjoTooieRecompiled-windows-x64.zip
             package/BanjoTooieRecompiled-linux-x64.tar.gz
+            package/BanjoTooieRecompiled.flatpak
           body: |
             Built from
             [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}).
@@ -389,6 +456,7 @@ jobs:
             |---|---|---|
             | Windows x64 | `BanjoTooieRecompiled-windows-x64.zip` | extract, run `BanjoTooieRecompiled.exe` |
             | Linux x64 | `BanjoTooieRecompiled-linux-x64.tar.gz` | extract, run `./run.sh` from inside the extracted directory |
+            | Linux (Flatpak) | `BanjoTooieRecompiled.flatpak` | `flatpak install BanjoTooieRecompiled.flatpak` |
 
             On Linux, run it through `run.sh` rather than the executable
             directly: the launcher looks for its `assets/` directory relative to
@@ -397,6 +465,9 @@ jobs:
             and, for the **Select ROM** dialog, a running xdg-desktop-portal
             (standard on GNOME and KDE). See `README.md` for the exact
             list and the packages that provide them.
+
+            The Flatpak package resolves assets internally and uses the
+            desktop portal for the ROM picker dialog.
 
             Requires a GPU with Direct3D 12 (Shader Model 6) or Vulkan 1.2.
             See `README.md` for details.

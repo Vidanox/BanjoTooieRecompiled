@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Banjo-Tooie: Recompiled
+Comment=Static recompilation of Banjo-Tooie (USA) for PC
+Exec=BanjoTooieRecompiled
+Icon=io.github.Vidanox.BanjoTooieRecompiled
+Terminal=false
+Type=Application
+Categories=Game;ActionGame;AdventureGame;
+StartupWMClass=BanjoTooieRecompiled
+Keywords=banjo;tooie;recompiled;n64;platformer;rare;
+PrefersNonDefaultGPU=true

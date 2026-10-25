@@ -31,6 +31,14 @@ endif()
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
+if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+    option(RECOMP_FLATPAK "Configure the build for Flatpak compatibility." OFF)
+    if (RECOMP_FLATPAK)
+        add_compile_definitions(RECOMP_FLATPAK)
+        set(NFD_PORTAL ON CACHE BOOL "Use xdg-desktop-portal instead of GTK" FORCE)
+    endif()
+endif()
+
 set(RT64_STATIC TRUE)
 set(RT64_SDL_WINDOW_VULKAN TRUE)
 add_compile_definitions(
@@ -304,7 +312,9 @@ target_sources(BanjoTooieRecompiled PRIVATE ${SOURCES})
 # The emptiness test matters: an empty define would make the version string "",
 # which recomp::Version::from_string rejects, and main() would exit before the
 # window opened. An exported-but-empty BT_VERSION must mean "no stamp".
-if (DEFINED ENV{BT_VERSION} AND NOT "$ENV{BT_VERSION}" STREQUAL "")
+if (DEFINED BT_VERSION AND NOT "${BT_VERSION}" STREQUAL "")
+    target_compile_definitions(BanjoTooieRecompiled PRIVATE "BT_VERSION=\"${BT_VERSION}\"")
+elseif (DEFINED ENV{BT_VERSION} AND NOT "$ENV{BT_VERSION}" STREQUAL "")
     target_compile_definitions(BanjoTooieRecompiled PRIVATE "BT_VERSION=\"$ENV{BT_VERSION}\"")
 endif()
 
