@@ -283,18 +283,18 @@ none, so see [Runtime dependencies](#runtime-dependencies) for what to install.
 
 |You push|You get|
 |---|---|
-|a commit to `main`|a release tagged `v<base>-build.<run number>`, created at that commit|
+|a commit to `main`|a release for the next patch version, `v1.0.1`, `v1.0.2`, …|
 |a `v*` tag|a release for that tag, versioned exactly as the tag says|
 
-`<base>` is the highest plain `vX.Y.Z` tag in the repository, so tagging `v1.1.0`
-moves the base and later builds become `v1.1.0-build.<n>`. Releases from `main`
-are ordinary releases, not pre-releases, so **`releases/latest` is always the
-newest build**. Pull requests build and upload a workflow artifact but publish
-nothing.
+The highest plain `vX.Y.Z` tag sets the base; a commit to `main` increments its
+patch. Tagging `v1.1.0` therefore makes the next branch build `v1.1.1`. Releases
+from `main` are ordinary releases, not pre-releases, so **`releases/latest` is
+always the newest build**. Pull requests build and upload a workflow artifact
+but publish nothing.
 
 The version a release is built as is stamped into the executable, and the
-launcher shows it in the bottom-left corner (`v1.0.0-build.12`). A local build,
-which has no stamp, reports `1.0.0`. The workflow passes it in as the
+launcher shows it in the bottom-left corner (`v1.0.1`). A local build, which has
+no stamp, reports `1.0.0`. The workflow passes it in as the
 `BT_VERSION` environment variable, which `CMakeLists.txt` turns into a define;
 a tag that is not `vMAJOR.MINOR.PATCH` is rejected before anything is built,
 because the game refuses to start on a version string it cannot parse.

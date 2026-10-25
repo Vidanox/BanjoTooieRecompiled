@@ -7,11 +7,10 @@ name: Build
 #
 # Two ways a release is produced:
 #
-#   * push to `main`  -> a build-stamped release, `v<base>-build.<run number>`,
-#                        tagged automatically at the pushed commit. `<base>` is
-#                        the highest plain `vX.Y.Z` tag, so a human tagging
-#                        `v1.1.0` moves the base and builds become
-#                        `v1.1.0-build.<n>` from then on.
+#   * push to `main`  -> a release for the next patch version, `v1.0.1`,
+#                        tagged automatically at the pushed commit. The highest
+#                        plain `vX.Y.Z` tag is incremented, so a human tagging
+#                        `v1.1.0` makes the next branch build `v1.1.1`.
 #   * push of a `v*` tag -> a release for that tag, versioned exactly as the tag
 #                        says.
 #
@@ -81,9 +80,10 @@ jobs:
                       "version with recomp::Version::from_string and refuses "
                       "to start on anything else" % tag)
           else:
-              # A build off a branch. Base the version on the highest plain
-              # vX.Y.Z tag and append the run number, which is unique and
-              # monotonic across the repository.
+              # A build off a branch. Increment the patch of the highest plain
+              # vX.Y.Z tag so every release is distinct and ordered
+              # (v1.0.1, v1.0.2, ...). A human tag push moves the base: after
+              # v1.1.0 the next branch build is v1.1.1.
               #
               # `ls-remote` rather than `git tag`, because the checkout is
               # shallow and has no tags in it. Sorting on the parsed tuple
@@ -94,8 +94,14 @@ jobs:
                       for line in out.splitlines() if "\t" in line]
               plain = sorted((t for t in tags if re.fullmatch(r"v\d+\.\d+\.\d+", t)),
                              key=lambda t: tuple(int(p) for p in t[1:].split(".")))
-              base = plain[-1][1:] if plain else "1.0.0"
-              version = "%s-build.%s" % (base, os.environ["GITHUB_RUN_NUMBER"])
+              if plain:
+                  major, minor, patch = (int(p) for p in plain[-1][1:].split("."))
+                  patch += 1
+                  while "v%d.%d.%d" % (major, minor, patch) in tags:
+                      patch += 1
+                  version = "%d.%d.%d" % (major, minor, patch)
+              else:
+                  version = "1.0.0"
               tag = "v" + version
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:

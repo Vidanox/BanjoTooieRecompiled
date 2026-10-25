@@ -856,11 +856,12 @@ Both Windows x64 and Linux x64 are built, and **one** `release` job publishes
 them together, so the two builds cannot race to create the release and a release
 is never published missing one of its assets.
 
-* **The tag** for a `main` push is `v<base>-build.<run number>`, where `<base>`
-  is the highest plain `vX.Y.Z` tag. It is read with `git ls-remote --tags`
-  rather than `git tag`, because the checkout is `fetch-depth: 1` — a shallow
-  clone has no tags in it at all. (The step is Python, run with `shell: python`,
-  so the same code runs on both runners.)
+* **The tag** for a `main` push is the next patch version: the highest plain
+  `vX.Y.Z` tag with its patch incremented (`v1.0.1`, `v1.0.2`, …). It is read
+  with `git ls-remote --tags` rather than `git tag`, because the checkout is
+  `fetch-depth: 1` — a shallow clone has no tags in it at all. A human tag push
+  moves the base (after `v1.1.0`, branch builds are `v1.1.1`). (The step is
+  Python, run with `shell: python`, so the same code runs on both runners.)
 * **The version is stamped into the executable**, so the launcher's label — and
   any bug report that quotes it — identifies the build. The workflow sets
   `BT_VERSION`; `CMakeLists.txt` turns it into the `BT_VERSION` define; and
@@ -870,9 +871,9 @@ is never published missing one of its assets.
   `-suffix`. `recomp::Version::from_string` accepts nothing else and `main`
   exits with `Invalid version string` on anything else, so the workflow rejects
   a non-conforming tag *before* building rather than shipping an executable that
-  cannot start. `1.0.0-build.7` is fine — the suffix is explicitly allowed.
-  Verified end to end: a build stamped `1.0.0-build.99` boots past
-  `[tooie] step version` with no error.
+  cannot start. `1.0.0` is what the workflow emits now; a manual tag may carry
+  a suffix, and `1.0.0-build.7` is accepted because the suffix is explicitly
+  allowed. Verified end to end with `1.0.0-build.99`.
 * ⚠ **It is an environment variable rather than a `-D` cache entry on purpose.**
   A cache entry persists in `build-cmake/`, so it would keep stamping a stale
   version into local builds long after the workflow that set it had gone.
