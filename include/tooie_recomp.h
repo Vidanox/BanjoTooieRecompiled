@@ -64,10 +64,9 @@ void tooie_yield_pending_sound(uint8_t* rdram, recomp_context* ctx);
 // Clears the runtime's RDP freeze bit when Tooie signals the frame barrier.
 void tooie_clear_dp_freeze(uint8_t* rdram, recomp_context* ctx);
 
-// Turns a "culled" verdict from Tooie's float-AABB, s16-AABB and sphere
-// visibility wrappers into "visible" while the applied aspect ratio is Expand,
-// whose projection is wider than the planes those tests build.
-void tooie_expand_visibility(uint8_t* rdram, recomp_context* ctx);
+// Widens only the camera's horizontal visibility planes for RT64 Expand.
+// Called at the end of func_800CAF34 before it restores s0 (the camera).
+void tooie_expand_frustum(uint8_t* rdram, recomp_context* ctx);
 
 // RT64 interpolation metadata. The game emits none of its own, so every
 // transform looks new to RT64 and it blends matrices that do not correspond,

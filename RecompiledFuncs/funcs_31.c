@@ -13938,7 +13938,6 @@ L_800E3DAC:
     ctx->r29 = ADD32(ctx->r29, 0X50);
     // 0x800E3DB4: or          $v0, $v1, $zero
     ctx->r2 = ctx->r3 | 0;
-    tooie_expand_visibility(rdram, ctx);
     // 0x800E3DB8: jr          $ra
     return;
 ;}
@@ -14094,7 +14093,6 @@ L_800E3E78:
     ctx->r29 = ADD32(ctx->r29, 0X50);
     // 0x800E3E80: or          $v0, $v1, $zero
     ctx->r2 = ctx->r3 | 0;
-    tooie_expand_visibility(rdram, ctx);
     // 0x800E3E84: jr          $ra
     return;
 ;}
@@ -14178,7 +14176,6 @@ L_800E3EE8:
     ctx->r29 = ADD32(ctx->r29, 0X28);
     // 0x800E3EF0: or          $v0, $v1, $zero
     ctx->r2 = ctx->r3 | 0;
-    tooie_expand_visibility(rdram, ctx);
     // 0x800E3EF4: jr          $ra
     return;
 ;}

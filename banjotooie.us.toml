@@ -414,30 +414,13 @@ func = "ovl_shift"
 before_vram = 0x80082528
 text = "tooie_reregister_shifted_overlay(rdram, ctx);"
 
-# `Aspect Ratio: Expand` widens only the projection handed to RT64. Tooie's own
-# visibility tests still build their planes from the original 4:3 camera, so
-# geometry in the expanded side regions is discarded by the game before any
-# display list reaches RT64 and the sides render as bare background.
-#
-# These are the three wrappers that produce those verdicts: func_800E3D0C
-# (float AABB), func_800E3DC0 (s16 AABB) and func_800E3E8C (sphere). Each leaves
-# 0 in $v0 for "culled" and non-zero for "visible", so hooking the return lets
-# the host turn a rejection into "visible" -- and only while the applied aspect
-# ratio is Expand, so Original and Manual keep the game's exact behaviour.
+# Widen the CPU camera's horizontal planes to match RT64 Expand. Never force
+# rejected boxes/spheres visible: that defeats zoom culling and exhausts model
+# allocation space in Witchyworld. s0 still holds the camera at this hook.
 [[patches.hook]]
-func = "func_800E3D0C"
-before_vram = 0x800E3DB8
-text = "tooie_expand_visibility(rdram, ctx);"
-
-[[patches.hook]]
-func = "func_800E3DC0"
-before_vram = 0x800E3E84
-text = "tooie_expand_visibility(rdram, ctx);"
-
-[[patches.hook]]
-func = "func_800E3E8C"
-before_vram = 0x800E3EF4
-text = "tooie_expand_visibility(rdram, ctx);"
+func = "func_800CAF34"
+before_vram = 0x800CB0D4
+text = "tooie_expand_frustum(rdram, ctx);"
 
 # RT64 interpolation metadata for the player model. RT64's Display/Manual
 # refresh-rate modes present frames blended between the game's own 20/30 Hz

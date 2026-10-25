@@ -37,6 +37,7 @@
 #include "recomp.h"
 #include "register_overlays.hpp"
 #include "tooie_recomp.h"
+#include "tooie_visibility.hpp"
 
 // CIC-NUS-6105 challenge/response, vendored by RT64's mupen64plus-core copy.
 extern "C" {
@@ -782,28 +783,64 @@ extern "C" void tooie_clear_dp_freeze(uint8_t* rdram, recomp_context* ctx) {
     rdp_state &= ~kDpStatusFreeze;
 }
 
-// `Aspect Ratio: Expand` widens only the projection RT64 is handed. Tooie's
-// visibility tests build their planes from the original 4:3 camera, so anything
-// in the extra side regions is rejected by the game before a display list ever
-// reaches RT64, and those regions render as bare background. func_800E3D0C,
-// func_800E3DC0 and func_800E3E8C are the float-AABB, s16-AABB and sphere
-// wrappers that produce those verdicts; each leaves 0 in $v0 for "culled" and
-// non-zero for "visible".
-//
-// Every original result is preserved unless Expand is the applied setting, so
-// Original and Manual keep the game's exact behaviour. In Expand a rejection
-// becomes "visible", which is the whole fix: the geometry exists, it was only
-// being culled by a camera narrower than the one being rendered.
-extern "C" void tooie_expand_visibility(uint8_t* rdram, recomp_context* ctx) {
-    (void)rdram;
-    if (ctx->r2 != 0) {
-        return;
+// RT64 Expand derives its target aspect from the window, with a 4:3 floor.
+// Publish dimensions on the SDL thread instead of querying SDL from guest code.
+namespace tooie::visibility {
+namespace {
+std::atomic<float> current_display_aspect{4.0f / 3.0f};
+}
+
+void update_display_size(int width, int height) {
+    if (width > 0 && height > 0) {
+        current_display_aspect.store(static_cast<float>(width) / height,
+                                     std::memory_order_relaxed);
     }
+}
+
+float display_aspect_ratio() {
+    return current_display_aspect.load(std::memory_order_relaxed);
+}
+} // namespace tooie::visibility
+
+// Hook the completed camera-plane rebuild, before s0 is restored. The game
+// rebuilds these from its original cached normals each time, so widening never
+// accumulates. Only the two horizontal planes change; all original visibility
+// consumers retain their own box/sphere tests, including the zoomed FOV.
+extern "C" void tooie_expand_frustum(uint8_t* rdram, recomp_context* ctx) {
     if (ultramodern::renderer::get_graphics_config().ar_option !=
         ultramodern::renderer::AspectRatio::Expand) {
         return;
     }
-    ctx->r2 = 1;
+    const float expansion = tooie::visibility::display_aspect_ratio() /
+                            (4.0f / 3.0f);
+    if (expansion <= 1.0f) {
+        return;
+    }
+    const gpr camera = ctx->r16;
+    tooie::visibility::Plane planes[2]{};
+    for (int side = 0; side < 2; ++side) {
+        const int offset = 0x24 + side * 0x10;
+        for (int axis = 0; axis < 3; ++axis) {
+            const uint32_t bits = MEM_W(offset + axis * 4, camera);
+            std::memcpy(&planes[side].normal[axis], &bits, sizeof(bits));
+        }
+        const uint32_t bits = MEM_W(offset + 0xC, camera);
+        std::memcpy(&planes[side].distance, &bits, sizeof(bits));
+    }
+    if (!tooie::visibility::widen_side_planes(planes, expansion)) {
+        return;
+    }
+    for (int side = 0; side < 2; ++side) {
+        const int offset = 0x24 + side * 0x10;
+        for (int axis = 0; axis < 3; ++axis) {
+            uint32_t bits;
+            std::memcpy(&bits, &planes[side].normal[axis], sizeof(bits));
+            MEM_W(offset + axis * 4, camera) = bits;
+        }
+        uint32_t bits;
+        std::memcpy(&bits, &planes[side].distance, sizeof(bits));
+        MEM_W(offset + 0xC, camera) = bits;
+    }
 }
 
 // ---------------------------------------------------------------------------

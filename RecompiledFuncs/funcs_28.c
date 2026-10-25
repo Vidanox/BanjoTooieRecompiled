@@ -8496,6 +8496,7 @@ RECOMP_FUNC void func_800CAF34(uint8_t* rdram, recomp_context* ctx) {
     // 0x800CB0D0: nop
 
     after_19:
+    tooie_expand_frustum(rdram, ctx);
     // 0x800CB0D4: lw          $ra, 0x1C($sp)
     ctx->r31 = MEM_W(ctx->r29, 0X1C);
     // 0x800CB0D8: lw          $s0, 0x18($sp)

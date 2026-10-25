@@ -55,6 +55,7 @@
 #include "funcs.h"
 #include "register_overlays.hpp"
 #include "rom_decompression.hpp"
+#include "tooie_visibility.hpp"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -123,6 +124,8 @@ ultramodern::renderer::WindowHandle create_window(
     }
     std::fprintf(stderr, "[tooie] create_window created\n"); std::fflush(stderr);
 
+    tooie::visibility::update_display_size(1600, 900);
+
     SDL_SysWMinfo wm_info;
     SDL_VERSION(&wm_info.version);
     SDL_GetWindowWMInfo(window, &wm_info);
@@ -146,6 +149,9 @@ void update_gfx(void*) {
         std::fflush(stderr);
     }
     recompinput::handle_events();
+    int width = 0, height = 0;
+    SDL_GetWindowSize(window, &width, &height);
+    tooie::visibility::update_display_size(width, height);
     if (count < 5) {
         std::fprintf(stderr, "[tooie] update_gfx call %d done\n", count);
         std::fflush(stderr);
