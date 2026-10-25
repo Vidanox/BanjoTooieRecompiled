@@ -3142,16 +3142,24 @@ RECOMP_FUNC void func_8080762C_bsfirstp(uint8_t* rdram, recomp_context* ctx) {
     // 0x8080764C: lui         $at, 0x1
     ctx->r1 = S32(RELOC_HI16(108, 0XA560) << 16);
     // 0x80807650: addu        $at, $at, $t6
+    gpr jr_addend_80807658 = ctx->r14;
     ctx->r1 = ADD32(ctx->r1, ctx->r14);
     // 0x80807654: lw          $t6, -0x5AA0($at)
-    ctx->r14 = MEM_W(ctx->r1, (int16_t)RELOC_LO16(108, 0XA560));
+    ctx->r14 = ADD32(ctx->r1, (int16_t)RELOC_LO16(108, 0XA560));
     // 0x80807658: jr          $t6
     // 0x8080765C: nop
 
-    LOOKUP_FUNC(ctx->r14)(rdram, ctx);
-    return;
+    switch (jr_addend_80807658 >> 2) {
+        case 0: goto L_80807660; break;
+        case 1: goto L_80807690; break;
+        case 2: goto L_80807660; break;
+        case 3: goto L_808076B8; break;
+        case 4: goto L_8080775C; break;
+        default: switch_error(__func__, 0x80807658, 0x8080A560);
+    }
     // 0x8080765C: nop
 
+L_80807660:
     // 0x80807660: jal         0x800072C8
     // 0x80807664: or          $a0, $s0, $zero
     ctx->r4 = ctx->r16 | 0;
@@ -3200,6 +3208,7 @@ RECOMP_FUNC void func_8080762C_bsfirstp(uint8_t* rdram, recomp_context* ctx) {
         goto L_80807788;
     // 0x8080768C: lw          $ra, 0x1C($sp)
     ctx->r31 = MEM_W(ctx->r29, 0X1C);
+L_80807690:
     // 0x80807690: jal         0x80007328
     // 0x80807694: or          $a0, $s0, $zero
     ctx->r4 = ctx->r16 | 0;
@@ -3240,6 +3249,7 @@ RECOMP_FUNC void func_8080762C_bsfirstp(uint8_t* rdram, recomp_context* ctx) {
         goto L_80807788;
     // 0x808076B4: lw          $ra, 0x1C($sp)
     ctx->r31 = MEM_W(ctx->r29, 0X1C);
+L_808076B8:
     // 0x808076B8: lui         $a1, 0x3DDD
     ctx->r5 = S32(0X3DDD << 16);
     // 0x808076BC: ori         $a1, $a1, 0x6388
@@ -3378,6 +3388,7 @@ L_8080774C:
         goto L_80807788;
     // 0x80807758: lw          $ra, 0x1C($sp)
     ctx->r31 = MEM_W(ctx->r29, 0X1C);
+L_8080775C:
     // 0x8080775C: jal         0x80007328
     // 0x80807760: or          $a0, $s0, $zero
     ctx->r4 = ctx->r16 | 0;

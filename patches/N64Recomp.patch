@@ -87,7 +87,7 @@ index d155b83..b878fa0 100644
          void emit_cop1_cs_write(int reg) const final;
          void emit_muldiv(InstrId instr_id, int reg1, int reg2) const final;
 diff --git a/src/analysis.cpp b/src/analysis.cpp
-index 9eaaa30..871c3ab 100644
+index 9eaaa30..2be549c 100644
 --- a/src/analysis.cpp
 +++ b/src/analysis.cpp
 @@ -57,7 +57,8 @@ using InstrId = rabbitizer::InstrId::UniqueId;
@@ -130,7 +130,7 @@ index 9eaaa30..871c3ab 100644
      auto check_move = [&]() {
          if (rs == 0) {
              // rs is zero so copy rt to rd
-@@ -87,6 +111,19 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
+@@ -87,6 +111,22 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
          // rt has been completely overwritten, so invalidate it
          reg_states[rt].invalidate();
          reg_states[rt].prev_lui = (int16_t)imm << 16;
@@ -145,12 +145,15 @@ index 9eaaa30..871c3ab 100644
 +        // be emitted as a runtime function lookup, which aborts the game with
 +        // "Failed to find function at 0x80193B8C" (glcutDll).
 +        if (auto target = reloc_target(instr.getVram())) {
-+            reg_states[rt].prev_lui = *target & 0xFFFF0000;
++            // The low half is sign-extended by lw/addiu. Carry bit 15 into
++            // the high half before masking, or targets such as 0x8080A494
++            // reconstruct 0x10000 bytes too low and valid tables are missed.
++            reg_states[rt].prev_lui = (*target + 0x8000U) & 0xFFFF0000U;
 +        }
          reg_states[rt].valid_lui = true;
          break;
      case InstrId::cpu_addiu:
-@@ -276,7 +313,7 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+@@ -276,7 +316,7 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
      // Look for jump tables
      // A linear search through the func won't be accurate due to not taking control flow into account, but it'll work for finding jtables
      for (const auto& instr : instructions) {
@@ -159,7 +162,7 @@ index 9eaaa30..871c3ab 100644
              return false;
          }
      }
-@@ -289,7 +326,11 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+@@ -289,7 +329,11 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
              JumpTable& cur_jtbl = stats.jump_tables[i];
  
              if (cur_jtbl.got_offset.has_value()) {
@@ -172,7 +175,7 @@ index 9eaaa30..871c3ab 100644
  
                  cur_jtbl.vram += (section->ram_addr + got_word);
              }
-@@ -322,8 +363,33 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+@@ -322,8 +366,33 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
              // Retrieve the current entry of the jump table
              // TODO same as above
              uint32_t rom_addr = vram + func.rom - func.vram;
@@ -206,7 +209,7 @@ index 9eaaa30..871c3ab 100644
              if (cur_jtbl.got_offset.has_value() && got_ram_addr.has_value()) {
                  // Position independent jump tables have values that are offsets from the GOT,
                  // convert those to absolute addresses
-@@ -340,8 +406,12 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+@@ -340,8 +409,12 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
          }
  
          if (cur_jtbl.entries.size() == 0) {
