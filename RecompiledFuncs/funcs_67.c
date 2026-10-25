@@ -34933,6 +34933,7 @@ RECOMP_FUNC void func_80800898_chnests(uint8_t* rdram, recomp_context* ctx) {
     ctx->r5 = ADD32(ctx->r29, 0X34);
     // 0x8080091C: or          $a3, $v0, $zero
     ctx->r7 = ctx->r2 | 0;
+    tooie_expand_pickup_scope(rdram, ctx, 1);
     // 0x80800920: jal         0x800DE448
     // 0x80800924: sw          $t6, 0x10($sp)
     MEM_W(0X10, ctx->r29) = ctx->r14;
@@ -34941,6 +34942,7 @@ RECOMP_FUNC void func_80800898_chnests(uint8_t* rdram, recomp_context* ctx) {
     // 0x80800924: sw          $t6, 0x10($sp)
     MEM_W(0X10, ctx->r29) = ctx->r14;
     after_8:
+    tooie_expand_pickup_scope(rdram, ctx, 2);
     // 0x80800928: lw          $ra, 0x24($sp)
     ctx->r31 = MEM_W(ctx->r29, 0X24);
     // 0x8080092C: lw          $s0, 0x20($sp)

@@ -26979,6 +26979,7 @@ L_800DE6CC:
     }
     // 0x800DE6DC: lwc1        $f18, 0x104($sp)
     ctx->f18.u32l = MEM_W(ctx->r29, 0X104);
+    tooie_expand_pickup_radius(rdram, ctx);
     // 0x800DE6E0: mul.s       $f4, $f14, $f18
     CHECK_FR(ctx, 4);
     CHECK_FR(ctx, 14);

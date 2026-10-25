@@ -533,3 +533,20 @@ func = "func_800BFD6C"
 before_vram = 0x800BFDF8
 text = "tooie_rt64_sky_layer(rdram, ctx);"
 
+
+# Expand-only: bowl rejection must not hide the larger audited pickup contents.
+# The scope brackets precisely the bowl draw, including all early returns.
+[[patches.hook]]
+func = "func_80800898_chnests"
+before_vram = 0x80800920
+text = "tooie_expand_pickup_scope(rdram, ctx, 1);"
+
+[[patches.hook]]
+func = "func_80800898_chnests"
+before_vram = 0x80800928
+text = "tooie_expand_pickup_scope(rdram, ctx, 2);"
+
+[[patches.hook]]
+func = "func_800DE498"
+before_vram = 0x800DE6E0
+text = "tooie_expand_pickup_radius(rdram, ctx);"

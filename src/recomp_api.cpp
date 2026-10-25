@@ -843,6 +843,59 @@ extern "C" void tooie_expand_frustum(uint8_t* rdram, recomp_context* ctx) {
     }
 }
 
+// Composite pickups draw a radius-70 bowl before their larger contents.
+// Only Expand gives that prerequisite draw the complete pickup's bounds.
+// The whitelist is limited to the 13 audited chnests descriptors. Model radii
+// are unscaled; func_800DE498 still applies the original actor draw scale.
+namespace {
+struct PickupVisualBounds {
+    uint32_t descriptor_thunk;
+    float model_radius;
+};
+constexpr PickupVisualBounds kCompositePickupBounds[] = {
+    {0x80085A70U, 107.0f}, // chnests export 0, model 0x06EA
+    {0x80085A78U, 107.0f}, // chnests export 1, model 0x06EA
+    {0x80085A80U, 107.0f}, // chnests export 2, model 0x06EA
+    {0x80085A88U, 107.0f}, // chnests export 3, model 0x06EA
+    {0x80085A90U, 107.0f}, // chnests export 4, model 0x06EA
+    {0x80085A98U, 107.0f}, // chnests export 5, model 0x06EA
+    {0x80085AA0U, 107.0f}, // chnests export 6, model 0x06EA
+    {0x80085AA8U, 160.0f}, // chnests export 7, model 0x06EF
+    {0x80085AB0U, 160.0f}, // chnests export 8, model 0x06EF
+    {0x80085AB8U, 101.0f}, // chnests export 9, model 0x06EC
+    {0x80085AC0U, 177.0f}, // chnests export 10, model 0x06ED
+    {0x80085AC8U, 107.0f}, // chnests export 11, model 0x06EA
+    {0x80085AD0U, 160.0f}, // chnests export 12, model 0x06EF
+};
+thread_local float expand_pickup_radius = 0.0f;
+}
+extern "C" void tooie_expand_pickup_scope(uint8_t* rdram, recomp_context* ctx, uint32_t stage) {
+    expand_pickup_radius = 0.0f;
+    if (stage != 1 || ultramodern::renderer::get_graphics_config().ar_option !=
+        ultramodern::renderer::AspectRatio::Expand) {
+        return;
+    }
+    const gpr actor = ctx->r16;
+    const uint32_t descriptor = static_cast<uint32_t>(MEM_W(0x10, actor));
+    for (const PickupVisualBounds& bounds : kCompositePickupBounds) {
+        if (descriptor == bounds.descriptor_thunk) {
+            // Captures include unpopulated cached radii. The authored model
+            // radius also covers the first draw, before contents are loaded.
+            const float cached_radius = static_cast<float>(MEM_HU(0x6A, actor));
+            expand_pickup_radius = cached_radius > bounds.model_radius ? cached_radius : bounds.model_radius;
+            break;
+        }
+    }
+}
+extern "C" void tooie_expand_pickup_radius(uint8_t*, recomp_context* ctx) {
+    if (ultramodern::renderer::get_graphics_config().ar_option ==
+        ultramodern::renderer::AspectRatio::Expand && expand_pickup_radius > ctx->f14.fl) {
+        ctx->f14.fl = expand_pickup_radius;
+    }
+    // Consume only this model's test; the return hook clears early-return paths.
+    expand_pickup_radius = 0.0f;
+}
+
 // ---------------------------------------------------------------------------
 // RT64 transform groups: interpolation metadata for the player model
 // ---------------------------------------------------------------------------
