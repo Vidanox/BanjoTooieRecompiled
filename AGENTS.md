@@ -603,6 +603,171 @@ sky, not a port defect.
 identity, aspect forcing, sky tagging) before the real cause was found. **Do not
 add another without a lever that can distinguish it.**
 
+### 7.6 Cutscene glitches at `Display`/`Manual` refresh: camera cuts
+
+Fine at the game's own rate, broken at 144 Hz: on every shot change RT64 blended
+the previous shot's camera with the new one, so the frames presented across a cut
+showed the camera halfway between two unrelated shots, often inside a wall.
+Captured in the attract loop's cave scene as a smeared green close-up on the cut
+frame, absent with the fix.
+
+Tooie's own cut flag is not mapped, so `evaluate_camera_cut` reads the camera at
+the first perspective projection of each frame: position from `0x38($sp)` of
+`func_800E44FC`, direction from the last column of the projection `Mtx` it is
+about to load (view × perspective; that column is the view axis whatever the
+scale or FOV). On a cut frame the projection groups keep their ids and only drop
+pos/rot to SKIP (`kCutProjectionMask`), and one AUTO-id group with every
+component SKIP is pushed for the actors (`kCutActorGroupFlags`), so RT64 draws
+that frame as submitted and interpolates normally from the next.
+
+⚠ **A cut is a change in the camera's velocity, not a large step.** The title
+flyover pans a steady 114 units a frame and the intro has still-to-still cuts of
+75, so no position threshold separates them. The rule compares each step with the
+previous step (60 units / 15° by default, `BT_RT64_CUT_DIST` /
+`BT_RT64_CUT_ANGLE`), also requires the step itself to exceed the limit (a
+±50-unit camera shake near the end of the intro would otherwise cut every frame),
+and right after a cut falls back to 400 units / 40°, because the step that *was*
+the cut is not a velocity. Measured on the whole new-game intro: frame-to-frame
+deviation p99 = 14.7, 40 shot changes flagged, no false positives; first version
+(absolute 400 / 40) missed six cuts. ⚠ **The projection id 0x1000 must not change
+on a cut** — the Expand bounds fix in `rt64.patch` keys on it.
+
+### 7.7 Every model through the shared renderer carries an id
+
+Untagged, RT64 pairs each *bone* with the previous frame's by draw-call hash and
+smallest matrix difference, so similar parts get swapped: the cuckoo-clock bird
+in the intro came apart (beak and a wing detached from the body, then jumped onto
+the clock face), the Rare sign dipped for a frame mid-turn (top edge 132 → 139 →
+131 px), the N logo blipped the same way. The root/bone hooks in
+`func_800DE498`/`func_800DCF48` already ran for every model; only the C++ filtered
+to the player and the sky. Non-player draws now get an id from
+`actor_transform_id`: the renderer copies the position by value and reuses the
+register that held its pointer, so there is no actor handle at the hook, and a
+draw instead keeps the id of the previous frame's nearest draw of the same model
+(within 400 units), bones nesting under it as the player's do. Measured over the
+intro: 99.5% of draws keep their id, 0 append failures and 0 scope imbalances
+across 3703 traced frames. `BT_RT64_ACTORS=off` restores the old pairing for A/B.
+
+⚠ **Non-player models must not wear the player's flags** (`kActorGroupFlags`).
+The first version did, which forced texcoord and tile interpolation onto the whole
+world: CPU-scrolled texcoords that wrap get blended the long way round, and
+`INTERPOLATE` tiles skip the TMEM-hash check (`doTileMatching`) that stops a scroll
+being blended against a different texture. Reported as the screen edge
+"wrapping" while turning the camera with the right stick, gone with this change.
+Actor groups keep RT64's untagged defaults for those (texcoord SKIP, tile AUTO).
+
+⚠ **But the transform components must stay INTERPOLATE, not AUTO.** AUTO
+position is RT64's teleport guard and it judges each *bone* separately: a wing
+snapping out of a flap trips it, that bone is drawn unblended among blended
+neighbours, and it comes loose. Tried and measured on the clock bird -- AUTO
+brought back the floating beak and wing fragments. Teleports are the tracker's
+job: a draw more than `kActorMatchDistance` from last frame's gets a new id.
+
+### 7.7b CPU-animated models need vertex interpolation
+
+Some models are animated **on the CPU**: an animation list is set
+(`kAnimationMatrixList` non-zero) but the root scope emits **zero** `G_MTX` —
+the game bends the vertices itself every frame. Measured with `BT_RT64_ACTORLOG`
+(per draw: tagged bones, matrix loads, vertex loads, DL calls): the attract
+demo's big dinosaur (`0x80231890`, 18 DL calls, 0 matrices) and the N-logo stages
+(`0x80200CF0`, `0x801FDDA0`, `0x801F76C0`). Transform ids cannot help those —
+the body stepped at the game's 20 Hz while everything around it ran at 144,
+reported as the dinosaur being "super laggy". ⚠ An earlier note here said the
+logos were bone-animated and vertex interpolation could not help them; that was
+an inference, and the measurement contradicts it.
+
+Every animated root now gets vertex interpolation (`kVertexInterpolateBits`, on
+the player too, which should also cover the CPU-skinned transformations —
+untested). It is safe to give broadly: RT64 interpolates a transform's vertices
+only when their count matches and their positions changed, so rigid and
+bone-skinned models are untouched. Verified with RT64's own count
+(`vertex_interpolated` in `BT_RT64_FRAMESTATS`): 0/s with `BT_RT64_VERTS=off`,
+19–42/s during the logos and ~20/s (one model a frame) in the dinosaur scene with
+it on, a few per second in Spiral Mountain gameplay with no visible artefacts.
+The cut mask clears it too (`kCutModelMask` now covers bits 3–14).
+
+### 7.7c A bone whose geometry is far from its origin is blended as a plain matrix
+
+Kazooie's crest stretched into a long stalk in the Talon Trot (absent in an
+emulator), present with all the port's metadata off too. **The cause is RT64's
+decomposed blend, not a pairing fault.** Measured with a per-pairing log in
+`GameFrame::matchTransform`: every pairing is id-for-id, but one Kazooie bone
+(`0x1000011E`, 5 vertices) has its matrix ORIGIN jump 100–346 units a frame
+while the body moves ~12 — it is scaled (det 0.00..4.6) and turned about a pivot
+far from the origin, so the geometry stays at the head while the origin swings.
+Decomposition blends origin, rotation and scale separately, and the mid-pose
+carries those vertices off their path; the triangles they share with the head
+become the stalk. Note what did NOT detect it: comparing the blended basis with
+its endpoints (never larger), and screenshots at 50–60 Hz (too few in-betweens —
+reproduce at the user's 144).
+
+The fix is in the RT64 patch, `guardDecomposedLerp`: per mapped transform, on
+its own vertices, it compares the decomposed midpoint with the plain
+(component-wise) matrix blend, which keeps every vertex on the straight line
+between its two real positions. A genuine rotation bows off that line by at most
+`tan(θ/4)/2` of the vertex's travel (0.29 at 120°), so when the decomposed blend
+strays more than `0.35 × travel + 0.5` that transform is blended plainly for the
+frame (`lerpDecompose = false`). Rigid limbs never trip it; trips during the
+trot are that bone and its neighbours (~30/s), 7 in the whole new-game intro.
+`BT_RT64_LERPGUARD=off` disables it (the stalks come back — A/B'd);
+`BT_RT64_LERPGUARD=log` prints each trip with its deviation and travel.
+
+⚠ An earlier attempt here was wrong and is removed: it SKIPped rotation/scale on
+"flicking" bones while keeping position blended. For a pivot-offset bone that is
+the worst case — the full-size part is carried along the origin's 346-unit swing
+— and the stalk got longer. A flick about a real joint is fine to blend; the
+check above is what distinguishes the two.
+
+Unrelated but measured at the same time: two particle models in the cave
+(~35 instances a frame, ~12-frame lives) churn ids constantly. That is the
+particles spawning and dying, not a tracker fault.
+
+### 7.8 The attract demo played 1.5x too fast
+
+Not interpolation (it happens at `Original` refresh too). Rare's demos replay
+recorded input **and each frame's recorded time step**, and the recording was
+made on an N64 that ran Terrydactyland at ~20 Hz: the step byte reads 3 VIs on
+almost every frame (some 2, 4, 5). The port never lags, so it presented those
+frames at the scene's own divisor of 2 and advanced the world 3 VIs in every 2.
+Measured: Banjo 25.7 units/frame in the demo vs 17.8 in normal play at the same
+divisor (534 vs 771 units/s).
+
+The two bytes were found by elimination (a scan for bytes equal to the divisor
+through the title *and* through gameplay, then watched in the demo):
+`kFrameStepVis` 0x8012C767 is the step the world advances by, `kFrameElapsedVis`
+0x80078F65 the VIs that really passed. In normal play they are always equal.
+`pace_recorded_frame` (start of `tooie_rt64_begin_frame`, before the RT64 gate)
+latches "recorded timing" the first time step > elapsed, then raises the frame
+divisor to each frame's step for the next wait and restores it after; the
+divisor also feeds `G_EX_SETREFRESHRATE`, so RT64 interpolates at the delivered
+rate. ⚠ **It must latch** — once paced, a demo frame really lasts its step and a
+per-frame test switches off every other frame (3,2,3,2 = still 1.2x). It
+unlatches on a scene change (frame counter reset), when the game sets its own
+divisor, or after ~3 s with no step above the divisor. Verified: the demo
+sections now last 1.37–1.46x as long; Spiral Mountain from a save stays at
+divisor 2 for all 1085 frames; the title returns at divisor 3.
+`BT_DEMO_PACING=off` restores the old behaviour.
+
+⚠ **Pacing a demo frame by frame changes the reported refresh rate almost
+every frame, and RT64 used to drop frames on every change**
+(`rt64_workload_queue.cpp`, `patches/rt64.patch`). Its tick counters were in
+units of 1/(target × original) s, so a change of the *original* rate forced a
+reset that threw away the carried fraction of a display frame: each logical
+frame got floor(target/original) display frames (4 instead of 4.8 at 30 Hz into
+144). Reported as enemies in the demo "lagging" (the bat, the dinosaur). The
+ticks are now in a rate-independent unit (`kDisplayFrameTicks` = 3600 per display
+frame), so the fraction survives and blend weights use the current logical
+frame's own length. Measured with `BT_RT64_FRAMESTATS` (display frames generated
+per second) at a 50 Hz target, which does not divide 30 or 20: old 38–46/s
+through the demo, new 49–50.5/s; constant-rate scenes identical either way.
+⚠ **Test it at a target that does not divide the game's rates** — at 60 Hz
+(the second monitor's cap) the old and new code are indistinguishable.
+`BT_RT64_TICKRESET=on` restores the old reset for A/B.
+
+Measured while chasing the remaining logo roughness: game-frame pacing is clean
+-- 50.0 ms ±0.6 at the 20 Hz boot/title, 33.3 ms ±0.6 at the 30 Hz demo (`t=`
+and `vi=` in the `[cam]` line) -- so uneven frame delivery is not the cause.
+
 ---
 
 ## 8. Traps
@@ -725,6 +890,11 @@ Different failures need different tools. Choosing the wrong one wastes a session
 |**UI asset failure**|`tools/dbgview.py`|captures `OutputDebugStringA`, where RmlUi logs.|
 |**Look at the picture**|`tools/capture.py`|saves the window to PNG.|
 |**Input-gated state**|`tools/trace_play.py`|the attract loop cannot reach first person; this launches with tracing and drives input.|
+|**Unattended input**|`BT_AUTOPAD`|scripted presses ORed into player 1's pad, `seconds:button,...` from the first input poll; `from-to:button` holds, and `up/down/left/right` drive the stick. From a clean save, `26:start,32:a` reaches the new-game intro; with a save, the same loads it.|
+|**Interpolation cuts / ids / timing**|`BT_RT64_CAMLOG=1`|per frame: `[cam]` (wall time `t=`, divisor `vi=`, camera step/turn, CUT), `[actors]` (draws that kept their id vs new), `[player]` (Banjo's root translation).|
+|**What a model emits**|`BT_RT64_ACTORLOG=1`|per non-player draw: id, position, tagged bones, `G_MTX`/`G_VTX`/`G_DL` counts. Animation set + 0 matrices = CPU-animated.|
+|**Is RT64 keeping up**|`BT_RT64_FRAMESTATS=1`|once a second from RT64: logical and generated display frames/s, and how many transforms had their vertices interpolated.|
+|**Which bones blend plainly**|`BT_RT64_LERPGUARD=log`|one line per transform whose decomposed blend strayed off its vertices' paths (§7.7c): id, vertex count, deviation, travel. `=off` disables the check.|
 
 **Distinguish spin from idle block by CPU first**: a spin holds ~1.0 core, an idle
 block ~0.0 — and measure it over a window against the frame counter, because a
@@ -732,8 +902,9 @@ block ~0.0 — and measure it over a window against the frame counter, because a
 
 ⚠ **Do not try to drive the game with synthetic keystrokes.** `SendInput` with
 scancodes into the flip-model D3D window does not register even after
-`SetForegroundWindow`. A real controller works. To test the pad, read `OSContPad`
-while a human plays.
+`SetForegroundWindow`. A real controller works, and so does `BT_AUTOPAD`, which
+injects below the input layer. To test the pad, read `OSContPad` while a human
+plays.
 
 ---
 
