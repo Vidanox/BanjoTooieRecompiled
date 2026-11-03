@@ -49,14 +49,16 @@ index 20c0d4d..b054be1 100644
                  }
                  case RT64_HOOK_OP_DISABLE:
 diff --git a/src/hle/rt64_game_frame.cpp b/src/hle/rt64_game_frame.cpp
-index 87392d0..80703c0 100644
+index 87392d0..4fccd94 100644
 --- a/src/hle/rt64_game_frame.cpp
 +++ b/src/hle/rt64_game_frame.cpp
-@@ -9,6 +9,37 @@
+@@ -9,6 +9,42 @@
  
  #include "xxHash/xxh3.h"
  
 +#include <atomic>
++#include <cstdio>
++#include <cstdlib>
 +
 +// TEMPORARY diagnostic (Banjo-Tooie port). Counts the transforms matched by
 +// explicit id in the player's id range, which is what tells "the game emitted
@@ -64,6 +66,9 @@ index 87392d0..80703c0 100644
 +// frame".
 +extern "C" {
 +std::atomic<uint32_t> g_bt_rt64_matched_transforms{0};
++// Transforms whose vertices RT64 interpolated (vertex count equal, positions
++// changed): the CPU-animated models. Read by BT_RT64_FRAMESTATS.
++std::atomic<uint32_t> g_bt_rt64_vertex_interpolated{0};
 +// Counts projection pairs RT64 refused to interpolate because the two frames'
 +// projections at the same index carry different explicit ids. With the default
 +// `G_EX_ID_AUTO` those pairs were blended unconditionally, so a non-zero count
@@ -90,7 +95,7 @@ index 87392d0..80703c0 100644
  namespace RT64 {
      // GameFrame
      
-@@ -310,6 +341,12 @@ namespace RT64 {
+@@ -310,6 +346,12 @@ namespace RT64 {
                  }
                  else {
                      matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, curIt->second, prevIt->second, modifiedBuffers);
@@ -103,7 +108,7 @@ index 87392d0..80703c0 100644
                      curIt++;
                      prevIt++;
                  }
-@@ -460,6 +497,14 @@ namespace RT64 {
+@@ -460,6 +502,14 @@ namespace RT64 {
                  const TransformGroup &curProjGroup = curWorkload.drawData.transformGroups[curProjGroupIndex];
                  const TransformGroup &prevProjGroup = prevWorkload.drawData.transformGroups[prevProjGroupIndex];
  
@@ -118,7 +123,7 @@ index 87392d0..80703c0 100644
                  // Cameras usually look better with simple interpolation, so default decomposition to off.
                  bool projectionDecompose = false;
                  uint8_t projectionLinearComponent = G_EX_COMPONENT_INTERPOLATE;
-@@ -475,6 +520,9 @@ namespace RT64 {
+@@ -475,6 +525,9 @@ namespace RT64 {
                      projectionSkewComponent = curProjGroup.skewInterpolation;
                      projectionPerspectiveComponent = curProjGroup.perspectiveInterpolation;
                      viewProjMap.mapped = (curProjGroup.matrixId == prevProjGroup.matrixId);
@@ -128,6 +133,244 @@ index 87392d0..80703c0 100644
                  }
                  else {
                      viewProjMap.mapped = (curProjGroup.matrixId == G_EX_ID_AUTO);
+@@ -709,6 +762,62 @@ namespace RT64 {
+         }
+     }
+ 
++    // Banjo-Tooie port. Decomposed interpolation blends a matrix's origin, rotation and scale
++    // separately. That is exact for a bone whose origin is its joint, and wrong for one whose
++    // geometry sits far from its origin -- a part scaled and turned about a distant pivot. There
++    // the origin swings hundreds of units a frame while the geometry hardly moves, and the
++    // separately blended mid-pose carries the geometry off its path: Kazooie's crest in the
++    // Talon Trot (one bone, 5 vertices, its origin jumping up to 346 units a frame against ~12
++    // for the body) drew a stalk reaching across the screen. A plain matrix blend keeps every
++    // vertex on the straight line between its two real positions. A genuine rotation bows off
++    // that line by at most tan(theta/4)/2 of the vertex's travel (0.29 at 120 degrees), so when
++    // the decomposed blend strays further than that on this transform's own vertices, measured
++    // at the midpoint, the transform uses the plain blend for this frame.
++    // BT_RT64_LERPGUARD=off disables it; BT_RT64_LERPGUARD=log also prints each trip.
++    static void guardDecomposedLerp(const Workload &workload, uint32_t transformIndex, const hlslpp::float4x4 &prevTransform,
++        const hlslpp::float4x4 &curTransform, uint32_t matrixId, RigidBody &rigidBody)
++    {
++        static const char *mode = std::getenv("BT_RT64_LERPGUARD");
++        static const bool off = (mode != nullptr) && (mode[0] == 'o');
++        static const bool log = (mode != nullptr) && (mode[0] == 'l');
++        if (off || !rigidBody.lerpDecompose || !rigidBody.transforms[0].valid || !rigidBody.transforms[1].valid) {
++            return;
++        }
++
++        if (!rigidBody.lerpRotation && !rigidBody.lerpScale && !rigidBody.lerpSkew) {
++            return;
++        }
++
++        const DrawData &drawData = workload.drawData;
++        const uint32_t vertexCount = drawData.worldTransformVertexCount(transformIndex);
++        if (vertexCount == 0) {
++            return;
++        }
++
++        const hlslpp::float4x4 decomposed = rigidBody.lerp(0.5f, prevTransform, curTransform, true);
++        const hlslpp::float4x4 linear = lerpMatrixComponents(prevTransform, curTransform, rigidBody.lerpTranslation, rigidBody.lerpRotation, rigidBody.lerpPerspective, 0.5f);
++        const float *positions = &drawData.posFloats[drawData.worldTransformVertexIndices[transformIndex] * 3];
++        float maxDeviation = 0.0f;
++        float maxTravel = 0.0f;
++        for (uint32_t i = 0; i < vertexCount; i++) {
++            const hlslpp::float4 vertex(positions[i * 3 + 0], positions[i * 3 + 1], positions[i * 3 + 2], 1.0f);
++            const hlslpp::float3 viaDecomposed = hlslpp::mul(vertex, decomposed).xyz;
++            const hlslpp::float3 viaLinear = hlslpp::mul(vertex, linear).xyz;
++            const hlslpp::float3 travel = hlslpp::mul(vertex, curTransform).xyz - hlslpp::mul(vertex, prevTransform).xyz;
++            maxDeviation = std::max(maxDeviation, float(hlslpp::length(viaDecomposed - viaLinear)));
++            maxTravel = std::max(maxTravel, float(hlslpp::length(travel)));
++        }
++
++        constexpr float ArcAllowance = 0.35f;
++        constexpr float AbsoluteAllowance = 0.5f;
++        if (maxDeviation > (ArcAllowance * maxTravel + AbsoluteAllowance)) {
++            rigidBody.lerpDecompose = false;
++            if (log) {
++                std::fprintf(stderr, "[lerpguard] id=%08X t=%u vtx=%u deviation=%.1f travel=%.1f\n", matrixId, transformIndex, vertexCount, maxDeviation, maxTravel);
++            }
++        }
++    }
++
+     void GameFrame::matchTransform(Workload &curWorkload, const Workload &prevWorkload, GameFrameMap::WorkloadMap &curWorkloadMap, const GameFrameMap::WorkloadMap *prevWorkloadMap, uint32_t curTransformIndex, uint32_t prevTransformIndex, ModifiedBuffers &modifiedBuffers) {
+         GameFrameMap::TransformMap &curTransformMap = curWorkloadMap.transforms[curTransformIndex];
+         if (prevWorkloadMap != nullptr) {
+@@ -723,6 +832,7 @@ namespace RT64 {
+         curTransformMap.rigidBody.updateAngular(prevTransform, curTransform, curGroup.rotationInterpolation, curGroup.scaleInterpolation, curGroup.skewInterpolation);
+         curTransformMap.rigidBody.updatePerspective(prevTransform, curTransform, curGroup.perspectiveInterpolation);
+         curTransformMap.rigidBody.updateDecomposition(curTransform, curGroup.decompose);
++        guardDecomposedLerp(curWorkload, curTransformIndex, prevTransform, curTransform, curGroup.matrixId, curTransformMap.rigidBody);
+         curTransformMap.prevTransformIndex = prevTransformIndex;
+         curTransformMap.mapped = true;
+         curWorkloadMap.prevTransformsMapped[prevTransformIndex] = true;
+@@ -751,6 +861,7 @@ namespace RT64 {
+                 }
+ 
+                 modifiedBuffers.positionVelocity = true;
++                g_bt_rt64_vertex_interpolated.fetch_add(1, std::memory_order_relaxed);
+             }
+         }
+ 
+diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
+index 1da2550..dd7e97e 100644
+--- a/src/hle/rt64_rsp.cpp
++++ b/src/hle/rt64_rsp.cpp
+@@ -1153,6 +1153,28 @@ namespace RT64 {
+             const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
+             const FixedRect viewportClipRect = viewport.rect(clipRatios.data());
+             drawRect = viewportClipRect.intersection(scissorRect.intersection(drawRect));
++            // Tooie's world projection is expanded later by ProjectionProcessor.
++            // posScreen still describes the original 4:3 view here. Geometry in
++            // the added side regions can therefore contribute no write bounds,
++            // making a later framebuffer pass too short or entirely empty.
++            // Keep a conservative full viewport for submitted Expand world tris.
++            // This changes render-target tracking, not guest object visibility.
++            const uint32_t groupIndex = workload.drawData.viewProjTransformGroups[curViewProjIndex];
++            const TransformGroup &group = workload.drawData.transformGroups[groupIndex];
++            const FixedRect fullViewport = viewportClipRect.intersection(scissorRect);
++            // Tooie emits AUTO, not ADJUST. Match the automatic full-width,
++            // landscape viewport rule used by ProjectionProcessor as well.
++            const bool autoAdjust = (group.aspectMode == G_EX_ASPECT_AUTO) &&
++                !fullViewport.isEmpty() &&
++                (extended.global.viewportOrigin == G_EX_ORIGIN_NONE) &&
++                (fullViewport.ulx <= fbPair.scissorRect.ulx) &&
++                (fullViewport.lrx >= fbPair.scissorRect.lrx) &&
++                (fullViewport.width(true, true) > fullViewport.height(true, true));
++            if ((state->ext.userConfig->aspectRatio == UserConfiguration::AspectRatio::Expand) &&
++                (projType == Projection::Type::Perspective) && (group.matrixId == 0x00001000U) &&
++                ((group.aspectMode == G_EX_ASPECT_ADJUST) || autoAdjust)) {
++                drawRect = fullViewport;
++            }
+             if (!drawRect.isNull()) {
+                 fbPair.drawColorRect.merge(drawRect);
+                 if (otherModeStack[otherModeStackSize - 1].zUpd()) {
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index 5a331aa..bb7e320 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -4,6 +4,13 @@
+ 
+ #include "rt64_workload_queue.h"
+ 
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++
++extern "C" std::atomic<uint32_t> g_bt_rt64_vertex_interpolated;
++
+ #include "common/rt64_thread.h"
+ 
+ #include "rt64_present_queue.h"
+@@ -882,6 +889,10 @@ namespace RT64 {
+         Thread::setCurrentThreadName("RT64 Workload");
+ 
+         WorkloadConfiguration workloadConfig;
++        // Banjo-Tooie port: the ticks below are in units of 1 / (targetRate * kDisplayFrameTicks) seconds, so a
++        // display frame is always kDisplayFrameTicks long whatever the original rate. 3600 divides exactly by
++        // every rate a game reports in practice (60, 30, 20, 15, 12, 10, 50, 25...).
++        constexpr int64_t kDisplayFrameTicks = 3600;
+         int64_t logicalTicks = 0;
+         int64_t displayTicks = 0;
+         uint32_t originalRateForTicks = 0;
+@@ -988,7 +999,15 @@ namespace RT64 {
+                     const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
+                     generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty();
+ 
+-                    const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
++                    // Banjo-Tooie port: a change of the ORIGINAL rate no longer resets the ticks. They are counted
++                    // in a unit that does not depend on it (see kDisplayFrameTicks), so the carried fraction of a
++                    // display frame survives a rate change. Resetting it rounded every frame down whenever the
++                    // rate changed, which a recorded demo paced frame by frame does almost every frame (30/20/15
++                    // Hz): too few interpolated frames per logical one, and visible hitches in motion.
++                    // BT_RT64_TICKRESET=on restores the old reset on an original-rate change, for A/B.
++                    static const bool oldTickReset = (std::getenv("BT_RT64_TICKRESET") != nullptr);
++                    const bool rateChanged = oldTickReset && (originalRateForTicks != workload.viOriginalRate);
++                    const bool resetTicks = !generateInterpolatedFrames || rateChanged || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
+                     if (resetTicks) {
+                         logicalTicks = 0;
+                         displayTicks = 0;
+@@ -999,20 +1018,44 @@ namespace RT64 {
+ 
+                 // Estimate amount of frames to render based on how many display frames it'd take to reach the next logical frame.
+                 uint32_t displayFrames = 1;
++                // Length of this logical frame in ticks: one display frame is kDisplayFrameTicks, so a logical
++                // frame at the original rate is targetRate / viOriginalRate display frames.
++                int64_t logicalFrameTicks = kDisplayFrameTicks;
+                 if (generateInterpolatedFrames) {
+-                    logicalTicks += workloadConfig.targetRate;
+-                    displayFrames = uint32_t((logicalTicks - displayTicks) / workload.viOriginalRate);
++                    logicalFrameTicks = (int64_t(workloadConfig.targetRate) * kDisplayFrameTicks) / workload.viOriginalRate;
++                    logicalTicks += logicalFrameTicks;
++                    displayFrames = uint32_t((logicalTicks - displayTicks) / kDisplayFrameTicks);
+                     deltaTimeMs = 1.0f / float(workloadConfig.targetRate);
+ 
+                     if ((displayFrames > 1) && frameReduction) {
+-                        displayTicks += workload.viOriginalRate;
++                        displayTicks += kDisplayFrameTicks;
+                         displayFrames--;
+                         frameReduction = false;
+                     }
+ 
+                     assert((logicalTicks > displayTicks) && "Logical ticks must always remain bigger than the display ticks.");
+-                    assert(((logicalTicks - displayTicks) <= (workloadConfig.targetRate + workload.viOriginalRate)) && "The gap between logical ticks and display ticks can't be bigger than the target rate.");
++                    assert(((logicalTicks - displayTicks) <= (logicalFrameTicks + kDisplayFrameTicks)) && "The gap between logical ticks and display ticks can't be bigger than the target rate.");
+                     assert((displayFrames > 0) && "At least one display frame must be generated.");
++
++                    // BT_RT64_FRAMESTATS: once a second, logical frames and generated display frames per second.
++                    // With interpolation keeping up, display frames per second equals the target rate.
++                    static const bool frameStats = (std::getenv("BT_RT64_FRAMESTATS") != nullptr);
++                    if (frameStats) {
++                        static uint64_t statLogical = 0;
++                        static uint64_t statDisplay = 0;
++                        static auto statStart = std::chrono::steady_clock::now();
++                        statLogical++;
++                        statDisplay += displayFrames;
++                        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - statStart).count();
++                        if (seconds >= 1.0) {
++                            std::fprintf(stderr, "[rt64fps] logical=%.1f/s display=%.1f/s rate=%u target=%u vertex_interpolated=%u\n",
++                                statLogical / seconds, statDisplay / seconds, workload.viOriginalRate, workloadConfig.targetRate,
++                                g_bt_rt64_vertex_interpolated.exchange(0, std::memory_order_relaxed));
++                            statLogical = 0;
++                            statDisplay = 0;
++                            statStart = std::chrono::steady_clock::now();
++                        }
++                    }
+                 }
+                 else if (workload.viOriginalRate > 0) {
+                     deltaTimeMs = 1.0f / float(workload.viOriginalRate);
+@@ -1071,7 +1114,7 @@ namespace RT64 {
+                         const int64_t expectedTimeMicro = frame * maxTimePerFrameMicro;
+                         const int64_t measuredFrameMicro = renderTimeTotalMicro / framesRendered;
+                         if ((currentTimeMicro > expectedTimeMicro) || ((currentTimeMicro + measuredFrameMicro) > adjustedTimeWindowMicro)) {
+-                            displayTicks += workload.viOriginalRate;
++                            displayTicks += kDisplayFrameTicks;
+                             skippedFrames = true;
+                             continue;
+                         }
+@@ -1080,9 +1123,9 @@ namespace RT64 {
+                     RenderTarget *overrideTarget = nullptr;
+                     uint32_t overrideModifier = 0;
+                     if (generateInterpolatedFrames) {
+-                        prevFrameWeight = std::clamp((workloadConfig.targetRate + displayTicks - logicalTicks) / float(workloadConfig.targetRate), 0.0f, 1.0f);
+-                        displayTicks += workload.viOriginalRate;
+-                        curFrameWeight = std::clamp((workloadConfig.targetRate + displayTicks - logicalTicks) / float(workloadConfig.targetRate), 0.0f, 1.0f);
++                        prevFrameWeight = std::clamp((logicalFrameTicks + displayTicks - logicalTicks) / float(logicalFrameTicks), 0.0f, 1.0f);
++                        displayTicks += kDisplayFrameTicks;
++                        curFrameWeight = std::clamp((logicalFrameTicks + displayTicks - logicalTicks) / float(logicalFrameTicks), 0.0f, 1.0f);
+ 
+                         // Override the render target.
+                         if (usingMSAA || (frame > 0)) {
+@@ -1143,7 +1186,7 @@ namespace RT64 {
+ 
+                         // Add the amount of display ticks that correspond to the remaining frames.
+                         if (skipWorkloadNow) {
+-                            displayTicks += workload.viOriginalRate * (displayFrames - (frame + 1));
++                            displayTicks += kDisplayFrameTicks * (displayFrames - (frame + 1));
+                         }
+ 
+                         ext.sharedResources->interpolatedCondition.notify_all();
 diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
 index 9fae0d4..ff85358 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
@@ -536,35 +779,3 @@ index e7895c3..6655c86 100644
      const float MaxDepth = simulateDepthClipF3D && !renderFlagRect(rp.flags) && !zSourcePrim ? (1022.0f / 1024.0f) : 1.0f;
      
      // FIXME: This can be implemented by checking feature support for the API and embedding the depth bounds into the pipeline.
-diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
---- a/src/hle/rt64_rsp.cpp
-+++ b/src/hle/rt64_rsp.cpp
-@@ -1153,6 +1153,28 @@
-             const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
-             const FixedRect viewportClipRect = viewport.rect(clipRatios.data());
-             drawRect = viewportClipRect.intersection(scissorRect.intersection(drawRect));
-+            // Tooie's world projection is expanded later by ProjectionProcessor.
-+            // posScreen still describes the original 4:3 view here. Geometry in
-+            // the added side regions can therefore contribute no write bounds,
-+            // making a later framebuffer pass too short or entirely empty.
-+            // Keep a conservative full viewport for submitted Expand world tris.
-+            // This changes render-target tracking, not guest object visibility.
-+            const uint32_t groupIndex = workload.drawData.viewProjTransformGroups[curViewProjIndex];
-+            const TransformGroup &group = workload.drawData.transformGroups[groupIndex];
-+            const FixedRect fullViewport = viewportClipRect.intersection(scissorRect);
-+            // Tooie emits AUTO, not ADJUST. Match the automatic full-width,
-+            // landscape viewport rule used by ProjectionProcessor as well.
-+            const bool autoAdjust = (group.aspectMode == G_EX_ASPECT_AUTO) &&
-+                !fullViewport.isEmpty() &&
-+                (extended.global.viewportOrigin == G_EX_ORIGIN_NONE) &&
-+                (fullViewport.ulx <= fbPair.scissorRect.ulx) &&
-+                (fullViewport.lrx >= fbPair.scissorRect.lrx) &&
-+                (fullViewport.width(true, true) > fullViewport.height(true, true));
-+            if ((state->ext.userConfig->aspectRatio == UserConfiguration::AspectRatio::Expand) &&
-+                (projType == Projection::Type::Perspective) && (group.matrixId == 0x00001000U) &&
-+                ((group.aspectMode == G_EX_ASPECT_ADJUST) || autoAdjust)) {
-+                drawRect = fullViewport;
-+            }
-             if (!drawRect.isNull()) {
-                 fbPair.drawColorRect.merge(drawRect);
-                 if (otherModeStack[otherModeStackSize - 1].zUpd()) {

@@ -23,6 +23,7 @@
 // `$t0` is the thunk address rather than a function. A `[[patches.hook]]` at
 // 0x80081F5C replaces that tail with a call back into this function.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -32,6 +33,7 @@
 #include <cstring>
 #include <span>
 #include <thread>
+#include <vector>
 
 #include "funcs.h"
 #include "recomp.h"
@@ -705,6 +707,11 @@ constexpr uint32_t kViListenerCount = 8U;
 constexpr uint32_t kViTargetRetraces = 0x80079138U;
 constexpr uint32_t kViRetraceInterval = 0x8007913CU;
 constexpr uint32_t kViConsumedRetraces = 0x80079704U;
+// Bytes, found by elimination (AGENTS.md 7.8): the VIs the game advances its
+// world by this frame, and the VIs that actually elapsed. Equal in normal play;
+// a recorded demo sets the first from its recording.
+constexpr uint32_t kFrameStepVis = 0x8012C767U;
+constexpr uint32_t kFrameElapsedVis = 0x80078F65U;
 constexpr uint32_t kGameMode = 0x80043380U;
 constexpr uint32_t kPendingGameMode = 0x80043384U;
 constexpr uint32_t kGameFrameCount = 0x800459C8U;
@@ -918,10 +925,14 @@ extern "C" void tooie_expand_pickup_radius(uint8_t*, recomp_context* ctx) {
 //   * `tooie_rt64_push_player_bone` / `pop_player_bone` do the same for each
 //     animated bone, keyed by the model's own bone index.
 //
-// Deliberately not tagged: camera and projection transforms (blending two
-// unrelated views across a cut is worse than not interpolating, and Tooie's
-// camera-cut detection is not mapped), billboards, other actors, and the
-// CPU-skinned alternate forms, which need vertex segments rather than ids.
+// Projections are tagged too (see kGameplayProjectionId), and camera cuts are
+// detected from the camera itself so the frame that cuts is drawn as submitted
+// instead of blended with the previous shot (see kCutProjectionMask).
+//
+// Every other model through the shared renderer is tagged as well, by tracked
+// identity (see kActorTransformIdBase). Deliberately not tagged: geometry drawn
+// outside that renderer, and the CPU-skinned alternate forms, which need vertex
+// segments rather than ids.
 
 // Tooie submits `gspF3DEX2_NoN`. The extended-GBI hook is that microcode's
 // SPNOOP, opcode 0xE0; the header defaults RT64_HOOK_OPCODE to F3D's 0x00, and
@@ -1018,7 +1029,45 @@ static_assert(kMatrixGroupWord0 == 0x6400000CU, "G_EX_MATRIXGROUP_V1");
 static_assert(kPopMatrixGroupWord0 == 0x6400000DU, "G_EX_POPMATRIXGROUP_V1");
 static_assert(kRootGroupFlags == 0x02408AADU, "root matrix group flags");
 static_assert(kBoneGroupFlags == 0x02008AADU, "bone matrix group flags");
+
+// Every other model (root and bones): an id and decomposed transforms, and
+// otherwise exactly what an untagged draw gets (TransformGroup's defaults).
+// The player's flags force texcoord and tile interpolation, which is right for
+// Banjo and wrong for the world: texcoords CPU-scrolled across a wrap are blended
+// the long way round, and INTERPOLATE tiles skip the TMEM-hash check that stops a
+// scroll being blended against a different texture -- reported as the lair's
+// graphics "wrapping" in the attract loop. tile AUTO and texcoord SKIP keep both.
+// ⚠ The transform components must be INTERPOLATE, not AUTO. AUTO position is
+// RT64's teleport guard (no blend when a transform moves >5 units at >10x last
+// frame's speed), and it judges every BONE on its own: a wing snapping out of a
+// flap trips it, that one bone is drawn unblended while its neighbours blend, and
+// the part comes loose. Measured on the clock bird: AUTO brought back a floating
+// beak and wing fragments that INTERPOLATE removes. Teleports are handled by the
+// tracker instead -- a draw further than kActorMatchDistance from last frame's
+// gets a new id and is not blended at all.
+constexpr uint32_t kActorGroupFlags = matrix_group_flags(
+    1U, 0U, G_EX_INTERPOLATE_DECOMPOSE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE,
+    G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_SKIP,
+    G_EX_COMPONENT_AUTO, G_EX_ORDER_LINEAR,
+    G_EX_ASPECT_AUTO, G_EX_COMPONENT_SKIP, G_EX_COMPONENT_AUTO);
 static_assert(kProjectionGroupFlags == 0x02008AAAU, "projection group flags");
+
+// Vertex interpolation (bits 13-14) for a root drawn with an animation. Some
+// models are animated on the CPU: they emit NO bone matrices at all -- the game
+// bends the vertices itself every frame (the attract demo's big dinosaur
+// 0x80231890, the N-logo stages; measured: animation list set, zero G_MTX inside
+// the root scope). Transform interpolation cannot touch that, so the body moved
+// at the game's 20 Hz while everything around it ran at 144. RT64 interpolates
+// a transform's vertices only when the count matches and the positions changed,
+// so for a rigid or bone-skinned model -- whose vertices are static -- this is a
+// no-op, and it is safe to give every animated root rather than a list.
+constexpr uint32_t kVertexInterpolateBits =
+    static_cast<uint32_t>(G_EX_COMPONENT_INTERPOLATE) << 13;
+static_assert((kActorGroupFlags & (3U << 13)) == 0U &&
+                  (kRootGroupFlags & (3U << 13)) == 0U,
+              "vertex interpolation is off in the base flags");
 
 // The skybox is a dome anchored to the camera, so its view matrix is the
 // *current* camera's; RT64 interpolating that view blends the dome with the
@@ -1044,6 +1093,38 @@ constexpr uint32_t kSkyProjectionGroupFlags = matrix_group_flags(
 // pos and rot occupy bits 3-4 and 5-6 of the flags word (see matrix_group_flags).
 static_assert(kSkyProjectionGroupFlags == (kProjectionGroupFlags & ~0x78U),
               "sky projection flags must differ from the projection flags only in pos/rot");
+
+// Camera cuts. On the frame the camera cuts, every interpolated frame RT64
+// presents before it blends two unrelated shots: the view swings through the
+// space between them, and every actor the heuristic pairs across the cut slides
+// from where it stood in the old shot to where it stands in the new one. That is
+// the cutscene glitch at Display/Manual refresh, invisible at the game's own rate.
+//
+// A cut frame keeps every id -- the Expand bounds fix in rt64.patch keys on the
+// gameplay projection's 0x1000 -- and changes only the components: SKIP makes
+// RigidBody::updateLinear/updateAngular clear their lerp, so RT64 draws that
+// frame's transforms exactly as submitted (the mechanism kSkyProjectionGroupFlags
+// documents). Because the ids still match, the frame after a cut interpolates
+// normally again. SKIP is 0, so masking a component's bits out is SKIP.
+//
+// Projections: pos + rot (bits 3-6). Model groups: pos, rot, scale, skew,
+// perspective and vertices (3-14).
+constexpr uint32_t kCutProjectionMask = 0x78U;
+constexpr uint32_t kCutModelMask = 0x7FF8U;
+// Pushed once, at the cut frame's first perspective projection, so every
+// untagged model matrix drawn after it -- all actors but the player -- falls in a
+// group RT64 still pairs as AUTO but does not blend. The player's and the sky
+// layers' own groups push above it and are masked where they are emitted.
+constexpr uint32_t kCutActorGroupFlags = matrix_group_flags(
+    1U, 0U, G_EX_INTERPOLATE_SIMPLE,
+    G_EX_COMPONENT_SKIP, G_EX_COMPONENT_SKIP,
+    G_EX_COMPONENT_SKIP, G_EX_COMPONENT_SKIP,
+    G_EX_COMPONENT_SKIP, G_EX_COMPONENT_SKIP,
+    G_EX_COMPONENT_SKIP, G_EX_ORDER_AUTO,
+    G_EX_ASPECT_AUTO, G_EX_COMPONENT_SKIP, G_EX_COMPONENT_AUTO);
+static_assert((kProjectionGroupFlags & ~kCutProjectionMask) ==
+                  kSkyProjectionGroupFlags,
+              "the cut projection mask must be exactly pos + rot");
 
 // ⚠ A deliberate trade, not a fix -- see rt64_sky_stretch. `G_EX_ASPECT_STRETCH`
 // tells RT64 not to widen this projection at all: the sky is drawn with the field
@@ -1107,6 +1188,24 @@ constexpr uint32_t kSkyboxTransformIdBase = 0x00F20000U;
 constexpr uint32_t kSkyboxTransformIdStride = 0x100U;
 constexpr uint32_t kSkyboxLayerCount = 4U;
 
+// Every other model through the shared renderer -- NPCs, cutscene characters,
+// props, the boot logos. Untagged, RT64 pairs each *bone* with last frame's by
+// the draw-call hash and the smallest matrix difference, so the limbs of one
+// character, or the identical segments of a spinning logo, get paired with each
+// other and blended across: the jerky turning and odd limb motion that shows only
+// above the game's own rate. The renderer copies the position by value and
+// reuses the register that held its pointer, so there is no actor handle at the
+// hook; identity is instead tracked here -- a draw keeps the id of last frame's
+// draw of the same model nearest to it -- and the bones nest under it with the
+// player's sub-id scheme. Ids leave 0x100 per model for bones; 0x800000 slots
+// keep the highest id clear of G_EX_ID_AUTO.
+constexpr uint32_t kActorTransformIdBase = 0x20000000U;
+constexpr uint32_t kActorTransformIdStride = 0x100U;
+constexpr uint32_t kActorSlotCount = 0x00800000U;
+// A draw further than this from every same-model draw last frame is a new
+// object, not a moved one. Ordinary motion is tens of units a frame.
+constexpr float kActorMatchDistance = 400.0f;
+
 uint32_t read_word(uint8_t* rdram, uint32_t address) {
     return static_cast<uint32_t>(
         MEM_W(0, static_cast<gpr>(static_cast<int32_t>(address))));
@@ -1160,6 +1259,13 @@ bool append_matrix_group(uint8_t* rdram, uint32_t cursor, uint32_t transform_id,
 struct RootScope {
     uint32_t transform_id;
     bool pushed;
+    uint32_t bone_flags;  // what this model's bones are grouped with
+    // BT_RT64_ACTORLOG only.
+    uint32_t model;
+    float pos[3];
+    uint32_t gfx_start;
+    uint32_t bones;
+    uint32_t anim;
 };
 
 struct PlayerModelKey {
@@ -1208,6 +1314,78 @@ uint32_t player_model_transform_id(uint32_t player, uint32_t model) {
     const uint32_t slot = g_player_model_count++;
     g_player_models[slot] = {player, model};
     return kPlayerTransformIdBase + slot * kPlayerTransformIdStride;
+}
+
+float read_float(uint8_t* rdram, uint32_t address) {
+    const uint32_t bits = read_word(rdram, address);
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+// One element of an N64 fixed-point `Mtx`: the integer halves of all sixteen
+// s15.16 values come first, then the fractional halves, two to a word.
+float read_mtx_element(uint8_t* rdram, uint32_t mtx, uint32_t row,
+                       uint32_t col) {
+    const uint32_t word = row * 2U + col / 2U;
+    const uint32_t shift = (col & 1U) ? 0U : 16U;
+    const uint32_t whole = (read_word(rdram, mtx + word * 4U) >> shift) & 0xFFFFU;
+    const uint32_t frac =
+        (read_word(rdram, mtx + 32U + word * 4U) >> shift) & 0xFFFFU;
+    return static_cast<float>(static_cast<int32_t>((whole << 16) | frac)) /
+           65536.0f;
+}
+
+struct ActorDraw {
+    uint32_t model;
+    float pos[3];
+    uint32_t transform_id;
+    bool claimed;
+};
+
+// Last frame's draws and this frame's, swapped at the frame boundary. Draws run
+// on the same guest thread as tooie_rt64_begin_frame.
+std::vector<ActorDraw> g_prev_actor_draws;
+std::vector<ActorDraw> g_cur_actor_draws;
+
+uint32_t g_next_actor_slot = 0;
+uint32_t g_frame_actor_matched = 0;
+uint32_t g_frame_actor_new = 0;
+
+// Greedy nearest match against last frame's unclaimed draws of the same model.
+// Linear in the frame's draw count per draw; a few hundred draws is a few tens
+// of thousands of compares a frame.
+uint32_t actor_transform_id(uint32_t model, const float pos[3]) {
+    ActorDraw* best = nullptr;
+    float best_d2 = kActorMatchDistance * kActorMatchDistance;
+    for (ActorDraw& prev : g_prev_actor_draws) {
+        if (prev.claimed || prev.model != model) {
+            continue;
+        }
+        const float dx = pos[0] - prev.pos[0];
+        const float dy = pos[1] - prev.pos[1];
+        const float dz = pos[2] - prev.pos[2];
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best = &prev;
+        }
+    }
+
+    uint32_t transform_id;
+    if (best != nullptr) {
+        best->claimed = true;
+        transform_id = best->transform_id;
+        ++g_frame_actor_matched;
+    }
+    else {
+        transform_id = kActorTransformIdBase +
+            (g_next_actor_slot++ % kActorSlotCount) * kActorTransformIdStride;
+        ++g_frame_actor_new;
+    }
+    g_cur_actor_draws.push_back({model, {pos[0], pos[1], pos[2]}, transform_id,
+                                 false});
+    return transform_id;
 }
 
 // Opt-in counters, in the same style as TOOIE_TRACE_LOOKUP. They report both
@@ -1296,6 +1474,70 @@ bool rt64_proj_off() {
     return off;
 }
 
+// BT_RT64_CUTS=off: detect camera cuts (and log them) but still interpolate
+// across them, i.e. the behaviour before cut handling existed.
+bool rt64_cuts_off() {
+    static const bool off = rt64_env_off("BT_RT64_CUTS");
+    return off;
+}
+
+// BT_RT64_ACTORS=off: leave every model but the player and the sky untagged,
+// i.e. paired by RT64's own heuristic as before actor ids existed.
+bool rt64_actors_off() {
+    static const bool off = rt64_env_off("BT_RT64_ACTORS");
+    return off;
+}
+
+// BT_RT64_VERTS=off: no vertex interpolation on animated models (see
+// kVertexInterpolateBits), so CPU-animated ones step at the game's own rate.
+bool rt64_verts_off() {
+    static const bool off = rt64_env_off("BT_RT64_VERTS");
+    return off;
+}
+
+// BT_RT64_ACTORLOG=1: one line per non-player model draw -- id, position, and
+// what it emitted (tagged bones, matrix loads, vertex loads, display-list calls).
+bool rt64_actorlog_enabled() {
+    static const bool enabled = std::getenv("BT_RT64_ACTORLOG") != nullptr;
+    return enabled;
+}
+
+// BT_RT64_CAMLOG=1: one line per frame with the camera, the jump since the
+// previous frame, and whether it was treated as a cut; plus one line with how
+// many model draws kept last frame's id and how many started a new one.
+bool rt64_camlog_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BT_RT64_CAMLOG");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+float env_float(const char* name, float fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    return static_cast<float>(std::atof(value));
+}
+
+// How far one game frame's camera step may differ from the last one before it
+// counts as a cut, in world units and degrees (see evaluate_camera_cut).
+// BT_RT64_CUT_DIST / BT_RT64_CUT_ANGLE override them.
+float cut_distance() {
+    static const float value = env_float("BT_RT64_CUT_DIST", 60.0f);
+    return value;
+}
+
+float cut_angle() {
+    static const float value = env_float("BT_RT64_CUT_ANGLE", 15.0f);
+    return value;
+}
+
+// The limits right after a cut, when there is no previous step to compare with.
+constexpr float kCutUnknownDistance = 400.0f;
+constexpr float kCutUnknownAngle = 40.0f;
+
 uint32_t g_frame_enables = 0;
 uint32_t g_frame_root_groups = 0;
 uint32_t g_frame_bone_groups = 0;
@@ -1315,7 +1557,7 @@ uint32_t g_frame_failures = 0;
 // Which append site refused, as a bitmask, so a non-zero failure count names
 // itself instead of needing a bisect. Bits: 0 enable, 1 refresh rate, 2 player
 // root, 3 sky root, 4 root pop, 5 bone push, 6 bone pop, 7 perspective
-// projection, 8 orthographic projection.
+// projection, 8 orthographic projection, 9 camera-cut actor group.
 uint32_t g_frame_failure_mask = 0;
 
 void note_append_failure(uint32_t site) {
@@ -1331,6 +1573,28 @@ thread_local uint32_t g_sky_draw_depth = 0;
 // Which sky layer the draw loop is on, set at the loop head where the counter
 // lives, and read by the root-group hook that tags the layer's model matrix.
 thread_local uint32_t g_sky_layer = 0;
+
+// Camera-cut detection, evaluated once per frame at the first perspective
+// projection (the sky draws first) so the sky, the world and the player agree.
+// Tooie's own cut flag is not mapped, so a cut is read off the camera itself
+// (see evaluate_camera_cut for where position and direction come from).
+struct CameraSample {
+    float pos[3];
+    float rot[3];  // unit view direction
+};
+bool g_cam_sampled = false;
+bool g_frame_cut = false;
+bool g_have_prev_cam = false;
+bool g_prev_cam_has_dir = false;
+CameraSample g_prev_cam = {};
+// Last frame's step and turn, valid only when last frame was not itself a cut.
+bool g_prev_cam_motion_known = false;
+float g_prev_cam_step[3] = {};
+float g_prev_cam_turn = 0.0f;
+
+uint32_t cut_mask(uint32_t flags, uint32_t mask) {
+    return g_frame_cut ? (flags & ~mask) : flags;
+}
 
 } // namespace
 
@@ -1358,8 +1622,94 @@ extern std::atomic<uint32_t> g_bt_rt64_proj_skipped_other;
 // func_800A73F4 builds and submits Tooie's real scene display list, and RT64
 // resets the extended-GBI enable whenever a display list starts, so the enable
 // is re-emitted at the head of every frame's list.
+namespace {
+
+uint32_t read_byte(uint8_t* rdram, uint32_t address) {
+    return (read_word(rdram, address & ~3U) >> (24U - (address & 3U) * 8U)) & 0xFFU;
+}
+
+// BT_DEMO_PACING=off: let a recorded demo run at the game's own divisor, i.e.
+// 1.5x too fast, as before this existed.
+bool demo_pacing_off() {
+    static const bool off = rt64_env_off("BT_DEMO_PACING");
+    return off;
+}
+
+// The attract demo plays 1.5x too fast. Rare's demos replay recorded input
+// *and* each frame's recorded time step, and the recording was made on an N64
+// that ran Terrydactyland at ~20 Hz: the step is 3 VIs (sometimes 2, 4, 5). The
+// port never lags, so it shows those frames at the scene's own divisor of 2 and
+// advances the world 3 VIs in every 2. Measured: Banjo runs 25.7 units a frame
+// in the demo against 17.8 in normal play at the same divisor.
+//
+// A frame whose step exceeds the VIs that really elapsed is the signature of
+// recorded timing -- in normal play both bytes come from the same VI count. From
+// then until the scene changes, each frame's divisor is raised to its step for
+// the next wait and put back after. It has to LATCH: once paced, a demo frame
+// really does last its step, the two bytes agree, and a per-frame test would
+// switch itself off every other frame (3, 2, 3, 2 -- still 1.2x). The divisor
+// also feeds G_EX_SETREFRESHRATE, so RT64 interpolates at the delivered rate.
+// Capped at 6 so a recorded load stall (15) does not freeze the screen.
+uint32_t g_pacing_override = 0;
+uint32_t g_pacing_saved_divisor = 0;
+bool g_recorded_timing = false;
+uint32_t g_pacing_last_frame = 0;
+uint32_t g_pacing_quiet_frames = 0;
+
+void pace_recorded_frame(uint8_t* rdram) {
+    // A scene load resets the frame counter, and with it the game sets its own
+    // divisor -- possibly to the very value overriding with -- so a reset ends
+    // recorded timing and the game's divisor is left exactly as it is.
+    const uint32_t frame = read_word(rdram, kGameFrameCount);
+    const bool new_scene = frame < g_pacing_last_frame;
+    g_pacing_last_frame = frame;
+    if (new_scene) {
+        g_recorded_timing = false;
+        g_pacing_override = 0;
+    }
+
+    uint32_t divisor = read_word(rdram, kViRetraceInterval);
+    if (g_pacing_override != 0U) {
+        if (divisor == g_pacing_override) {
+            divisor = g_pacing_saved_divisor;
+            write_word(rdram, kViRetraceInterval, divisor);
+        }
+        else {
+            // The game set a divisor of its own: it wins.
+            g_recorded_timing = false;
+            g_pacing_quiet_frames = 0;
+        }
+        g_pacing_override = 0;
+    }
+    if (demo_pacing_off() || divisor == 0U) {
+        return;
+    }
+
+    const uint32_t step = std::min(read_byte(rdram, kFrameStepVis), 6U);
+    if (step > read_byte(rdram, kFrameElapsedVis)) {
+        g_recorded_timing = true;
+        g_pacing_quiet_frames = 0;
+    }
+    // Belt and braces for normal play: if the latch ever trips without a demo,
+    // ~3 s of steps no longer than the divisor releases it. The demo's own runs
+    // of 2-VI steps are a handful of frames long.
+    if (g_recorded_timing && step <= divisor && ++g_pacing_quiet_frames > 90U) {
+        g_recorded_timing = false;
+    }
+    if (g_recorded_timing && step > divisor) {
+        g_pacing_quiet_frames = 0;
+        g_pacing_saved_divisor = divisor;
+        g_pacing_override = step;
+        write_word(rdram, kViRetraceInterval, step);
+    }
+}
+
+} // namespace
+
 extern "C" void tooie_rt64_begin_frame(uint8_t* rdram, recomp_context* ctx) {
     (void)ctx;
+    // Runs before the RT64 gate on purpose: pacing is game timing, not metadata.
+    pace_recorded_frame(rdram);
     if (rt64_disabled()) {
         return;
     }
@@ -1444,6 +1794,22 @@ extern "C" void tooie_rt64_begin_frame(uint8_t* rdram, recomp_context* ctx) {
     }
     g_player_scope_depth = 0;
     g_player_key = 0;
+    g_cam_sampled = false;
+    g_frame_cut = false;
+
+    if (rt64_camlog_enabled()) {
+        std::fprintf(stderr, "[actors] frame=%u drawn=%zu kept=%u new=%u\n",
+                     frame, g_cur_actor_draws.size(), g_frame_actor_matched,
+                     g_frame_actor_new);
+        std::fflush(stderr);
+    }
+    g_prev_actor_draws.swap(g_cur_actor_draws);
+    g_cur_actor_draws.clear();
+    for (ActorDraw& draw : g_prev_actor_draws) {
+        draw.claimed = false;
+    }
+    g_frame_actor_matched = 0;
+    g_frame_actor_new = 0;
 
     if (!append_command(rdram, kRenderBufferState, kEnableWord0,
                         kEnableWord1)) {
@@ -1498,9 +1864,10 @@ extern "C" void tooie_rt64_player_scope(uint8_t* rdram, recomp_context* ctx,
 // the address of the display-list cursor and 0x10C($sp) the model's geometry
 // list, both read from the same stack slots the function itself uses.
 //
-// The same site serves the skybox: it reaches the shared renderer through
-// func_800DE448 as well, so whichever scope is active decides the identity --
-// the player's model, or the sky layer the draw loop is on.
+// The same site serves the skybox and every other model: they reach the shared
+// renderer through func_800DE448 as well, so whichever scope is active decides
+// the identity -- the player's model, the sky layer the draw loop is on, or
+// otherwise the tracked draw (actor_transform_id).
 extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
                                             recomp_context* ctx) {
     if (rt64_disabled()) {
@@ -1509,7 +1876,7 @@ extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
 
     const bool in_player = g_player_scope_depth != 0U;
     const bool in_sky = g_sky_draw_depth != 0U;
-    if (!in_player && !in_sky) {
+    if (!in_player && !in_sky && rt64_actors_off()) {
         return;
     }
 
@@ -1532,8 +1899,10 @@ extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
         }
         scope.transform_id = kSkyboxTransformIdBase +
             g_sky_layer * kSkyboxTransformIdStride;
-        scope.pushed = append_matrix_group(rdram, cursor, scope.transform_id,
-                                           kRootGroupFlags);
+        scope.bone_flags = kBoneGroupFlags;
+        scope.pushed = append_matrix_group(
+            rdram, cursor, scope.transform_id,
+            cut_mask(kRootGroupFlags, kCutModelMask));
         if (scope.pushed) {
             ++g_frame_sky_groups;
         }
@@ -1548,13 +1917,62 @@ extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
         return;
     }
 
-    scope.transform_id = player_model_transform_id(g_player_key, model);
+    uint32_t root_flags = kRootGroupFlags;
+    scope.bone_flags = kBoneGroupFlags;
+    const bool animated = read_word(rdram, kAnimationMatrixList) != 0U;
+    if (in_player) {
+        scope.transform_id = player_model_transform_id(g_player_key, model);
+    }
+    else {
+        root_flags = kActorGroupFlags;
+        scope.bone_flags = kActorGroupFlags;
+        // 0xE0($sp) is the renderer's own copy of the draw position.
+        const uint32_t sp = static_cast<uint32_t>(ctx->r29);
+        float pos[3];
+        for (uint32_t i = 0; i < 3U; ++i) {
+            pos[i] = read_float(rdram, sp + 0xE0U + i * 4U);
+        }
+        if (!std::isfinite(pos[0]) || !std::isfinite(pos[1]) ||
+            !std::isfinite(pos[2])) {
+            return;
+        }
+        scope.transform_id = actor_transform_id(model, pos);
+        if (rt64_actorlog_enabled()) {
+            scope.model = model;
+            scope.pos[0] = pos[0];
+            scope.pos[1] = pos[1];
+            scope.pos[2] = pos[2];
+            scope.anim = read_word(rdram, kAnimationMatrixList);
+        }
+    }
     if (scope.transform_id == 0U) {
         return;
     }
 
-    scope.pushed =
-        append_matrix_group(rdram, cursor, scope.transform_id, kRootGroupFlags);
+    // BT_RT64_CAMLOG: the player root's translation, read from the gSPMatrix
+    // the renderer has just emitted (the command before the cursor).
+    if (in_player && rt64_camlog_enabled()) {
+        const uint32_t gfx = read_word(rdram, cursor);
+        if (in_rdram(gfx - 8U, 8U) && (read_word(rdram, gfx - 8U) >> 24) == 0xDAU) {
+            const uint32_t mtx =
+                (read_word(rdram, gfx - 4U) & 0x00FFFFFFU) | 0x80000000U;
+            if (in_rdram(mtx, 64U)) {
+                std::fprintf(stderr, "[player] frame=%u id=0x%08X pos=(%.1f %.1f %.1f)\n",
+                             read_word(rdram, kGameFrameCount), scope.transform_id,
+                             read_mtx_element(rdram, mtx, 3U, 0U),
+                             read_mtx_element(rdram, mtx, 3U, 1U),
+                             read_mtx_element(rdram, mtx, 3U, 2U));
+            }
+        }
+    }
+
+    if (animated && !rt64_verts_off()) {
+        root_flags |= kVertexInterpolateBits;
+    }
+    // Where this model's commands start (BT_RT64_ACTORLOG counts from here).
+    scope.gfx_start = read_word(rdram, cursor);
+    scope.pushed = append_matrix_group(rdram, cursor, scope.transform_id,
+                                       cut_mask(root_flags, kCutModelMask));
     if (scope.pushed) {
         ++g_frame_root_groups;
     }
@@ -1582,6 +2000,28 @@ extern "C" void tooie_rt64_pop_player_root(uint8_t* rdram,
     RootScope& scope = g_root_scopes[depth];
     if (scope.pushed) {
         const uint32_t cursor = static_cast<uint32_t>(MEM_W(0xF8U, ctx->r29));
+        if (rt64_actorlog_enabled() && scope.model != 0U) {
+            // What this model emitted between its root group and here: matrix
+            // loads (G_MTX), vertex loads (G_VTX) and display-list calls (G_DL).
+            uint32_t matrices = 0, vertices = 0, calls = 0, first_vtx = 0;
+            const uint32_t end = read_word(rdram, cursor);
+            if (in_rdram(scope.gfx_start, 8U) && end > scope.gfx_start &&
+                end - scope.gfx_start < 0x40000U) {
+                for (uint32_t a = scope.gfx_start; a + 8U <= end; a += 8U) {
+                    const uint32_t op = read_word(rdram, a) >> 24;
+                    if (op == 0xDAU) ++matrices;
+                    else if (op == 0x01U) { if (vertices++ == 0U) first_vtx = read_word(rdram, a + 4U); }
+                    else if (op == 0xDEU) ++calls;
+                }
+            }
+            std::fprintf(stderr,
+                         "[actor] frame=%u model=%08X id=%08X pos=(%.0f %.0f %.0f) "
+                         "bones=%u mtx=%u vtx=%u dl=%u vtx0=%08X anim=%08X\n",
+                         read_word(rdram, kGameFrameCount), scope.model,
+                         scope.transform_id, scope.pos[0], scope.pos[1],
+                         scope.pos[2], scope.bones, matrices, vertices, calls,
+                         first_vtx, scope.anim);
+        }
         if (!append_command(rdram, cursor, kPopMatrixGroupWord0,
                             kPopMatrixGroupWord1)) {
             note_append_failure(4U);
@@ -1598,7 +2038,7 @@ extern "C" void tooie_rt64_push_player_bone(uint8_t* rdram,
     if (rt64_disabled()) {
         return;
     }
-    if (g_player_scope_depth == 0U || g_root_scope_depth == 0U) {
+    if (g_root_scope_depth == 0U) {
         return;
     }
 
@@ -1633,9 +2073,10 @@ extern "C" void tooie_rt64_push_player_bone(uint8_t* rdram,
     const uint32_t cursor = static_cast<uint32_t>(ctx->r16);
     g_bone_scopes[depth] = append_matrix_group(
         rdram, cursor, root_scope.transform_id + 1U + static_cast<uint32_t>(bone),
-        kBoneGroupFlags);
+        cut_mask(root_scope.bone_flags, kCutModelMask));
     if (g_bone_scopes[depth]) {
         ++g_frame_bone_groups;
+        ++root_scope.bones;
     }
     else {
         note_append_failure(5U);
@@ -1727,10 +2168,121 @@ extern "C" void tooie_rt64_sky_layer(uint8_t* rdram, recomp_context* ctx) {
 //
 // `cursor_address` is the guest address of the cursor word: `$s0` for
 // func_800E44FC, the stack slot `0x34($sp)` for func_800E42F0.
+namespace {
+
+bool normalize3(float v[3]) {
+    const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (!(length > 1e-6f) || !std::isfinite(length)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < 3U; ++i) {
+        v[i] /= length;
+    }
+    return true;
+}
+
+// Samples this frame's camera and decides whether it cut. Only the first
+// perspective projection of a frame is sampled.
+//
+// Position: func_800E44FC's own copy at 0x38($sp). Direction: the projection
+// it is about to load is view x perspective in N64 row-vector form, and its
+// last column is the world-space vector whose dot product gives clip w, i.e. the
+// view axis -- the camera's direction, whatever scale or FOV the matrix carries.
+// The matrix is at 0x4($s0), written by func_80018C28 just before the hook.
+void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
+                         uint32_t gfx_state) {
+    if (g_cam_sampled) {
+        return;
+    }
+    g_cam_sampled = true;
+
+    const uint32_t sp = static_cast<uint32_t>(ctx->r29);
+    CameraSample cam = {};
+    bool finite = true;
+    for (uint32_t i = 0; i < 3U; ++i) {
+        cam.pos[i] = read_float(rdram, sp + 0x38U + i * 4U);
+        finite = finite && std::isfinite(cam.pos[i]);
+    }
+    const uint32_t mtx = read_word(rdram, gfx_state + 4U);
+    bool have_dir = in_rdram(mtx, 64U);
+    if (have_dir) {
+        for (uint32_t i = 0; i < 3U; ++i) {
+            cam.rot[i] = read_mtx_element(rdram, mtx, i, 3U);
+        }
+        have_dir = normalize3(cam.rot);
+    }
+
+    // A cut is a change in the camera's *velocity*, not a large step: the title
+    // flyover pans a steady 114 units a frame, the intro has still-to-still cuts
+    // of 75. So a step is compared against last frame's step, and it must also
+    // be bigger than the limit itself, or a camera shake -- +50, -50, +50 -- would
+    // read as a cut on every frame. Right after a cut the velocity is unknown,
+    // and only a step bigger than the fallback limits counts.
+    // Measured on the new-game intro: frame-to-frame deviation p99 = 14.7 units;
+    // all 40 shot changes deviate by 75 or more or turn by 17 degrees or more.
+    float move = 0.0f;
+    float turn = 0.0f;
+    float step[3] = {};
+    bool cut = false;
+    if (finite && g_have_prev_cam) {
+        float deviation = 0.0f;
+        for (uint32_t i = 0; i < 3U; ++i) {
+            step[i] = cam.pos[i] - g_prev_cam.pos[i];
+            move += step[i] * step[i];
+            const float error = step[i] - g_prev_cam_step[i];
+            deviation += error * error;
+        }
+        move = std::sqrt(move);
+        deviation = g_prev_cam_motion_known ? std::sqrt(deviation) : move;
+        if (have_dir && g_prev_cam_has_dir) {
+            const float dot = cam.rot[0] * g_prev_cam.rot[0] +
+                              cam.rot[1] * g_prev_cam.rot[1] +
+                              cam.rot[2] * g_prev_cam.rot[2];
+            turn = std::acos(std::fmin(1.0f, std::fmax(-1.0f, dot))) *
+                   57.29578f;
+        }
+        const float turn_change = g_prev_cam_motion_known
+            ? std::fabs(turn - g_prev_cam_turn) : turn;
+        const float move_limit = g_prev_cam_motion_known
+            ? cut_distance() : kCutUnknownDistance;
+        const float turn_limit = g_prev_cam_motion_known
+            ? cut_angle() : kCutUnknownAngle;
+        cut = (move > cut_distance() && deviation > move_limit) ||
+              (turn > cut_angle() && turn_change > turn_limit);
+    }
+    g_frame_cut = cut && !rt64_cuts_off();
+
+    if (rt64_camlog_enabled()) {
+        const uint32_t frame = read_word(rdram, kGameFrameCount);
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr,
+                     "[cam] frame=%u t=%.2f vi=%u pos=(%.1f %.1f %.1f) "
+                     "dir=(%.3f %.3f %.3f) move=%.1f turn=%.1f%s\n",
+                     frame, ms, read_word(rdram, kViRetraceInterval),
+                     cam.pos[0], cam.pos[1], cam.pos[2], cam.rot[0],
+                     cam.rot[1], cam.rot[2], move, turn,
+                     cut ? (g_frame_cut ? " CUT" : " CUT(not applied)") : "");
+        std::fflush(stderr);
+    }
+    g_prev_cam_has_dir = have_dir;
+
+    if (finite) {
+        g_prev_cam_motion_known = g_have_prev_cam && !cut;
+        for (uint32_t i = 0; i < 3U; ++i) {
+            g_prev_cam_step[i] = step[i];
+        }
+        g_prev_cam_turn = turn;
+        g_prev_cam = cam;
+        g_have_prev_cam = true;
+    }
+}
+
+} // namespace
+
 extern "C" void tooie_rt64_tag_projection(uint8_t* rdram, recomp_context* ctx,
                                           uint32_t kind,
                                           uint32_t cursor_address) {
-    (void)ctx;
     if (rt64_disabled() || rt64_proj_off()) {
         return;
     }
@@ -1738,6 +2290,14 @@ extern "C" void tooie_rt64_tag_projection(uint8_t* rdram, recomp_context* ctx,
     uint32_t transform_id = kOrthoProjectionId;
     uint32_t flags = kProjectionGroupFlags;
     if (kind == 0U) {
+        const bool first_of_frame = !g_cam_sampled;
+        evaluate_camera_cut(rdram, ctx, cursor_address);
+        if (first_of_frame && g_frame_cut &&
+            !append_matrix_group(rdram, cursor_address, G_EX_ID_AUTO,
+                                 kCutActorGroupFlags)) {
+            note_append_failure(9U);
+        }
+
         if (g_sky_draw_depth != 0U) {
             transform_id = kSkyboxProjectionId;
             // Off by default: the stretch makes the dome cover the widened frame,
@@ -1755,6 +2315,7 @@ extern "C" void tooie_rt64_tag_projection(uint8_t* rdram, recomp_context* ctx,
         else {
             transform_id = kGameplayProjectionId;
         }
+        flags = cut_mask(flags, kCutProjectionMask);
     }
 
     if (append_matrix_group(rdram, cursor_address, transform_id, flags)) {

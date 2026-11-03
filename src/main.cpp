@@ -6,9 +6,12 @@
 // their overlay table come from RecompiledFuncs/.
 
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -318,6 +321,90 @@ ultramodern::input::connected_device_info_t get_connected_device_info(
         .connected_device = ultramodern::input::Device::None,
         .connected_pak = ultramodern::input::Pak::None,
     };
+}
+
+// BT_AUTOPAD: scripted button presses for player 1, for reaching states the
+// attract loop never shows (the new-game intro) from an unattended run.
+// Synthetic keystrokes do not reach the window (AGENTS.md, Instruments), so the
+// presses are ORed in after the real controller is read. Format:
+// "seconds:button,..." with seconds counted from the first input poll and
+// button one of a b z start l r du dd dl dr cu cd cl cr, or a stick direction
+// up down left right (full deflection). Each press is held for 0.15 s;
+// "from-to:button" holds it for that span instead. Unset means no effect.
+struct AutopadPress {
+    double at;
+    double until;
+    uint16_t button;
+    float x;
+    float y;
+};
+
+std::vector<AutopadPress> autopad_script() {
+    std::vector<AutopadPress> presses;
+    const char* script = std::getenv("BT_AUTOPAD");
+    if (script == nullptr) {
+        return presses;
+    }
+    static const std::pair<const char*, uint16_t> names[] = {
+        {"a", 0x8000}, {"b", 0x4000}, {"z", 0x2000}, {"start", 0x1000},
+        {"du", 0x0800}, {"dd", 0x0400}, {"dl", 0x0200}, {"dr", 0x0100},
+        {"l", 0x0020}, {"r", 0x0010}, {"cu", 0x0008}, {"cd", 0x0004},
+        {"cl", 0x0002}, {"cr", 0x0001},
+    };
+    std::string text = script;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find(',', start);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        const std::string item = text.substr(start, end - start);
+        const size_t colon = item.find(':');
+        if (colon != std::string::npos) {
+            const std::string when = item.substr(0, colon);
+            const std::string name = item.substr(colon + 1);
+            const size_t dash = when.find('-');
+            const double at = std::atof(when.c_str());
+            const double until = (dash != std::string::npos)
+                ? std::atof(when.c_str() + dash + 1) : at + 0.15;
+            for (const auto& [label, bit] : names) {
+                if (name == label) {
+                    presses.push_back({at, until, bit, 0.0f, 0.0f});
+                }
+            }
+            if (name == "up") presses.push_back({at, until, 0, 0.0f, 1.0f});
+            if (name == "down") presses.push_back({at, until, 0, 0.0f, -1.0f});
+            if (name == "left") presses.push_back({at, until, 0, -1.0f, 0.0f});
+            if (name == "right") presses.push_back({at, until, 0, 1.0f, 0.0f});
+        }
+        start = end + 1;
+    }
+    return presses;
+}
+
+bool get_input_with_autopad(int player_index, uint16_t* buttons_out,
+                            float* x_out, float* y_out) {
+    static const std::vector<AutopadPress> presses = autopad_script();
+    const bool connected = recompinput::profiles::get_n64_input(
+        player_index, buttons_out, x_out, y_out);
+    if (presses.empty() || player_index != 0) {
+        return connected;
+    }
+    static const auto origin = std::chrono::steady_clock::now();
+    const double now = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - origin).count();
+    for (const AutopadPress& press : presses) {
+        if (now >= press.at && now < press.until) {
+            *buttons_out |= press.button;
+            if (press.x != 0.0f) {
+                *x_out = press.x;
+            }
+            if (press.y != 0.0f) {
+                *y_out = press.y;
+            }
+        }
+    }
+    return true;
 }
 
 // --- RSP microcode ---------------------------------------------------------
@@ -683,7 +770,7 @@ int main(int argc, char** argv) {
 
     ultramodern::input::callbacks_t input_callbacks{
         .poll_input = recompinput::poll_inputs,
-        .get_input = recompinput::profiles::get_n64_input,
+        .get_input = get_input_with_autopad,
         .set_rumble = recompinput::set_rumble,
         .get_connected_device_info = get_connected_device_info,
     };
