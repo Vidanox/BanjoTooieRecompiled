@@ -26421,6 +26421,7 @@ L_808002A8:
     // 0x808002B8: nop
 
 L_808002BC:
+    tooie_yield_intro_sync(rdram, ctx);
     // 0x808002BC: jal         0x800000BC
     // 0x808002C0: lw          $a0, 0x0($s1)
     ctx->r4 = MEM_W(ctx->r17, 0X0);

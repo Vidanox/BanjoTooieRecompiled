@@ -59,6 +59,7 @@ stubs/hooks, or the recompiler patches. See §11.
 | Syscall/overlay layer | `src/recomp_api.cpp` | `recomp_syscall_handler`, overlay registration, all hooks |
 | Overlay tables | `src/register_overlays.cpp` | maps the generated section table into runtime order |
 | ROM decompression | `src/rom_decompression.cpp` | C++ port of `tools/decompress_rom.py`, byte-identical |
+| Test harness | `src/test_harness.cpp` | `BT_WARP` / `BT_POKE` / `BT_POS` / `BT_HARNESSLOG`, env-gated (section 9) |
 | Audio microcode | `rsp/n_aspMain.cpp` | recompiled RSP program |
 | Config | `banjotooie.us.toml` | entrypoint, stubs, instruction patches, hooks |
 
@@ -487,6 +488,56 @@ forever. Fixed by clearing the freeze where the game signals the barrier
 |Runs, no crash, no frames|a blocked guest queue|
 |Just stops, no error|missing `--game bt` (the thread blocks in `wait_for_game_started`)|
 
+### 6.9 The intro's music-cue wait starved the audio thread
+
+Reported as "long pauses between scene transitions" and "the music is not
+synced" in the new-game intro. One cause for both, and it is the same shape as
+§6.6: a loop that hardware preempts and the cooperative runtime does not.
+
+**How the intro keeps time (native).** `glintrosyncDll` keeps the intro on the
+score's schedule. Its clock (float seconds at `0x801275D8`) advances by each
+frame's time step while a scene plays; the map-change routine `func_800A76F4`
+stamps `osGetCount` (`entrypoint_0`) before loading the next map and, after the
+load, `entrypoint_1` **busy-polls `osGetCount`** until the clock reaches that
+scene's cue (a per-map table in the overlay), then adds the wait to the clock.
+So each transition lasts load + wait = a fixed budget, the next scene starts on
+its cue, and on hardware the load simply eats part of the wait. Measured with
+`BT_PACELOG`: the clock runs at wall rate inside scenes and jumps by exactly the
+gap at each transition; scene starts are identical to the frame in every run
+and at every refresh mode.
+
+**What was ours.** The poll loop (`0x808002BC`) makes no OS call, so nothing
+else ran while it spun -- including the audio thread, which on hardware
+preempts it. The music stopped dead for every wait and the device queue ran
+dry. Measured over the whole intro (144 Hz, identical at `Original` with
+interpolation off and at 50 Hz): 11 transitions holding the picture 1.85-6.46 s
+(43.9 s in all), ~0.1 s of audio generated during a wait that was not also in
+the §6.6 sound-release sweep (that one yields, so ~1.7 s of audio got through
+in those), and the audio clock **34.3 s behind wall time** by Spiral Mountain,
+while the pictures stayed on their cues. A silent frozen frame is what read as
+a "long pause"; the hardware plays the score across it.
+
+Fix: `tooie_yield_intro_sync` (`yield_self_1ms`) hooked at the loop head, so it
+runs only while the cue has not been reached; the loop condition and the
+bookkeeping are untouched. After: audio generated during every wait equals the
+wait (3.37 s for a 3.37 s gap, ...), no empty-queue events, and the audio clock
+ends the intro 0.09 s from wall time. The gaps keep their length -- that part is
+native: the cue table sets it, and the hardware differs only by its slower VI
+(59.83 Hz, so its scenes run ~0.3% longer and its waits are that much shorter,
+<0.4 s per transition). No longplay with per-scene timings was found to check
+against; a Rare developer calls it "the 10-minute intro", and ours runs 11:09
+from the first scene to Spiral Mountain. `BT_INTROSYNC_YIELD=off` restores the
+starving spin for A/B. The hook is in `banjotooie.us.toml` and was also inserted
+by hand into `RecompiledFuncs/funcs_76.c` exactly where N64Recomp emits a
+`before_vram` hook (after the label, before the instruction), so a regeneration
+reproduces it.
+
+⚠ **Any wall-clock busy-wait in Tooie needs a scheduling point.** The symptom
+is a stall with the audio clock (`au=` in `BT_PACELOG`) frozen while VIs still
+advance; `tools/stack_sample.py` during the stall names the loop (here Game
+Thread 6 inside `func_808000BC_glintrosyncDll`, everything else parked in
+`osRecvMesg`).
+
 ---
 
 ## 7. Findings: rendering
@@ -632,6 +683,34 @@ deviation p99 = 14.7, 40 shot changes flagged, no false positives; first version
 (absolute 400 / 40) missed six cuts. ⚠ **The projection id 0x1000 must not change
 on a cut** — the Expand bounds fix in `rt64.patch` keys on it.
 
+**"The camera jumps when a cinematic starts" measured clean, i.e. native** (recipe
+(e), Jamjars, teleported and walked in, plus the alive-King throne-room scene).
+Every dialogue start and end is flagged on exactly the frame the camera changes
+shot (5224 / 4494 / 1481 units, 116-140°), nothing else in those scenes steps
+more than 40 units, game frames arrive every 33.3 ms ±1 across the cut, and the
+sky and world projections of the cut frame carry the same camera (checked per
+projection). Captured display frames at 50 and 144 Hz show old shot, then new
+shot, then a smooth pan, with no blended frame in between. That is the
+same hard cut the N64 makes. The other camera-change cases the report could
+mean (a cut that is undetected because it is small, or a cinematic that sets
+its FOV a frame late) did not occur in these scenes.
+
+**Re-measured for the three Mayahem Temple NPCs (2026-11-08), walked up to the
+way a player would** (recipes in §9): Mumbo (enter the skull, walk up, scripted
+walk, talk; then a second talk started with B), Humba Wumba (enter the wigwam,
+scripted walk, talk) and Jamjars (walked into his trigger from 420 units away,
+not teleported). Every dialogue start and end is one CUT frame with zero camera
+motion on the three frames either side (442/22°, 272/8°, 671/15°, 440/22°,
+1040/12°, 1006/4°, 326/15°, 4489/142°, 1523/110°); the walk-up dolly into
+Mumbo (0 → 15 → 7 units a frame) and Jamjars' 140-frame dialogue flyover
+(20-27 units a frame, stopping dead) are never flagged. Burst captures across
+Mumbo's start and his mid-dialogue cut at 50 Hz and at Original refresh show the
+same two pictures, old shot then new shot. Not reproduced. ⚠ The one false
+positive in all the logs is outside MT: a new-game intro shot whose camera goes
+from rest to a steady 114 units a frame (frame ~103 of the first scene, vi 3) is
+flagged, so that one frame is held instead of interpolated. A velocity rule
+cannot tell that from a cut without looking ahead; left as is.
+
 ### 7.7 Every model through the shared renderer carries an id
 
 Untagged, RT64 pairs each *bone* with the previous frame's by draw-call hash and
@@ -722,6 +801,259 @@ Unrelated but measured at the same time: two particle models in the cave
 (~35 instances a frame, ~12-frame lives) churn ids constantly. That is the
 particles spawning and dying, not a tracker fault.
 
+### 7.7d The player's id table ran out, untagging the player for good
+
+Reported after a long session: Banjo, Talon-Trot Kazooie and the
+transformations all started distorting at once and stayed that way. The
+player's ids come from `player_model_transform_id`, keyed on (player slot,
+model **address**) — and that address does not stay put. Every room load
+reloads the model, and the heap compactor (`defrag`, `baanim_defrag`) moves it
+during play. Measured with `[player-slot]` (`BT_RT64_CAMLOG`): 4 new addresses
+in 60 s near Bottles' dialogue, 8 in 230 s with two trips through Banjo's
+house, 2 in 64 s of open exploration. The table was append-only with 256 slots,
+so after ~254 reloads/moves every new address got id 0, the root and bone
+groups were no longer emitted, and the player went back to RT64's heuristic
+pairing (§7.2's shearing) for the rest of the session, whatever model it wore.
+
+Fix: a slot not drawn in this frame or the previous one is reused (oldest
+first). RT64 pairs a transform only with the previous frame's, so an id idle for
+a whole frame cannot be blended with its old owner. A/B with the table shrunk to
+3 slots (`BT_RT64_SLOTCAP=3`), same input: with the old behaviour
+(`BT_RT64_SLOTRECLAIM=off`) the player draws with id 0 from the third move on,
+RT64's id-matched transforms drop from 64 to 44 a frame, and the lerp guard
+trips 125 times on AUTO-paired transforms (the player blended against whatever
+the heuristic chose); with reuse the stale slot is reclaimed on that frame,
+matching stays at ~60 a frame and AUTO trips are 8.
+
+⚠ A move still costs the player one uninterpolated frame (new address, new id).
+Carrying the id across is not safe: a miss can equally be a model *swap* (a
+transformation), and handing the old id to a different skeleton blends bones by
+index across two rigs. ⚠ **Actor ids are keyed on the model address too**
+(`actor_transform_id`), so a heap move gives an NPC or a cutscene character one
+unpaired frame as well. Tested for Grunty (§7.7e) and it was not her cause: through
+the whole new-game intro no character's model address changed mid-scene, and her
+id changed only when she left the frame.
+
+### 7.7e A blink dropped vertex interpolation for the whole of a CPU-animated body
+
+"Grunty lags in all cutscenes." She is CPU-animated (§7.7b: anim set, 0 `G_MTX`,
+66–68 DL calls; the model address differs from run to run, `0x801F4470` in one),
+and so is Mingella. Her whole body is therefore ONE transform and is
+interpolated only through its vertices — and RT64 does that only when the
+transform's vertex count matches the previous frame's. Her eyelids and mouth
+swap one part's geometry: measured with `BT_RT64_VTXLOG`, a blink runs
+1174 → 1181 → 1186 → 1168 → 1168 → 1186 → 1181 → 1174 vertices. Every one of
+those frames lost vertex interpolation for the entire body, which then stepped
+at the cutscene's 20 Hz: 205 of her 1067 frames in the rock scene (19%), in
+bursts of three. Bone-animated characters are untouched by this — their eyes are
+under a bone transform with no vertex interpolation.
+
+Fix (RT64 patch): RT64 now records where every vertex load starts
+(`DrawData::vertexLoadStarts`), and when a vertex-interpolated transform's count
+changed, `alignVertexLoads` pairs its loads from the front and from the back
+while their lengths agree. The loads in between (the swapped eye or mouth) have
+no previous shape, so each of their vertices borrows the velocity of the nearest
+paired vertex: the part travels with the skin around it and only its shape
+snaps. Left still instead, a part whose rim is stitched to the face would split
+from it by up to a frame's motion. It gives up if fewer than half the vertices
+pair. Measured on the same scene: 165 count-changing frames for Grunty, all 165
+paired (1151–1158 of ~1174 vertices), 805/805 across every model in the intro; a
+burst of captures through her dialogue shows no torn geometry.
+`BT_RT64_VTXALIGN=off` restores the old behaviour, `=noborrow` leaves the
+swapped part still. Equal-length loads that are genuinely different shapes are
+paired by index, which is what RT64 already did whenever the total happened to
+match.
+
+⚠ The borrow is defensive and Grunty does not exercise it: across her blink
+frames, all ~15k vertex pairs that share a position in different loads have
+identical velocities with and without it (mid-blend gap 0.00 both ways). Her
+eyelid geometry is not stitched to her skull. A talking face whose mouth part
+*is* stitched would be where it matters. **King Jingaling is not that case**:
+measured in his alive scene (recipe (c)), he is BONE-animated (`801E47F0`,
+23 tagged bones, 41 `G_MTX`; the throne is a separate 8-bone model at the same
+spot). His bone transforms carry no vertex interpolation, and up to 4 of them
+have CPU-modified vertices (the beak) on a frame. `BT_RT64_SEAMLOG` found 297
+vertex pairs on different transforms that coincide at both keyframes (373 with
+the throne included), and the blend RT64 draws keeps them together: a
+midpoint gap of 0.00 (0.49 at most, on the throne, the same as a plain blend
+and inside the 0.5 coincidence tolerance) over ~600 frames, with no lerp-guard
+trips and no re-pairing on his ids. Close-ups captured at Original refresh and at
+50 Hz look the same. The "opening" is his beak parting on a red mouth as he talks,
+plus a few hairline cracks that are there at Original too. It is native.
+
+**The texture side, checked 2026-11-08 ("black lines in his face as he talks").**
+Four-way A/B on the same moment of the greeting (interpolation on/off × Auto
+900p/Original 240p), plus 116 captures through the whole dialogue at 50 Hz (most
+of them in-between frames), cropped to his head. The only dark line on his face
+is the closed beak's seam: a 1-2 px sliver of the red mouth interior
+(RGB ≈ 165,47,32, not black) between the upper and lower beak, present in all
+four configurations and no thicker with interpolation (red pixels inside the
+yellow head: 141 on / 159 off at 900p, 43 / 48 at 240p). His head and beak are
+untextured (vertex colour), so tile-edge bleed, clamp/wrap and LOD have nothing
+to act on, and no dark fringe appears at any UV edge of the eye textures at 900p.
+No black pixel was found inside his head in any close-up. Native; the seam simply
+reads darker the higher the resolution.
+
+**Mingella's face "vibrating like a PS1 game" is in the game's own vertex data.**
+She is CPU-animated like Grunty (934 vertices, a constant count in all 2179
+frames dumped, so §7.7e never touches her). The game writes every skinned vertex
+as an s16, i.e. snapped to a whole model unit each frame, and her head spans
+~200 units. Each vertex rounds independently as it moves, so in a close-up the
+surface shimmers by ±0.5 unit (about a pixel at 900p). That is the PS1 look
+exactly, and the N64 draws the same snapped vertices. The data has no
+frame-to-frame reversals beyond rounding: 0.135% of axis steps reverse by ≥3
+units, all of them in the feet at animation changes, and none in the head.
+Interpolation blends between the snapped positions rather than adding to them.
+Recovering the lost precision would mean changing the game's skinning output
+format. It is now smoothed on the drawing side instead, as an enhancement
+(§7.7h).
+
+### 7.7f Transforms sharing one id were paired by submission order
+
+"In Bottles' house, the lamps' fake light card sometimes bounces out of place
+when you turn the view." The cards are one actor (`8035B630` in that run) drawing
+one `G_MTX` per visible card under a single root id (no bone groups, so every
+card shares it). RT64 matches transforms that share an id with
+`G_EX_ORDER_LINEAR` **by their position in submission order**. So when the camera
+turned and a card was culled, or a new one came into view, every later card was
+blended against its neighbour's matrix and flew across the room for a game frame
+before landing. Measured with `BT_RT64_PAIRLOG=1000` over 10 s of C-left turning:
+55 card pairings whose origin jumped 2900-9200 units (a correct pair moves about
+100), each on a frame where the visible count changed. Captured at 50 Hz, it shows
+as a large, blurred, translucent card over the top-left of the room for
+about 50 ms as a lamp leaves the view. There is no such card at Original refresh.
+
+Fix (RT64 patch, `pairSharedIdRange` in `rt64_game_frame.cpp`): when several
+transforms share an id, submission order is still used whenever it is plausible.
+That is, every order pair is within `4 × (nearest previous origin) + 50` of
+its partner, or the whole set moved alike (a rigid shift). A stable set, such as
+rigid parts or blades sharing an origin, therefore pairs exactly as before.
+Otherwise each transform takes the nearest previous one, by origin, with the basis
+to separate coincident origins. A pairing longer than `4 × median + 50` is dropped,
+so a card that has just appeared is drawn as submitted instead of flying in from
+another lamp. Verified: 55 → 0 such pairings at 50 Hz and 57 → 0 at 144 Hz on the
+same input, and captures through the same turn show the lamp leaving cleanly.
+Re-pairing is rare elsewhere: 5 times through the first 100 s of a new game, and
+a handful in Jinjo Village and the throne room, all count changes.
+`BT_RT64_IDNEAREST=off` restores order pairing; `=log` prints each re-paired range.
+⚠ Bone-animated actors are unaffected, since each bone has its own id. This
+matters for actors whose inner matrices carry no ids: props and effects drawn as
+several matrices under one root, and several instances of one model at the same
+root position (which the actor tracker gives one id).
+
+### 7.7g Untagged particles were paired with whatever was left over
+
+"When swimming there is a decal on the water but sometimes it flashes." Banjo's
+swim effects (the wake rings on the water and the bubbles off his tail, one call
+hash, `D1B357712C9D8A9F` in that run) carry no ids, so RT64 pairs them with the
+previous frame greedily, smallest difference first -- **with no limit on
+distance**. Each time one ring dies behind Banjo and a new one is born at him, the
+two leftovers are paired and blended for a game frame (two, in fact: the bad pair
+also seeds the next frame's velocity prediction). Measured with `BT_RT64_PAIRLOG=150`
+in recipe (a) with stick input: the rest of the group sits still (predicted
+difference ~0) while one pairing per change jumps 300-500 units (1350-1610 in the
+drop into the pool), 56 of them in ~20 s of swimming. Captured at 50 Hz, each
+shows as a large translucent white disc flying across Banjo for 2-3 captures;
+absent at `Original`, where nothing is blended.
+
+Fix (RT64 patch, `autoPairGate` in `rt64_game_frame.cpp`): before AUTO pairings
+are applied, the greedy pass is simulated, and within each call hash a pairing
+whose velocity-predicted origin difference exceeds `4 x (the group's lower median)
++ 100` is removed from the candidates; the greedy pass then runs again, so the new
+particle is drawn as submitted (as on the N64) and anything the bad pair displaced
+can still find its real partner. A group of one fast mover is its own median and
+is never gated. Perspective scenes only: the file select's sliding panels move
+170-280 units a frame next to static siblings of the same hash, and gating them
+would step a correct slide. Verified: 56 -> 0 such pairings on the same input, 22
+gates, all that one hash; captures through the same swim show no disc. Quiet
+elsewhere: 0 gates through the new-game intro (100 s) and ~90 s of random play in
+Jinjo Village and Bottles' house. `BT_RT64_AUTOGATE=off` restores RT64's pairing;
+`=log` prints each gated pairing.
+
+⚠ This monitor caps RT64's target at 60 (`[rt64fps] ... target=60` with
+`rr_manual_value` 144), so "144 Hz" runs on it are 60 Hz runs. The pairing is
+per game frame and does not depend on the display rate.
+
+**Measured clean, not fixed (2026-11-08):** the lamp and window glows in Bottles'
+house and the window lights in Jinjo Village are constant to the last bit with a
+still camera (std 0.00 over 250+ captures while Banjo idles in the same shot),
+and the glow area changes smoothly through a C-button turn (no oscillation); no
+tracked model in the house is drawn on alternate frames. No one-frame black flash
+was caught at 50 Hz across 7 warp transitions (all smooth 0.4-2 s fades), a door,
+4 pause-menu opens, 8 first-person toggles, the Jamjars dialogue cut and ~10 min of
+scripted random play; the only dark one-capture dips were the camera pressed into
+a wall or into Banjo. Re-tried 2026-11-08: Banjo walked back into the Mayahem
+Temple entrance walls with C-down, the camera scraping along them for ~16 s,
+220 captures each at 50 Hz and at Original refresh: no single-capture dip in
+either (frame mean luminance never under 60% of both neighbours). Still no lead.
+
+### 7.7h Smoothing the whole-unit snapping of CPU-animated vertices (enhancement)
+
+Asked for by the user, and native (§7.7e): Mingella's face shimmers because the
+game writes every skinned vertex as an s16, so each one snaps to a whole unit on
+its own. RT64 now smooths CPU-animated vertex positions while it pairs them
+(`smoothVertexRange` in `rt64_game_frame.cpp`), per axis, with no state of its
+own: the previous workload already holds what was DRAWN there (positions) and
+the drawn motion into it (velocities).
+
+* **Predict, blend, clamp.** The prediction is the previous drawn position plus
+  0.9 × the previous drawn velocity, used only while the game's value still lies
+  ahead in that direction and never past it. It is pulled toward the game's value
+  by `gain` (0.35) and then clamped to within `band` (0.5) of it. So the drawn
+  vertex is never further from the game's value than the rounding already was:
+  nothing lags by more than half a unit and nothing drifts.
+* **Motion passes through.** Smoothing applies in full to steps under `soft`
+  (3 units), fades out by `pass` (6), and above that the game's value is drawn
+  exactly. A previous step of `pass` or more predicts nothing, or the frame after
+  a jump would be thrown half a unit off.
+* **Count changes (§7.7e).** The paired loads are smoothed against their own
+  previous vertices. A vertex of the swapped part takes its nearest paired
+  vertex's offset as well as its velocity, so seam duplicates stay together.
+* **Upload.** Positions are uploaded with the workload before matching runs, so
+  the rewritten range (`ModifiedBuffers::notePositions`) is re-uploaded with the
+  velocities. Matching only runs above the original rate, so at Original refresh
+  nothing changes.
+* **Switch.** The graphics option "Smooth Animated Faces" (`bt_smooth_faces`,
+  default on) writes `g_bt_rt64_vertex_smooth` from its change callback, which
+  also fires on load. `BT_RT64_VTXSMOOTH=off` forces it off for A/B (§9).
+
+⚠ **Two wrong turns, both caught by measuring.** First, a plain prediction rang:
+when a vertex stopped, it overshot by the full 0.5 and came back over about four
+frames, an expression bouncing after it ends. Second, prediction was disabled
+above `soft` rather than `pass`, which left the fade region pinned at the band
+edge with a weight that changes every frame, adding up to 0.5 units of noise to
+fast movers: +7% roughness on a 116-vertex intro model. Both are gone. Also note
+that the first version of the log counted only frames whose vertices changed,
+which flattered whichever mode logged more frames.
+
+**Measured** (`BT_RT64_VTXSMOOTHLOG`, the new-game intro to 290 s, 50 Hz; and
+`BT_RT64_VTXDUMP` replayed offline through a model of the filter that matches
+the C++ output on 555 of 569 frames — the 14 misses are gaps in the dump, not
+disagreements):
+
+* **Mingella (934 vertices).** Shimmer, i.e. the mean |second difference| of
+  vertices whose raw steps are ≤ 2 units (84% of samples), drops from 0.401 to
+  0.295 (-26%, same input replayed; -27% in game). Larger motion changes by
+  +0.1%. The drawn vertex stays within 0.50 of the game's value (mean 0.13).
+* **The other CPU-animated models in the intro.** No model's total roughness
+  went up: 116 vertices -4%, 1219 -4%, 37 -33%, 61 -33%, 353 -14%, the rest
+  0 to -3%.
+* **Synthetic ramps.** At 0.3 / 1.5 / 2.5 units a frame, roughness falls from
+  0.57 / 1.00 / 1.00 to 0.28 / 0.12 / 0.20. When the ramp stops there is no
+  overshoot at all, and the vertex is settled on the next frame.
+* **Pacing.** Display rate holds at 50/s throughout.
+
+Close-ups of Mingella with it on show no torn geometry. Grunty (`2000C000`
+in that run, 1237 frames to 445 s) changed vertex count on 184 frames, and all
+184 were still paired. Her close-ups through open, closed and mid-blink eyes
+show no gap. With `"bt_smooth_faces": false` in `graphics.json`, no `[vsmooth]`
+line shows a vertex off the game's value, so the option reaches RT64. Its
+appearance in the settings menu has not been checked. ⚠ The gain plateaus
+(gain 0.15-0.35 and vel 0.8-1.0 all land within 0.01 of each other), and the
+non-causal ideal clamped to the same band is only about 40% below raw. So this
+is close to what a causal filter can recover; more would need the unrounded
+values, which the game never computes.
+
 ### 7.8 The attract demo played 1.5x too fast
 
 Not interpolation (it happens at `Original` refresh too). Rare's demos replay
@@ -748,6 +1080,22 @@ sections now last 1.37–1.46x as long; Spiral Mountain from a save stays at
 divisor 2 for all 1085 frames; the title returns at divisor 3.
 `BT_DEMO_PACING=off` restores the old behaviour.
 
+⚠ **Only a recordable step may latch (fixed 2026-11-08).** The first frame
+after a map load carries the load stall in the step byte (14-15) while the
+elapsed byte can read less: entering the intro's map `0x0A5` one run read step
+15, elapsed 5. That latched recorded timing in normal play, and the latch then
+held itself: once paced, every frame really lasts the capped 6 VIs, so the step
+stays above the divisor and the ~3 s quiet release never fires. The whole scene
+ran at divisor 6 (10 Hz, 113 frames instead of 196) and, because the intro
+waits on its music cues (§6.9), the following transition shortened by the 1.45 s
+the scene had overrun. Timing-dependent -- the previous run had read step 14,
+elapsed 14 on the same frame and stayed at divisor 3. Steps above the cap of 6
+no longer latch; `BT_PACELOG` prints `[pacing] latch` and `[pacing] load-stall
+frame ignored` lines. Re-verified on the attract loop: each of the three demo
+maps (`0x116`, `0x13A`, `0x14F`) still latches on its frame 3 (step 4-5 against
+elapsed 1-2) and plays at divisors 2-6, and the load frames (step 15, 11, 7)
+are ignored.
+
 ⚠ **Pacing a demo frame by frame changes the reported refresh rate almost
 every frame, and RT64 used to drop frames on every change**
 (`rt64_workload_queue.cpp`, `patches/rt64.patch`). Its tick counters were in
@@ -767,6 +1115,51 @@ through the demo, new 49–50.5/s; constant-rate scenes identical either way.
 Measured while chasing the remaining logo roughness: game-frame pacing is clean
 -- 50.0 ms ±0.6 at the 20 Hz boot/title, 33.3 ms ±0.6 at the 30 Hz demo (`t=`
 and `vi=` in the `[cam]` line) -- so uneven frame delivery is not the cause.
+
+### 7.9 Sky seams: clamped tiles with nothing to blend across (enhancement)
+
+"Is it possible to make the seams of the sky less noticeable?" **Native, not
+ours, and not an upscaling artefact**: a vertical step through Spiral Mountain's
+clouds measured 112 -> 119 (row 640, x 815 at 1600x900) identically at 50 Hz
+interpolated, at `Original` refresh, and at `Original` resolution.
+
+**Cause, read from the data** (RDRAM dumped mid sky draw, model parsed
+offline). Every sky checked is a panorama cut into tiles with clamp in both
+axes, each mapped edge to edge across [-0.5, N-0.5] texels: Spiral Mountain
+three 64x64 IA8 tiles in a 9-quad ring (A B C A B C ..., plus one quad
+cross-fading C into A to fit 8 segments), Jinjo Village 32x32 RGBA32, Mayahem
+Temple 32x32 RGBA16 in both directions. The art IS continuous -- adjacent tiles'
+edge columns differ by 12-14 (0-255), the same as any two neighbouring columns
+inside a tile (11), against 44-78 for tiles that are not neighbours -- but the
+tiles do not overlap, so the filter cannot blend tile A's last texel with tile
+B's first: each side holds its own edge flat for half a texel and the picture
+steps by one texel's difference. A real N64 clamps the same way.
+
+**Enhancement** (`sky_seams` in `recomp_api.cpp`, graphics option "Blend Sky
+Seams" / `bt_sky_seams`, default on). At the sky draw's exit, the display list it
+emitted is walked (following `G_DL`, tracking segments, tiles, loads and
+vertices); every textured triangle edge lying on a clamped tile border is
+collected, and edges two tiles share are paired. Both borders are then rewritten
+in RDRAM to their common average, so the two sides meet at the same value.
+Guards: same model (one segment-1 base); the triangles on OPPOSITE sides of the
+edge (Spiral Mountain's cross-faded pair are coincident, not neighbours); and the
+borders must already agree, mean |diff| <= 2 x (mean |edge - next texel|) + 3 --
+real seams measure 0.1-1.3x that gradient, mismatched art 2.9-14x (the attract
+and intro skies have some; they are rejected). IA8, I8, IA16, RGBA16, RGBA32 only;
+CI and 4-bit are left alone. Averaging is idempotent, so re-processing is harmless.
+It re-runs only when the emitted segment and `G_DL` set changes -- the model
+renderer emits only the segments in view, and a seam can only be paired while
+both sides are drawn -- or a written texel no longer holds (reload in place).
+
+**Measured.** The Spiral Mountain step is gone: row 640 now runs
+111 112 114 116 116 ... through the seam, row 760 111 111 111 110 109 (was
+111 -> 107). Close-ups show no seam even contrast-enhanced, and no new artefact.
+Mayahem Temple: every pair blended, 0 rejected; Jinjo Village: 10 pairs, 0
+rejected. Cost: 22-41 us per processing in Spiral Mountain, 150-290 us for the
+largest (attract/intro) sky, about once every two seconds while that camera
+moves; nothing per frame beyond scanning the ~30 commands the sky emitted.
+Turning the option off takes effect at the next map load (the texels already
+rewritten are not restored). `BT_SKY_SEAMS=off|log|log2` (§9).
 
 ---
 
@@ -891,10 +1284,81 @@ Different failures need different tools. Choosing the wrong one wastes a session
 |**Look at the picture**|`tools/capture.py`|saves the window to PNG.|
 |**Input-gated state**|`tools/trace_play.py`|the attract loop cannot reach first person; this launches with tracing and drives input.|
 |**Unattended input**|`BT_AUTOPAD`|scripted presses ORed into player 1's pad, `seconds:button,...` from the first input poll; `from-to:button` holds, and `up/down/left/right` drive the stick. From a clean save, `26:start,32:a` reaches the new-game intro; with a save, the same loads it.|
-|**Interpolation cuts / ids / timing**|`BT_RT64_CAMLOG=1`|per frame: `[cam]` (wall time `t=`, divisor `vi=`, camera step/turn, CUT), `[actors]` (draws that kept their id vs new), `[player]` (Banjo's root translation).|
+|**Interpolation cuts / ids / timing**|`BT_RT64_CAMLOG=1`|per frame: `[cam]` (wall time `t=`, divisor `vi=`, camera step/turn, CUT), `[actors]` (draws that kept their id vs new), `[player]` (Banjo's root translation), `[player-slot]` (each player id (re)assignment, §7.7d).|
 |**What a model emits**|`BT_RT64_ACTORLOG=1`|per non-player draw: id, position, tagged bones, `G_MTX`/`G_VTX`/`G_DL` counts. Animation set + 0 matrices = CPU-animated.|
 |**Is RT64 keeping up**|`BT_RT64_FRAMESTATS=1`|once a second from RT64: logical and generated display frames/s, and how many transforms had their vertices interpolated.|
+|**Do the clocks agree / where did a stall go**|`BT_PACELOG=1`|one `[pace]` line per game frame: wall time `t=`, frame counter, map, divisor, step and elapsed bytes, `wvi=` (VIs the world advanced, sum of the step byte), `vi=` (the runtime's VI count), `au=` (audio frames the game generated; `/rate=` is the audio clock), `q=` device queue in us, `drop=` frames the queue skip-logic threw away, `empty=` buffers queued onto an empty device (underruns), `yld=`/`isy=` scheduling points spent in the §6.6 sweep / the §6.9 intro wait, `ic=` the intro's schedule clock. A transition is a jump in `t=` with `f=` +2; compare `au=` across it. Also `[pacing]` latch lines (§7.8).|
+|**Intro music-cue wait, A/B**|`BT_INTROSYNC_YIELD=off`|removes the §6.9 scheduling point: the music stops for every intro transition again.|
 |**Which bones blend plainly**|`BT_RT64_LERPGUARD=log`|one line per transform whose decomposed blend strayed off its vertices' paths (§7.7c): id, vertex count, deviation, travel. `=off` disables the check.|
+|**Player id table exhaustion**|`BT_RT64_SLOTCAP=n`|shrinks the player id table so running out (§7.7d) happens in seconds; `BT_RT64_SLOTRECLAIM=off` restores the old never-reuse table for A/B.|
+|**Which pairings jumped**|`BT_RT64_PAIRLOG=<units>`|one line per id-paired transform whose origin moved further than that in one frame: id, both transform indices, distance, both origins, transform counts. A wrong pairing shows as thousands of units where its neighbours move tens (§7.7f).|
+|**Transforms sharing an id**|`BT_RT64_IDNEAREST=log`|one line per id range that was re-paired by nearest origin instead of submission order (§7.7f): counts, pairs, dropped. `=off` restores order pairing.|
+|**Which particles were re-paired**|`BT_RT64_AUTOGATE=log`|one line per untagged pairing removed by the gate (§7.7g): call hash, both transform indices, predicted distance, the group's limit and size, both origins. `=off` disables the gate.|
+|**Sky seam blending, A/B and what it did**|`BT_SKY_SEAMS=off`, `=log`, `=log2`|`off` disables the §7.9 blending, overriding the graphics option. `log` prints one `[skyseam]` line per processed sky: display-list range, commands walked, models, border edges, pairs blended/rejected, coincident (`same-side`) pairs skipped, texels written, and `us=` the time it took. `log2` adds one line per pair with its `diff`/`grad` and verdict.|
+|**Does the blend open a seam**|`BT_RT64_SEAMLOG=<hex id>>8>[-<last>]`|per frame, for that model's transforms (root id without its bone byte, e.g. `20002D`): vertex pairs on different transforms that coincide at both keyframes, and the largest gap the drawn blend opens between them at the midpoint, against a plain blend. O(n²) in vertices, so it is a diagnostic only (§7.7e, King Jingaling).|
+|**Does a CPU-animated model blend**|`BT_RT64_VTXLOG=1`|one line per vertex-interpolated transform per frame from RT64: id, current and previous vertex count, whether it changed, and how many vertices `alignVertexLoads` paired when the counts differ (§7.7e; 0 = it stepped). Verbose — grep by id (ids from `BT_RT64_ACTORLOG`). `BT_RT64_VTXALIGN=off` disables the pairing, `=noborrow` leaves the swapped part still.|
+|**Is vertex smoothing on, and what does it cost**|`BT_RT64_VTXSMOOTH=off`, `BT_RT64_VTXSMOOTHLOG=1`|`=off` disables the CPU-animated vertex smoothing (§7.7h) for A/B, overriding the graphics option; `=<gain>,<vel>,<band>,<soft>,<pass>` retunes it (defaults `0.35,0.9,0.5,3,6`). `VTXSMOOTHLOG` prints `[vsmooth]` per vertex-interpolated transform per frame, on or off: `rough` = mean \|second difference\| of the drawn positions per component (the shimmer plus real acceleration), `off`/`max` = mean/max distance from the game's value (never above `band`). Group by `n=` (vertex count): Mingella is 934. Frames with unchanged vertices are logged too, so on and off sum over the same frames.|
+|**Per-vertex trajectories**|`BT_RT64_VTXDUMP=<path>:<n>[,<n>...]`|appends, for every vertex-interpolated transform with one of those vertex counts, a record `u32 id, u32 n, n×3 f32 game positions, n×3 f32 drawn positions` (binary, flushed per frame). For offline A/B of a filter on the identical input: dump with `BT_RT64_VTXSMOOTH=off` and replay.|
+|**Unattended runs that stay out of the way**|`BT_WINDOW_POS=x,y`|creates the window at that position (physical pixels) without activating it, e.g. on a second monitor. Launch with `--game bt` to skip the launcher menu (it ignores `BT_AUTOPAD` and posted clicks), and set `"background_input_mode": "Off"` in a portable `general.json` so a controller in use elsewhere does not drive the test.|
+|**Start somewhere specific (debug only)**|`BT_WARP`, `BT_POKE`, `BT_POS`|`src/test_harness.cpp`, run once per game frame from the `func_800A73F4` hook; unset = one null check. Syntax and verified recipes below.|
+|**Where am I, what is Banjo doing**|`BT_HARNESSLOG=1` (`=2`)|map id, Banjo's position and movement state once a second (`=2`: 4x a second plus every state change). Map changes are logged whenever any harness variable is set. States: `0x1` idle, `0x4` walk, `0x5` jump, `0x2D`/`0x2E` swimming/paddling, `0x73` locked in dialogue, `0x98` scripted walk, `0xA6`-`0xAA` Grip Grab.|
+
+### Starting a run anywhere: `BT_WARP` / `BT_POKE` / `BT_POS`
+
+A clean portable save plus `BT_AUTOPAD=26:start,32:a` reaches the new-game intro
+(map `0x0A1`) at ~34.5 s; a warp at 40 s lands in the target map by ~42 s. Times
+are seconds on the `BT_AUTOPAD` clock (first input poll). The game **autosaves**:
+after the first run the same autopad loads file 1 straight into the saved map at
+~34.5 s, and `@40` warps still work. Delete `build-cmake/saves` for a clean start.
+
+* `BT_WARP=map[:exit][@when][,...]` calls the game's own go-to-map request,
+  `func_800A791C(map, exit, 1)` (the call warp pads make), so the map loads
+  through the real transition. One request per frame, deferred while a load is
+  pending (`0x80127642` nonzero). Map ids are ScriptHawk's (`games/bt.lua`).
+* `BT_POKE=target op value[:bits][@when][,...]`: `target` is a hex address or
+  `*PTR+OFF` (the word at PTR, plus OFF); `op` is `=`, `|=` or `&=`; bits default
+  from the digit count (2/4/8). Each item logs `was / wrote / read back` on its
+  first write, and when the game had changed it back. Quote it in cmd
+  (`set "BT_POKE=..."`) because of `|`.
+* `BT_POS=x,y,z[@when][;...]` sets Banjo's position (all three copies the game
+  keeps). Retries until a player exists.
+* `when`: none = every frame (a constant GameShark code; for warps and positions,
+  none = once at 0 s); `@S` once at S s; `@mMAP` once on entering MAP;
+  `@mMAP+S` once, S s after entering it; a trailing `~` repeats every frame from
+  then on (for `@m`, while in that map).
+
+Addresses (USA 1.0), each observed in game: current map `0x80132DC2` (u16; boot
+`0x18B`, file select `0x158`); flag block = `*0x8012C770` (heap, moves between
+runs, hence `*`); moves are flag-block bytes `0x18`-`0x1F` (new game reads
+`E0 FF FF 01`: the Banjo-Kazooie moves) and **Grip Grab is byte `0x1B` bit 1**
+(ScriptHawk); player = `*(0x80135490 + 4 * byte 0x801354DF)`, position block at
+player `+0xE4`, movement block at `+0x120`. Byte order checked: the 32-bit word
+at flag `+0x18` read `0xE0FFFF01` and the byte at `+0x1B` read `0x01`.
+
+Verified recipes (clean save, halved screenshots taken; add `BT_WINDOW_POS`):
+
+|Target|Recipe|Observed|
+|---|---|---|
+|(a) Spiral Mountain, Banjo swimming|`BT_AUTOPAD=26:start,32:a BT_WARP=AF:1@40`|exit 1 is the waterfall cave: Banjo drops into the pool and treads water from ~49 s, state `0x2D`, y 630.|
+|(b) Jinjo Village|`BT_AUTOPAD=26:start,32:a,44-47:up BT_WARP=142:1@40`|"Isle O' Hags (Jinjo Village)" title by 48 s, walking out of the tunnel from Spiral Mountain.|
+|(b) Bottles' house|`BT_AUTOPAD=26:start,32:a BT_WARP=142:1@40,143:1@m142+8`|inside the front door, Bottles' family in view, by ~53 s.|
+|(c) King Jingaling, alive and talking|`BT_AUTOPAD=26:start,32:a,62:a,64:a,...,110:a BT_WARP=142:1@40,144:1@m142+12`|Banjo walks in (state `0x98`), "YO, WASSUP! I'M KING JINGALING" by ~62 s; the A presses (every 2 s) run the dialogue to the Jiggy hand-over (~118 s).|
+|(c) the zap cutscene|`BT_AUTOPAD=26:start,32:a BT_WARP=142:1@40,18E:0@m142+9`|"Meanwhile..." at Cauldron Keep, B.O.B. firing (map `0x18E`).|
+|(e) NPC dialogue that cuts the camera|`BT_AUTOPAD=26:start,32:a BT_WARP=B8:1@40 BT_POS=3246,1201,-3601@mB8+3`|Mayahem Temple: Jamjars' first-visit "HEY! GET YOUR SORRY HIDE..." fires the moment Banjo lands (state `0x73`); `BT_RT64_CAMLOG` logs a CUT at its start (5224 units, 116 deg) and another when it ends ~5.5 s later.|
+|(e) Jamjars, walked up to|`BT_AUTOPAD=26:start,32:a,48-52:up BT_WARP=B8:1@40 BT_POS=2946,1201,-3901@mB8+3`|Banjo walks ~420 units into the trigger (stick up runs +x+z there) and the first-visit dialogue starts at ~49 s, state `0x73`; the dialogue camera is a 140-frame flyover.|
+|(e) Mumbo, walked up to, then talked to again|`BT_AUTOPAD=26:start,32:a,49-51:up,52:b,53:b,54:b,56:a,...,71:a,74:b,75:b BT_WARP=B8:1@40,B7:0@mB8+4`|map `0x0B7` is Mumbo's Skull (exit 0 = its door). Walking up starts a scripted walk (`0x98`) and his intro (`0x74`, ~50 s); A every second ends it at ~72 s and the B presses at 74 s start a second talk.|
+|(e) Humba Wumba|`BT_AUTOPAD=26:start,32:a BT_WARP=B8:1@40,B6:1@mB8+4`|map `0x0B6` is Wumba's Wigwam; use exit **1** (exit 0 leaves Banjo stuck at the origin in `0x98`). Entering walks him in and her intro starts at ~50 s.|
+|Mingella / Grunty / the sisters (new-game intro)|`BT_AUTOPAD=26:start,32:a`|maps `0x0A1` (Klungo at the rock, 34-99 s) → `0x0A8` (card game) → `0x0A2` (the sisters' drill, ~152 s) → `0x0A9` → `0x0A3` (~214 s); Mingella (934 vertices) is on screen at ~250-275 s of launch time.|
+|(d) Grip Grab learned (still open 2026-11-08)|`BT_POKE=*8012C770+1B\|=02@mB8~` (all moves: `*8012C770+18=FFFFFFFF@mB8~,*8012C770+1C=FFFFFFFF@mB8~`)|**OPEN.** The bit is written and read back, but no ledge state (`0xA6`-`0xAA`) has been observed yet, so the grant is not proven in play and no ledge recipe exists. Leads: the Cheato-page ledge at the top of Mayahem Temple's pyramid (`BT_POS=-1200,4400,-900@mB8+3` stands Banjo on its top strip, y 4250); the pyramid tiers are 500 units apart, too tall to reach by jumping. Pin health while probing (`BT_POKE=8011B644=05`); falls out of the level respawn at the MT entrance.|
+
+**What triggers the alive-King scene:** entering the throne room (`0x144`) on a
+file that has not met him yet (observed: it plays on arrival from a fresh file).
+In normal play that is your first walk into his palace in Jinjo Village after the
+intro; the intro itself is other maps (observed `0x0A1` -> `0x0A8` in its first
+65 s). Read from the code, not traced: the throne-room actor
+`func_80800014_chkingjinjobits` is a state machine that tests flag `0x367` before
+the greeting dialogue, and a later state queues the zap cutscene with
+`_glcutDll_entrypoint_7(0x18E)`.
 
 **Distinguish spin from idle block by CPU first**: a spin holds ~1.0 core, an idle
 block ~0.0 — and measure it over a window against the frame counter, because a

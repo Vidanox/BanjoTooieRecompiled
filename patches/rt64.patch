@@ -49,16 +49,23 @@ index 20c0d4d..b054be1 100644
                  }
                  case RT64_HOOK_OP_DISABLE:
 diff --git a/src/hle/rt64_game_frame.cpp b/src/hle/rt64_game_frame.cpp
-index 87392d0..4fccd94 100644
+index 87392d0..44550ce 100644
 --- a/src/hle/rt64_game_frame.cpp
 +++ b/src/hle/rt64_game_frame.cpp
-@@ -9,6 +9,42 @@
+@@ -9,6 +9,52 @@
  
  #include "xxHash/xxh3.h"
  
++#include <algorithm>
 +#include <atomic>
++#include <cfloat>
++#include <cmath>
 +#include <cstdio>
 +#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <unordered_map>
++#include <vector>
 +
 +// TEMPORARY diagnostic (Banjo-Tooie port). Counts the transforms matched by
 +// explicit id in the player's id range, which is what tells "the game emitted
@@ -69,6 +76,9 @@ index 87392d0..4fccd94 100644
 +// Transforms whose vertices RT64 interpolated (vertex count equal, positions
 +// changed): the CPU-animated models. Read by BT_RT64_FRAMESTATS.
 +std::atomic<uint32_t> g_bt_rt64_vertex_interpolated{0};
++// The "Smooth Animated Faces" graphics option (GameFrame::smoothVertexRange). Written by the game side
++// when the option loads or changes; 1 = on, the default.
++std::atomic<uint32_t> g_bt_rt64_vertex_smooth{1};
 +// Counts projection pairs RT64 refused to interpolate because the two frames'
 +// projections at the same index carry different explicit ids. With the default
 +// `G_EX_ID_AUTO` those pairs were blended unconditionally, so a non-zero count
@@ -95,20 +105,395 @@ index 87392d0..4fccd94 100644
  namespace RT64 {
      // GameFrame
      
-@@ -310,6 +346,12 @@ namespace RT64 {
-                 }
-                 else {
-                     matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, curIt->second, prevIt->second, modifiedBuffers);
-+                    if (curIt->first >= 0x10000000U) {
-+                        g_bt_rt64_matched_transforms.fetch_add(1, std::memory_order_relaxed);
+@@ -172,11 +218,13 @@ namespace RT64 {
+         uint32_t curIndex = 0;
+         uint32_t prevIndex = 0;
+         float difference = FLT_MAX;
++        float positionDifference = FLT_MAX;
+ 
+-        MatchCandidate(uint32_t curIndex, uint32_t prevIndex, float difference) {
++        MatchCandidate(uint32_t curIndex, uint32_t prevIndex, float difference, float positionDifference = FLT_MAX) {
+             this->curIndex = curIndex;
+             this->prevIndex = prevIndex;
+             this->difference = difference;
++            this->positionDifference = positionDifference;
+         }
+     };
+ 
+@@ -252,6 +300,321 @@ namespace RT64 {
+         return matchResult;
+     }
+ 
++    // Banjo-Tooie port: untagged (G_EX_ID_AUTO) transforms are paired with the previous frame's greedily by
++    // smallest difference and with no limit on distance, so when a set of short-lived objects changes -- a
++    // ripple ring dies behind a swimming Banjo as a new one is born at him -- the leftover new object is
++    // paired with the leftover dying one and blended across the gap for a game frame. A greedy pass is
++    // simulated first; within each call hash, a pairing whose velocity-predicted origin difference exceeds
++    // 4 x the group's lower median + 100 units is marked unusable (difference = FLT_MAX), and the caller's
++    // greedy pass then runs without it, so the new object is drawn as submitted (as on the N64) and anything
++    // the bad pairing displaced can still find its real partner. A group of one fast mover is its own
++    // median and is never gated. Perspective scenes only: 2D/orthographic elements (the file select's
++    // sliding panels) legitimately move hundreds of units a frame next to static siblings of the same
++    // hash. BT_RT64_AUTOGATE=off disables it; =log prints each gated pairing.
++    static void autoPairGate(std::vector<MatchCandidate> &candidates, const std::unordered_map<uint32_t, uint64_t> &autoHash,
++        const Workload &curWorkload, const Workload &prevWorkload, size_t curCount, size_t prevCount, bool perspective)
++    {
++        static const char *mode = std::getenv("BT_RT64_AUTOGATE");
++        static const bool disabled = (mode != nullptr) && (std::strcmp(mode, "off") == 0);
++        static const bool logging = (mode != nullptr) && (std::strcmp(mode, "log") == 0);
++        if (disabled || !perspective || autoHash.empty()) {
++            return;
++        }
++
++        thread_local std::vector<bool> curTaken;
++        thread_local std::vector<bool> prevTaken;
++        thread_local std::vector<uint32_t> accepted;
++        thread_local std::unordered_map<uint64_t, std::vector<float>> groupDiffs;
++        thread_local std::unordered_map<uint64_t, float> groupLimit;
++        curTaken.assign(curCount, false);
++        prevTaken.assign(prevCount, false);
++        accepted.clear();
++        groupDiffs.clear();
++        groupLimit.clear();
++        for (uint32_t i = 0; i < candidates.size(); i++) {
++            const MatchCandidate &c = candidates[i];
++            if ((c.curIndex >= curCount) || (c.prevIndex >= prevCount) || curTaken[c.curIndex] || prevTaken[c.prevIndex]) {
++                continue;
++            }
++
++            curTaken[c.curIndex] = true;
++            prevTaken[c.prevIndex] = true;
++            auto it = autoHash.find(c.curIndex);
++            if (it != autoHash.end()) {
++                accepted.push_back(i);
++                groupDiffs[it->second].push_back(c.positionDifference);
++            }
++        }
++
++        bool anyGated = false;
++        for (auto &group : groupDiffs) {
++            std::vector<float> &diffs = group.second;
++            std::sort(diffs.begin(), diffs.end());
++            const float lowerMedian = diffs[(diffs.size() - 1) / 2];
++            const float limit = 4.0f * lowerMedian + 100.0f;
++            groupLimit[group.first] = limit;
++            anyGated = anyGated || (diffs.back() > limit);
++        }
++
++        if (!anyGated) {
++            return;
++        }
++
++        for (uint32_t i = 0; i < candidates.size(); i++) {
++            MatchCandidate &c = candidates[i];
++            auto it = autoHash.find(c.curIndex);
++            if (it == autoHash.end()) {
++                continue;
++            }
++
++            auto limitIt = groupLimit.find(it->second);
++            if ((limitIt == groupLimit.end()) || (c.positionDifference <= limitIt->second)) {
++                continue;
++            }
++
++            if (logging && std::binary_search(accepted.begin(), accepted.end(), i)) {
++                const hlslpp::float4x4 &cm = curWorkload.drawData.worldTransforms[c.curIndex];
++                const hlslpp::float4x4 &pm = prevWorkload.drawData.worldTransforms[c.prevIndex];
++                std::fprintf(stderr, "[autogate] hash=%016llX cur=%u prev=%u d=%.1f limit=%.1f group=%zu curT=(%.0f %.0f %.0f) prevT=(%.0f %.0f %.0f)\n",
++                    (unsigned long long)it->second, c.curIndex, c.prevIndex, c.positionDifference, limitIt->second, groupDiffs[it->second].size(),
++                    float(cm[3][0]), float(cm[3][1]), float(cm[3][2]), float(pm[3][0]), float(pm[3][1]), float(pm[3][2]));
++            }
++
++            c.difference = FLT_MAX;
++        }
++    }
++
++    // Banjo-Tooie port: several transforms can share one explicit id with linear ordering -- a model whose
++    // inner matrices carry no ids of their own, like the lamp light cards in Bottles' house (one model, one
++    // matrix per visible card). RT64 paired them by their position in submission order, so when the camera
++    // turned and a card was culled (or a new one came into view), every later card was blended against its
++    // neighbour's matrix and flew across the room for a frame: measured, origins 3000-9000 units apart on
++    // each frame the visible count changed, against ~100 for a correct pair.
++    // Submission order is kept whenever it is plausible, so a stable set (rigid parts, blades sharing an
++    // origin) pairs exactly as before. Otherwise each transform takes the nearest previous one (origin first,
++    // basis to separate coincident origins), and a pairing far longer than the rest is dropped, so a card
++    // that only just came into view is drawn as submitted instead of flying in from another lamp.
++    // BT_RT64_IDNEAREST=off restores pure order pairing; =log prints every id range that was re-paired.
++    template<typename TransformVector>
++    static void pairSharedIdRange(const TransformVector &curTransforms, const TransformVector &prevTransforms,
++        const std::vector<uint32_t> &cur, const std::vector<uint32_t> &prev, uint32_t matrixId, std::vector<std::pair<uint32_t, uint32_t>> &pairs)
++    {
++        static const char *mode = std::getenv("BT_RT64_IDNEAREST");
++        static const bool off = (mode != nullptr) && (std::strcmp(mode, "off") == 0);
++        static const bool log = (mode != nullptr) && (std::strcmp(mode, "log") == 0);
++        const size_t curCount = cur.size();
++        const size_t prevCount = prev.size();
++        const size_t orderCount = std::min(curCount, prevCount);
++        auto originDistance = [&](uint32_t c, uint32_t p) {
++            const hlslpp::float4x4 &a = curTransforms[c];
++            const hlslpp::float4x4 &b = prevTransforms[p];
++            const float dx = a[3][0] - b[3][0], dy = a[3][1] - b[3][1], dz = a[3][2] - b[3][2];
++            return std::sqrt(dx * dx + dy * dy + dz * dz);
++        };
++
++        bool orderPlausible = (curCount == prevCount);
++        if (!off && orderPlausible && (curCount > 1)) {
++            for (size_t i = 0; (i < curCount) && orderPlausible; i++) {
++                float nearest = FLT_MAX;
++                for (size_t j = 0; j < prevCount; j++) {
++                    nearest = std::min(nearest, originDistance(cur[i], prev[j]));
++                }
++
++                orderPlausible = (originDistance(cur[i], prev[i]) <= (4.0f * nearest + 50.0f));
++            }
++
++            // A set moving as one -- every order pair displaced alike -- keeps its order however fast it
++            // moves, even when a part lands where its neighbour was a frame ago.
++            if (!orderPlausible) {
++                float mean[3] = {};
++                for (size_t i = 0; i < curCount; i++) {
++                    for (int k = 0; k < 3; k++) {
++                        mean[k] += (curTransforms[cur[i]][3][k] - prevTransforms[prev[i]][3][k]) / float(curCount);
 +                    }
-+                    else if ((curIt->first >= 0x00F20000U) && (curIt->first < 0x00F30000U)) {
-+                        g_bt_rt64_matched_sky.fetch_add(1, std::memory_order_relaxed);
++                }
++
++                const float meanLength = std::sqrt(mean[0] * mean[0] + mean[1] * mean[1] + mean[2] * mean[2]);
++                bool rigid = true;
++                for (size_t i = 0; (i < curCount) && rigid; i++) {
++                    float deviation = 0.0f;
++                    for (int k = 0; k < 3; k++) {
++                        const float d = (curTransforms[cur[i]][3][k] - prevTransforms[prev[i]][3][k]) - mean[k];
++                        deviation += d * d;
 +                    }
-                     curIt++;
++
++                    rigid = (std::sqrt(deviation) <= (0.25f * meanLength + 20.0f));
++                }
++
++                orderPlausible = rigid;
++            }
++        }
++
++        if (off || orderPlausible || (curCount * prevCount > 4096)) {
++            for (size_t i = 0; i < orderCount; i++) {
++                pairs.emplace_back(cur[i], prev[i]);
++            }
++
++            return;
++        }
++
++        struct Candidate {
++            float cost;
++            float distance;
++            uint32_t i;
++            uint32_t j;
++            bool operator<(const Candidate &o) const { return cost < o.cost; }
++        };
++
++        thread_local std::vector<Candidate> candidates;
++        thread_local std::vector<uint8_t> curUsed, prevUsed;
++        thread_local std::vector<Candidate> chosen;
++        candidates.clear();
++        chosen.clear();
++        curUsed.assign(curCount, 0);
++        prevUsed.assign(prevCount, 0);
++        for (uint32_t i = 0; i < curCount; i++) {
++            const hlslpp::float4x4 &a = curTransforms[cur[i]];
++            for (uint32_t j = 0; j < prevCount; j++) {
++                const hlslpp::float4x4 &b = prevTransforms[prev[j]];
++                float basisDiff = 0.0f, basisNorm = 1e-6f;
++                for (int r = 0; r < 3; r++) {
++                    for (int k = 0; k < 3; k++) {
++                        const float d = a[r][k] - b[r][k];
++                        basisDiff += d * d;
++                        basisNorm += a[r][k] * a[r][k] + b[r][k] * b[r][k];
++                    }
++                }
++
++                const float distance = originDistance(cur[i], prev[j]);
++                candidates.push_back({ distance + 10.0f * std::sqrt(basisDiff / basisNorm), distance, i, j });
++            }
++        }
++
++        std::sort(candidates.begin(), candidates.end());
++        for (const Candidate &c : candidates) {
++            if (!curUsed[c.i] && !prevUsed[c.j]) {
++                curUsed[c.i] = 1;
++                prevUsed[c.j] = 1;
++                chosen.push_back(c);
++            }
++        }
++
++        float median = 0.0f;
++        if (chosen.size() > 1) {
++            thread_local std::vector<float> distances;
++            distances.clear();
++            for (const Candidate &c : chosen) {
++                distances.push_back(c.distance);
++            }
++
++            std::nth_element(distances.begin(), distances.begin() + distances.size() / 2, distances.end());
++            median = distances[distances.size() / 2];
++        }
++
++        uint32_t dropped = 0;
++        for (const Candidate &c : chosen) {
++            if ((chosen.size() > 1) && (c.distance > (4.0f * median + 50.0f))) {
++                dropped++;
++                continue;
++            }
++
++            pairs.emplace_back(cur[c.i], prev[c.j]);
++        }
++
++        if (log) {
++            std::fprintf(stderr, "[idnearest] id=%08X cur=%zu prev=%zu paired=%zu dropped=%u median=%.1f\n",
++                matrixId, curCount, prevCount, chosen.size() - dropped, dropped, median);
++        }
++    }
++
++    // BT_RT64_SEAMLOG=<id >> 8, hex>[-<last>] (a model's root id without its bone byte). Finds vertex pairs on
++    // different transforms of that model that coincide at both keyframes (a seam) and prints, per frame, how far
++    // apart the blend RT64 will draw puts them at the midpoint, against a plain component-wise blend.
++    static void logSeamGaps(const Workload &curWorkload, const Workload &prevWorkload, const GameFrameMap::WorkloadMap &curMap) {
++        static const char *seamLog = std::getenv("BT_RT64_SEAMLOG");
++        if (seamLog == nullptr) {
++            return;
++        }
++
++        static char *seamEnd = nullptr;
++        static const uint32_t prefix = uint32_t(std::strtoul(seamLog, &seamEnd, 16));
++        static const uint32_t prefixLast = (seamEnd != nullptr && *seamEnd == '-') ? uint32_t(std::strtoul(seamEnd + 1, nullptr, 16)) : prefix;
++        struct SeamVertex { hlslpp::float3 w0, w1, mid, plain; uint32_t t; uint32_t id; };
++        thread_local std::vector<SeamVertex> verts;
++        verts.clear();
++        uint32_t movedTransforms = 0;
++        const DrawData &cd = curWorkload.drawData;
++        const DrawData &pd = prevWorkload.drawData;
++        for (uint32_t t = 0; t < uint32_t(curMap.transforms.size()); t++) {
++            const GameFrameMap::TransformMap &tm = curMap.transforms[t];
++            const uint32_t id = cd.transformGroups[cd.worldTransformGroups[t]].matrixId;
++            if (!tm.mapped || ((id >> 8) < prefix) || ((id >> 8) > prefixLast)) {
++                continue;
++            }
++
++            const uint32_t p = tm.prevTransformIndex;
++            const uint32_t count = cd.worldTransformVertexCount(t);
++            if (count != pd.worldTransformVertexCount(p)) {
++                continue;
++            }
++
++            const hlslpp::float4x4 &curM = cd.worldTransforms[t];
++            const hlslpp::float4x4 &prevM = pd.worldTransforms[p];
++            const hlslpp::float4x4 mid = tm.rigidBody.lerp(0.5f, prevM, curM, true);
++            const float *cp = &cd.posFloats[cd.worldTransformVertexIndices[t] * 3];
++            const float *pp = &pd.posFloats[pd.worldTransformVertexIndices[p] * 3];
++            const bool vtxInterp = cd.transformGroups[cd.worldTransformGroups[t]].vertexInterpolation != G_EX_COMPONENT_SKIP;
++            bool moved = false;
++            for (uint32_t i = 0; i < count * 3; i++) {
++                moved = moved || (cp[i] != pp[i]);
++            }
++
++            movedTransforms += moved ? 1 : 0;
++            for (uint32_t i = 0; i < count; i++) {
++                const hlslpp::float4 vc(cp[i * 3], cp[i * 3 + 1], cp[i * 3 + 2], 1.0f);
++                const hlslpp::float4 vp(pp[i * 3], pp[i * 3 + 1], pp[i * 3 + 2], 1.0f);
++                SeamVertex s;
++                s.w0 = hlslpp::mul(vp, prevM).xyz;
++                s.w1 = hlslpp::mul(vc, curM).xyz;
++                s.mid = hlslpp::mul((vtxInterp && moved) ? ((vc + vp) * 0.5f) : vc, mid).xyz;
++                s.plain = (s.w0 + s.w1) * 0.5f;
++                s.t = t;
++                s.id = id;
++                verts.push_back(s);
++            }
++        }
++
++        uint32_t pairs = 0;
++        float maxGap = 0.0f, maxPlain = 0.0f;
++        uint32_t worstA = 0, worstB = 0;
++        for (size_t i = 0; i < verts.size(); i++) {
++            for (size_t j = i + 1; j < verts.size(); j++) {
++                if (verts[i].t == verts[j].t) {
++                    continue;
++                }
++
++                if ((float(hlslpp::length(verts[i].w0 - verts[j].w0)) > 0.5f) || (float(hlslpp::length(verts[i].w1 - verts[j].w1)) > 0.5f)) {
++                    continue;
++                }
++
++                pairs++;
++                const float gap = hlslpp::length(verts[i].mid - verts[j].mid);
++                const float plainGap = hlslpp::length(verts[i].plain - verts[j].plain);
++                if (gap > maxGap) {
++                    maxGap = gap;
++                    worstA = verts[i].id;
++                    worstB = verts[j].id;
++                }
++
++                maxPlain = std::max(maxPlain, plainGap);
++            }
++        }
++
++        if (!verts.empty()) {
++            std::fprintf(stderr, "[seam] verts=%zu moved=%u pairs=%u maxgap=%.2f plaingap=%.2f worst=%08X/%08X\n", verts.size(), movedTransforms, pairs, maxGap, maxPlain, worstA, worstB);
++        }
++    }
++
+     void GameFrame::match(RenderWorker *worker, WorkloadQueue &workloadQueue, const GameFrame &prevFrame, BufferUploader *velocityUploader, bool &velocityUploaderUsed, bool &tileInterpolationUsed, bool &lookAtInterpolationUsed) {
+         tileInterpolationUsed = false;
+         lookAtInterpolationUsed = false;
+@@ -309,12 +672,36 @@ namespace RT64 {
                      prevIt++;
                  }
-@@ -460,6 +502,14 @@ namespace RT64 {
+                 else {
+-                    matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, curIt->second, prevIt->second, modifiedBuffers);
+-                    curIt++;
+-                    prevIt++;
++                    // Every transform sharing this id, in submission order (see pairSharedIdRange).
++                    const uint32_t matrixId = curIt->first;
++                    thread_local std::vector<uint32_t> rangeCur, rangePrev;
++                    thread_local std::vector<std::pair<uint32_t, uint32_t>> rangePairs;
++                    rangeCur.clear();
++                    rangePrev.clear();
++                    rangePairs.clear();
++                    for (; (curIt != curWorkload.transformIdMap.end()) && (curIt->first == matrixId); curIt++) {
++                        rangeCur.push_back(curIt->second);
++                    }
++
++                    for (; (prevIt != prevWorkload.transformIdMap.end()) && (prevIt->first == matrixId); prevIt++) {
++                        rangePrev.push_back(prevIt->second);
++                    }
++
++                    pairSharedIdRange(curWorkload.drawData.worldTransforms, prevWorkload.drawData.worldTransforms, rangeCur, rangePrev, matrixId, rangePairs);
++                    for (const std::pair<uint32_t, uint32_t> &pair : rangePairs) {
++                        matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, pair.first, pair.second, modifiedBuffers);
++                        if (matrixId >= 0x10000000U) {
++                            g_bt_rt64_matched_transforms.fetch_add(1, std::memory_order_relaxed);
++                        }
++                        else if ((matrixId >= 0x00F20000U) && (matrixId < 0x00F30000U)) {
++                            g_bt_rt64_matched_sky.fetch_add(1, std::memory_order_relaxed);
++                        }
++                    }
+                 }
+             }
+ 
++            logSeamGaps(curWorkload, prevWorkload, curWorkloadMap);
++
+             if (!modifiedBuffers.empty()) {
+                 workloadsModified[workloads[w]].merge(modifiedBuffers);
+             }
+@@ -385,6 +772,10 @@ namespace RT64 {
+                     uploads.emplace_back(BufferUploader::Upload{ workload.drawData.velFloats.data(), { 0, workload.drawData.velFloats.size() }, sizeof(float), RenderBufferFlag::FORMATTED, { RenderFormat::R32_FLOAT }, &workload.drawBuffers.velocityBuffer });
+                 }
+ 
++                if (it.second.positionsModified()) {
++                    uploads.emplace_back(BufferUploader::Upload{ workload.drawData.posFloats.data(), { it.second.positionsBegin, it.second.positionsEnd }, sizeof(float), RenderBufferFlag::FORMATTED, { RenderFormat::R32_FLOAT }, &workload.drawBuffers.positionBuffer });
++                }
++
+                 if (it.second.texcoordVelocity) {
+                     uploads.emplace_back(BufferUploader::Upload{ workload.drawData.tcVelFloats.data(), { 0, workload.drawData.tcVelFloats.size() }, sizeof(float), RenderBufferFlag::FORMATTED, { RenderFormat::R32_FLOAT }, &workload.drawBuffers.texcoordVelocityBuffer });
+                 }
+@@ -460,6 +851,14 @@ namespace RT64 {
                  const TransformGroup &curProjGroup = curWorkload.drawData.transformGroups[curProjGroupIndex];
                  const TransformGroup &prevProjGroup = prevWorkload.drawData.transformGroups[prevProjGroupIndex];
  
@@ -123,7 +508,7 @@ index 87392d0..4fccd94 100644
                  // Cameras usually look better with simple interpolation, so default decomposition to off.
                  bool projectionDecompose = false;
                  uint8_t projectionLinearComponent = G_EX_COMPONENT_INTERPOLATE;
-@@ -475,6 +525,9 @@ namespace RT64 {
+@@ -475,6 +874,9 @@ namespace RT64 {
                      projectionSkewComponent = curProjGroup.skewInterpolation;
                      projectionPerspectiveComponent = curProjGroup.perspectiveInterpolation;
                      viewProjMap.mapped = (curProjGroup.matrixId == prevProjGroup.matrixId);
@@ -133,7 +518,50 @@ index 87392d0..4fccd94 100644
                  }
                  else {
                      viewProjMap.mapped = (curProjGroup.matrixId == G_EX_ID_AUTO);
-@@ -709,6 +762,62 @@ namespace RT64 {
+@@ -517,6 +919,11 @@ namespace RT64 {
+         tileCheckSet.clear();
+         lookAtCheckSet.clear();
+ 
++        // Banjo-Tooie port: the draw-call hash each AUTO (untagged) transform was matched under, so the
++        // pairing gate can judge a pairing against the others of its kind (see autoPairGate).
++        thread_local std::unordered_map<uint32_t, uint64_t> autoTransformHash;
++        autoTransformHash.clear();
++
+         // Traverse the map and fill the set with all the combinations of transforms to check.
+         for (std::pair<uint64_t, GameCallMap> curIt : curCallHashMap) {
+             auto prevRange = prevCallHashMap.equal_range(curIt.first);
+@@ -543,6 +950,9 @@ namespace RT64 {
+                         const TransformGroup &prevGroup = prevWorkload.drawData.transformGroups[prevGroupIndex];
+                         if ((curGroup.matrixId == prevGroup.matrixId) && ((curGroup.matrixId == G_EX_ID_AUTO) || ((curGroup.matrixId != G_EX_ID_IGNORE) && (curGroup.ordering == G_EX_ORDER_AUTO)))) {
+                             transformCheckSet.emplace(curWorldMatrix, prevWorldMatrix);
++                            if (curGroup.matrixId == G_EX_ID_AUTO) {
++                                autoTransformHash.emplace(curWorldMatrix, curIt.first);
++                            }
+                         }
+                     }
+                 }
+@@ -588,13 +998,19 @@ namespace RT64 {
+ 
+             TransformMatchResult matchResult = computeTransformMatch(curTransform, firstCurViewProj, prevTransform, firstPrevViewProj, prevRigidBody);
+             if (matchResult.valid) {
+-                matchCandidates.emplace_back(indices.first, indices.second, matchResult.computeDifference());
++                matchCandidates.emplace_back(indices.first, indices.second, matchResult.computeDifference(), matchResult.positionDifference);
+             }
+         }
+ 
+         ModifiedBuffers modifiedBuffers;
+         std::stable_sort(matchCandidates.begin(), matchCandidates.end());
++        autoPairGate(matchCandidates, autoTransformHash, firstCurWorkload, firstPrevWorkload, firstCurWorkloadMap.transforms.size(), firstCurWorkloadMap.prevTransformsMapped.size(),
++            firstCurProj.type == Projection::Type::Perspective);
+         for (const MatchCandidate candidate : matchCandidates) {
++            if (candidate.difference == FLT_MAX) {
++                continue;
++            }
++
+             if (firstCurWorkloadMap.transforms[candidate.curIndex].mapped) {
+                 continue;
+             }
+@@ -709,6 +1125,386 @@ namespace RT64 {
          }
      }
  
@@ -193,30 +621,511 @@ index 87392d0..4fccd94 100644
 +        }
 +    }
 +
++    // BT: temporal smoothing of CPU-animated vertex positions ("Smooth Animated Faces", on by default).
++    // A CPU-animated model (Mingella, Grunty, the dinosaur) is skinned by the game itself, which writes
++    // every vertex back as an s16: each one snaps to a whole model unit on its own, so a close-up face
++    // shimmers by +-0.5 unit (the PS1 look). Interpolation only blends between those snapped positions.
++    // Per axis, each vertex is predicted from its own previous drawn position and drawn velocity (both
++    // already in the previous workload; the prediction may catch up with the game's value but never pass
++    // it), pulled toward the game's value by `gain`, and CLAMPED to within `band` of it -- so the drawn
++    // vertex never strays further from the game's than the rounding did, which is what keeps expressions
++    // from lagging and anything from drifting. A step larger than `pass` is motion, not rounding, and is
++    // drawn exactly as the game wrote it; between `soft` and `pass` the smoothing fades out so that
++    // hand-over is continuous. Off at Original refresh (no matching runs). See AGENTS.md 7.7h.
++    // BT_RT64_VTXSMOOTH=off disables it, =<gain>,<vel>,<band>,<soft>,<pass> tunes it.
++    // BT_RT64_VTXSMOOTHLOG=1 prints per-transform stats, on or off.
++    // BT_RT64_VTXDUMP=<path>:<count>[,<count>...] appends raw and drawn positions of transforms with those vertex counts.
++    struct VertexSmoothParams {
++        bool enabled = true;
++        bool log = false;
++        float gain = 0.35f;
++        float vel = 0.9f;
++        float band = 0.5f;
++        float soft = 3.0f;
++        float pass = 6.0f;
++    };
++
++    static const VertexSmoothParams &vertexSmoothParams() {
++        static const VertexSmoothParams params = []() {
++            VertexSmoothParams p;
++            const char *v = std::getenv("BT_RT64_VTXSMOOTH");
++            if (v != nullptr) {
++                if (v[0] == 'o') {
++                    p.enabled = false;
++                }
++                else {
++                    std::sscanf(v, "%f,%f,%f,%f,%f", &p.gain, &p.vel, &p.band, &p.soft, &p.pass);
++                }
++            }
++
++            p.log = (std::getenv("BT_RT64_VTXSMOOTHLOG") != nullptr);
++            return p;
++        }();
++        return params;
++    }
++
++    // Both the user's switch (the graphics option, written by the game side) and the A/B variable.
++    static bool vertexSmoothingActive() {
++        return vertexSmoothParams().enabled && (g_bt_rt64_vertex_smooth.load(std::memory_order_relaxed) != 0);
++    }
++
++    struct VertexSmoothStats {
++        uint32_t components = 0;
++        uint32_t changed = 0;
++        float offsetSum = 0.0f;
++        float offsetMax = 0.0f;
++        float rough = 0.0f;
++    };
++
++    // Smooths `count` vertices: curPos holds the game's (raw) positions on entry and the drawn ones on exit,
++    // curVel receives drawn - previous drawn. prevPos/prevVel are the previous frame's drawn data. Returns
++    // the number of components drawn somewhere other than the game's value (0 = nothing to re-upload).
++    static uint32_t smoothVertexRange(float *curPos, float *curVel, const float *prevPos, const float *prevVel, uint32_t count, VertexSmoothStats *stats) {
++        const VertexSmoothParams &p = vertexSmoothParams();
++        const float fadeSpan = std::max(p.pass - p.soft, 1e-3f);
++        uint32_t changed = 0;
++        for (uint32_t i = 0; i < count * 3; i++) {
++            const float q = curPos[i];
++            const float fp = prevPos[i];
++            const float vp = prevVel[i];
++            const float d = std::fabs(q - fp);
++            float f = q;
++            if (d < p.pass) {
++                // Predict along the drawn velocity only while the game's value still lies ahead in that
++                // direction, and never PAST it: a vertex whose motion stops then settles onto the game's value
++                // from behind instead of overshooting and ringing. A previous step of `pass` or more (a
++                // pass-through, i.e. a jump) predicts nothing, or the frame after it would be thrown half a
++                // unit off.
++                float pred = fp;
++                if ((std::fabs(vp) < p.pass) && ((q - fp) * vp > 0.0f)) {
++                    pred = fp + p.vel * vp;
++                    pred = (vp > 0.0f) ? std::min(pred, q) : std::max(pred, q);
++                }
++
++                float s = pred + p.gain * (q - pred);
++                s = std::min(std::max(s, q - p.band), q + p.band);
++                const float w = std::min(1.0f, (p.pass - d) / fadeSpan);
++                f = q + w * (s - q);
++                if (std::fabs(f - q) < 1e-3f) {
++                    f = q;
++                }
++            }
++
++            if (stats != nullptr) {
++                const float off = std::fabs(f - q);
++                stats->offsetSum += off;
++                stats->offsetMax = std::max(stats->offsetMax, off);
++                stats->rough += std::fabs((f - fp) - vp);
++            }
++
++            curPos[i] = f;
++            curVel[i] = f - fp;
++            changed += (f != q) ? 1 : 0;
++        }
++
++        if (stats != nullptr) {
++            stats->components += count * 3;
++            stats->changed += changed;
++        }
++
++        return changed;
++    }
++
++    static void dumpVertices(uint32_t matrixId, const float *raw, const float *drawn, uint32_t count) {
++        static const char *spec = std::getenv("BT_RT64_VTXDUMP");
++        if (spec == nullptr) {
++            return;
++        }
++
++        static FILE *file = nullptr;
++        static std::vector<uint32_t> wantCounts;
++        static bool opened = false;
++        if (!opened) {
++            opened = true;
++            const char *colon = std::strrchr(spec, ':');
++            if ((colon != nullptr) && (colon != spec)) {
++                for (const char *c = colon + 1; *c != '\0'; ) {
++                    wantCounts.push_back(uint32_t(std::strtoul(c, const_cast<char **>(&c), 10)));
++                    while ((*c == ',') || (*c == ' ')) {
++                        c++;
++                    }
++
++                    if ((*c < '0') || (*c > '9')) {
++                        break;
++                    }
++                }
++                const std::string path(spec, size_t(colon - spec));
++                file = std::fopen(path.c_str(), "wb");
++            }
++        }
++
++        if ((file == nullptr) || (std::find(wantCounts.begin(), wantCounts.end(), count) == wantCounts.end())) {
++            return;
++        }
++
++        std::fwrite(&matrixId, sizeof(uint32_t), 1, file);
++        std::fwrite(&count, sizeof(uint32_t), 1, file);
++        std::fwrite(raw, sizeof(float), size_t(count) * 3, file);
++        std::fwrite(drawn, sizeof(float), size_t(count) * 3, file);
++        std::fflush(file);
++    }
++
++    // BT: vertex interpolation for a transform whose vertex count changed. A CPU-animated model draws
++    // all of its geometry under one transform, so swapping ONE part's geometry (an eyelid stage in a
++    // blink, a mouth shape) changes the total and RT64 drops vertex interpolation for the whole body:
++    // Grunty stepped at the cutscene's 20 Hz for every blink. Pair the transform's vertex loads instead,
++    // from the front and from the back while their lengths agree; the loads in between (the swapped part)
++    // borrow the velocity of the nearest paired vertex. A transform with less than half its vertices paired
++    // is left alone.
++    // Returns the number of paired vertices. BT_RT64_VTXALIGN=off disables it; =noborrow leaves the swapped
++    // part still instead (its seams then open by up to a frame's motion).
++    static uint32_t alignVertexLoads(Workload &curWorkload, const Workload &prevWorkload, uint32_t curStart, uint32_t curCount,
++        uint32_t prevStart, uint32_t prevCount, ModifiedBuffers &modifiedBuffers)
++    {
++        static const char *mode = std::getenv("BT_RT64_VTXALIGN");
++        static const bool off = (mode != nullptr) && (mode[0] == 'o');
++        static const bool noBorrow = (mode != nullptr) && (mode[0] == 'n');
++        if (off || (curCount == 0) || (prevCount == 0)) {
++            return 0;
++        }
++
++        struct Load {
++            uint32_t start;
++            uint32_t count;
++        };
++
++        thread_local std::vector<Load> curLoads;
++        thread_local std::vector<Load> prevLoads;
++        auto collectLoads = [](const DrawData &drawData, uint32_t start, uint32_t count, std::vector<Load> &loads) {
++            loads.clear();
++            const std::vector<uint32_t> &starts = drawData.vertexLoadStarts;
++            const uint32_t end = start + count;
++            auto it = std::lower_bound(starts.begin(), starts.end(), start);
++            if ((it == starts.end()) || (*it != start)) {
++                return false;
++            }
++
++            while ((it != starts.end()) && (*it < end)) {
++                const uint32_t loadStart = *it;
++                it++;
++                const uint32_t loadEnd = ((it != starts.end()) && (*it < end)) ? *it : end;
++                loads.push_back({ loadStart, loadEnd - loadStart });
++            }
++
++            return true;
++        };
++
++        if (!collectLoads(curWorkload.drawData, curStart, curCount, curLoads) || !collectLoads(prevWorkload.drawData, prevStart, prevCount, prevLoads)) {
++            return 0;
++        }
++
++        size_t front = 0;
++        while ((front < curLoads.size()) && (front < prevLoads.size()) && (curLoads[front].count == prevLoads[front].count)) {
++            front++;
++        }
++
++        size_t back = 0;
++        while ((back < (curLoads.size() - front)) && (back < (prevLoads.size() - front)) &&
++            (curLoads[curLoads.size() - 1 - back].count == prevLoads[prevLoads.size() - 1 - back].count))
++        {
++            back++;
++        }
++
++        uint32_t paired = 0;
++        for (size_t i = 0; i < front; i++) {
++            paired += curLoads[i].count;
++        }
++
++        for (size_t i = 0; i < back; i++) {
++            paired += curLoads[curLoads.size() - 1 - i].count;
++        }
++
++        if ((paired * 2 < curCount) || (paired * 2 < prevCount)) {
++            return 0;
++        }
++
++        std::vector<float> &curPos = curWorkload.drawData.posFloats;
++        const std::vector<float> &prevPos = prevWorkload.drawData.posFloats;
++        std::vector<float> &curVel = curWorkload.drawData.velFloats;
++        // (v, nearest paired vertex) for the swapped part, so smoothing can carry the same offset over.
++        thread_local std::vector<std::pair<uint32_t, uint32_t>> borrowed;
++        borrowed.clear();
++        auto pairLoad = [&](const Load &curLoad, const Load &prevLoad) {
++            for (uint32_t i = 0; i < curLoad.count; i++) {
++                for (uint32_t j = 0; j < 3; j++) {
++                    curVel[(curLoad.start + i) * 3 + j] = curPos[(curLoad.start + i) * 3 + j] - prevPos[(prevLoad.start + i) * 3 + j];
++                }
++            }
++        };
++
++        for (size_t i = 0; i < front; i++) {
++            pairLoad(curLoads[i], prevLoads[i]);
++        }
++
++        for (size_t i = 0; i < back; i++) {
++            pairLoad(curLoads[curLoads.size() - 1 - i], prevLoads[prevLoads.size() - 1 - i]);
++        }
++
++        // The swapped part has no previous shape to blend from, but it must still travel with the skin
++        // around it: left still, its rim separates from the paired neighbours it shares a seam with by up
++        // to a frame's motion. Each of its vertices takes the velocity of the nearest paired vertex, so
++        // seam duplicates (same position) move exactly together and only the part's SHAPE snaps.
++        const uint32_t curEnd = noBorrow ? uint32_t(front) : ((curLoads.size() > back) ? uint32_t(curLoads.size() - back) : uint32_t(front));
++        for (size_t l = front; l < curEnd; l++) {
++            for (uint32_t i = 0; i < curLoads[l].count; i++) {
++                const uint32_t v = curLoads[l].start + i;
++                float bestDistance = FLT_MAX;
++                uint32_t best = UINT32_MAX;
++                auto searchLoad = [&](const Load &load) {
++                    for (uint32_t k = 0; k < load.count; k++) {
++                        const uint32_t u = load.start + k;
++                        const float dx = curPos[u * 3 + 0] - curPos[v * 3 + 0];
++                        const float dy = curPos[u * 3 + 1] - curPos[v * 3 + 1];
++                        const float dz = curPos[u * 3 + 2] - curPos[v * 3 + 2];
++                        const float d = dx * dx + dy * dy + dz * dz;
++                        if (d < bestDistance) {
++                            bestDistance = d;
++                            best = u;
++                        }
++                    }
++                };
++
++                for (size_t p = 0; p < front; p++) {
++                    searchLoad(curLoads[p]);
++                }
++
++                for (size_t p = 0; p < back; p++) {
++                    searchLoad(curLoads[curLoads.size() - 1 - p]);
++                }
++
++                if (best != UINT32_MAX) {
++                    for (uint32_t j = 0; j < 3; j++) {
++                        curVel[v * 3 + j] = curVel[best * 3 + j];
++                    }
++
++                    borrowed.emplace_back(v, best);
++                }
++            }
++        }
++
++        // Smoothing (smoothVertexRange) on the paired loads, against their own previous vertices. A vertex of
++        // the swapped part has no previous self, so it takes its nearest paired vertex's offset from the
++        // game's value as well as its velocity: a seam duplicate (same position) stays exactly on its partner.
++        if (vertexSmoothingActive()) {
++            thread_local std::vector<float> rawPos;
++            rawPos.assign(curPos.begin() + curStart * 3, curPos.begin() + (curStart + curCount) * 3);
++            uint32_t changed = 0;
++            auto smoothLoad = [&](const Load &curLoad, const Load &prevLoad) {
++                changed += smoothVertexRange(&curPos[curLoad.start * 3], &curVel[curLoad.start * 3], &prevPos[prevLoad.start * 3],
++                    &prevWorkload.drawData.velFloats[prevLoad.start * 3], curLoad.count, nullptr);
++            };
++
++            for (size_t i = 0; i < front; i++) {
++                smoothLoad(curLoads[i], prevLoads[i]);
++            }
++
++            for (size_t i = 0; i < back; i++) {
++                smoothLoad(curLoads[curLoads.size() - 1 - i], prevLoads[prevLoads.size() - 1 - i]);
++            }
++
++            for (const std::pair<uint32_t, uint32_t> &b : borrowed) {
++                for (uint32_t j = 0; j < 3; j++) {
++                    const float offset = curPos[b.second * 3 + j] - rawPos[(b.second - curStart) * 3 + j];
++                    curPos[b.first * 3 + j] += offset;
++                    curVel[b.first * 3 + j] = curVel[b.second * 3 + j];
++                    changed += (offset != 0.0f) ? 1 : 0;
++                }
++            }
++
++            if (changed > 0) {
++                modifiedBuffers.notePositions(curStart * 3, (curStart + curCount) * 3);
++            }
++        }
++
++        return paired;
++    }
++
      void GameFrame::matchTransform(Workload &curWorkload, const Workload &prevWorkload, GameFrameMap::WorkloadMap &curWorkloadMap, const GameFrameMap::WorkloadMap *prevWorkloadMap, uint32_t curTransformIndex, uint32_t prevTransformIndex, ModifiedBuffers &modifiedBuffers) {
          GameFrameMap::TransformMap &curTransformMap = curWorkloadMap.transforms[curTransformIndex];
          if (prevWorkloadMap != nullptr) {
-@@ -723,6 +832,7 @@ namespace RT64 {
+@@ -723,12 +1519,30 @@ namespace RT64 {
          curTransformMap.rigidBody.updateAngular(prevTransform, curTransform, curGroup.rotationInterpolation, curGroup.scaleInterpolation, curGroup.skewInterpolation);
          curTransformMap.rigidBody.updatePerspective(prevTransform, curTransform, curGroup.perspectiveInterpolation);
          curTransformMap.rigidBody.updateDecomposition(curTransform, curGroup.decompose);
 +        guardDecomposedLerp(curWorkload, curTransformIndex, prevTransform, curTransform, curGroup.matrixId, curTransformMap.rigidBody);
++        {
++            // BT_RT64_PAIRLOG=<units>: prints every id-paired transform whose origin moved further than that in one frame.
++            static const char *pairLog = std::getenv("BT_RT64_PAIRLOG");
++            if (pairLog != nullptr) {
++                const float limit = float(std::atof(pairLog));
++                const float dx = curTransform[3][0] - prevTransform[3][0];
++                const float dy = curTransform[3][1] - prevTransform[3][1];
++                const float dz = curTransform[3][2] - prevTransform[3][2];
++                const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
++                if (d > limit) {
++                    std::fprintf(stderr, "[pair] id=%08X cur=%u prev=%u d=%.1f curT=(%.0f %.0f %.0f) prevT=(%.0f %.0f %.0f) ncur=%zu nprev=%zu\n",
++                        curGroup.matrixId, curTransformIndex, prevTransformIndex, d, float(curTransform[3][0]), float(curTransform[3][1]), float(curTransform[3][2]),
++                        float(prevTransform[3][0]), float(prevTransform[3][1]), float(prevTransform[3][2]), curWorkload.drawData.worldTransforms.size(), prevWorkload.drawData.worldTransforms.size());
++                }
++            }
++        }
          curTransformMap.prevTransformIndex = prevTransformIndex;
          curTransformMap.mapped = true;
          curWorkloadMap.prevTransformsMapped[prevTransformIndex] = true;
-@@ -751,6 +861,7 @@ namespace RT64 {
-                 }
  
+         uint64_t curVertexHash = 0;
+         uint64_t prevVertexHash = 0;
++        uint32_t paired = 0;
+         uint32_t curVertexIndex = curWorkload.drawData.worldTransformVertexIndices[curTransformIndex];
+         uint32_t curVertexCount = curWorkload.drawData.worldTransformVertexCount(curTransformIndex);
+         uint32_t prevVertexIndex = prevWorkload.drawData.worldTransformVertexIndices[prevTransformIndex];
+@@ -744,16 +1558,86 @@ namespace RT64 {
+                 const float *curPosFloatsRef = &curPosFloats[curVertexIndex * 3];
+                 const float *prevPosFloatsRef = &prevPosFloats[prevVertexIndex * 3];
+                 float *curVelFloatsRef = &curVelFloats[curVertexIndex * 3];
+-                for (uint32_t i = 0; i < curVertexCount; i++) {
+-                    for (uint32_t j = 0; j < 3; j++) {
+-                        curVelFloatsRef[i * 3 + j] = (curPosFloatsRef[i * 3 + j] - prevPosFloatsRef[i * 3 + j]);
++                const VertexSmoothParams &smoothParams = vertexSmoothParams();
++                static const bool dumping = (std::getenv("BT_RT64_VTXDUMP") != nullptr);
++                thread_local std::vector<float> rawCopy;
++                if (dumping) {
++                    rawCopy.assign(curPosFloatsRef, curPosFloatsRef + curVertexCount * 3);
++                }
++
++                VertexSmoothStats stats;
++                if (vertexSmoothingActive()) {
++                    // The previous workload's positions are what was DRAWN there (already smoothed), and its
++                    // velocities are the drawn motion into them, so no per-vertex state is kept anywhere else.
++                    float *curPosMutable = &curWorkload.drawData.posFloats[curVertexIndex * 3];
++                    const uint32_t changed = smoothVertexRange(curPosMutable, curVelFloatsRef, prevPosFloatsRef,
++                        &prevWorkload.drawData.velFloats[prevVertexIndex * 3], curVertexCount, smoothParams.log ? &stats : nullptr);
++                    if (changed > 0) {
++                        modifiedBuffers.notePositions(curVertexIndex * 3, (curVertexIndex + curVertexCount) * 3);
+                     }
+                 }
++                else {
++                    for (uint32_t i = 0; i < curVertexCount; i++) {
++                        for (uint32_t j = 0; j < 3; j++) {
++                            curVelFloatsRef[i * 3 + j] = (curPosFloatsRef[i * 3 + j] - prevPosFloatsRef[i * 3 + j]);
++                        }
++                    }
++
++                    if (smoothParams.log) {
++                        const float *prevVelRef = &prevWorkload.drawData.velFloats[prevVertexIndex * 3];
++                        for (uint32_t i = 0; i < curVertexCount * 3; i++) {
++                            stats.rough += std::fabs(curVelFloatsRef[i] - prevVelRef[i]);
++                        }
+ 
++                        stats.components = curVertexCount * 3;
++                    }
++                }
++
++                if (dumping) {
++                    dumpVertices(curGroup.matrixId, rawCopy.data(), curPosFloatsRef, curVertexCount);
++                }
++
++                // BT_RT64_VTXSMOOTHLOG: rough = mean |second difference| of the drawn positions per component
++                // (the shimmer), off = mean/max distance from the game's own value (the price).
++                if (smoothParams.log && (stats.components > 0)) {
++                    std::fprintf(stderr, "[vsmooth] id=%08X n=%u rough=%.4f off=%.4f max=%.3f changed=%u\n", curGroup.matrixId, curVertexCount,
++                        stats.rough / float(stats.components), stats.offsetSum / float(stats.components), stats.offsetMax, stats.changed);
++                }
++
++                modifiedBuffers.positionVelocity = true;
++                g_bt_rt64_vertex_interpolated.fetch_add(1, std::memory_order_relaxed);
++            }
++            else if ((curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP) && vertexSmoothParams().log) {
++                // Unchanged vertices still have a second difference (the previous motion stopping), so the
++                // log counts these frames too; otherwise smoothing on and off are measured over different frames.
++                const float *prevVelRef = &prevWorkload.drawData.velFloats[prevVertexIndex * 3];
++                float rough = 0.0f;
++                for (uint32_t i = 0; i < curVertexCount * 3; i++) {
++                    rough += std::fabs(prevVelRef[i]);
++                }
++
++                if (rough > 0.0f) {
++                    std::fprintf(stderr, "[vsmooth] id=%08X n=%u rough=%.4f off=0.0000 max=0.000 changed=0\n", curGroup.matrixId, curVertexCount,
++                        rough / float(curVertexCount * 3));
++                }
++            }
++        }
++        else if ((curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP) && (curVertexCount != prevVertexCount)) {
++            paired = alignVertexLoads(curWorkload, prevWorkload, curVertexIndex, curVertexCount, prevVertexIndex, prevVertexCount, modifiedBuffers);
++            if (paired > 0) {
                  modifiedBuffers.positionVelocity = true;
 +                g_bt_rt64_vertex_interpolated.fetch_add(1, std::memory_order_relaxed);
              }
          }
  
++        // BT_RT64_VTXLOG: every vertex-interpolated transform, with both vertex counts and, when they differ,
++        // how many vertices alignVertexLoads paired (0 = none: the transform steps at the game's rate).
++        static const bool vtxLog = (std::getenv("BT_RT64_VTXLOG") != nullptr);
++        if (vtxLog && (curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP)) {
++            std::fprintf(stderr, "[vtx] id=%08X cur=%u prev=%u changed=%d paired=%u\n", curGroup.matrixId, curVertexCount, prevVertexCount,
++                int((curVertexCount != prevVertexCount) || (curVertexHash != prevVertexHash)), paired);
++        }
++
+         if ((curGroup.texcoordInterpolation != G_EX_COMPONENT_SKIP) && (curVertexCount == prevVertexCount)) {
+             const std::vector<float> &curTcFloats = curWorkload.drawData.tcFloats;
+             const std::vector<float> &prevTcFloats = prevWorkload.drawData.tcFloats;
+diff --git a/src/hle/rt64_game_frame.h b/src/hle/rt64_game_frame.h
+index 00a72f6..6d3ec68 100644
+--- a/src/hle/rt64_game_frame.h
++++ b/src/hle/rt64_game_frame.h
+@@ -103,14 +103,30 @@ namespace RT64 {
+     struct ModifiedBuffers {
+         bool positionVelocity = false;
+         bool texcoordVelocity = false;
++        // BT: float range of posFloats rewritten by vertex smoothing (GameFrame::smoothVertexRange), which has
++        // to be uploaded again because the positions went up with the workload before matching ran.
++        size_t positionsBegin = SIZE_MAX;
++        size_t positionsEnd = 0;
++
++        void notePositions(size_t begin, size_t end) {
++            positionsBegin = (begin < positionsBegin) ? begin : positionsBegin;
++            positionsEnd = (end > positionsEnd) ? end : positionsEnd;
++        }
++
++        bool positionsModified() const {
++            return positionsEnd > positionsBegin;
++        }
+ 
+         void merge(const ModifiedBuffers &modifiedBuffers) {
+             positionVelocity |= modifiedBuffers.positionVelocity;
+             texcoordVelocity |= modifiedBuffers.texcoordVelocity;
++            if (modifiedBuffers.positionsModified()) {
++                notePositions(modifiedBuffers.positionsBegin, modifiedBuffers.positionsEnd);
++            }
+         }
+ 
+         bool empty() const {
+-            return !positionVelocity && !texcoordVelocity;
++            return !positionVelocity && !texcoordVelocity && !positionsModified();
+         }
+     };
+ 
 diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
-index 1da2550..dd7e97e 100644
+index 1da2550..2adffa8 100644
 --- a/src/hle/rt64_rsp.cpp
 +++ b/src/hle/rt64_rsp.cpp
-@@ -1153,6 +1153,28 @@ namespace RT64 {
+@@ -676,6 +676,7 @@ namespace RT64 {
+         auto &posScreen = workload.drawData.posScreen;
+         const auto &mvp = modelViewProjMatrix;
+         const uint32_t globalIndex = workload.drawData.vertexCount();
++        workload.drawData.vertexLoadStarts.emplace_back(globalIndex);
+         for (uint32_t i = dstIndex; i < dstMax; i++) {
+             auto &v = vertices[i];
+             posFloats.emplace_back(v.x);
+@@ -760,6 +761,7 @@ namespace RT64 {
+             auto &worldIndices = workload.drawData.worldIndices;
+             auto &posTransformed = workload.drawData.posTransformed;
+             const uint32_t newIndex = workload.drawData.vertexCount();
++            workload.drawData.vertexLoadStarts.emplace_back(newIndex);
+             posFloats.emplace_back(posFloats[globalIndex * 3 + 0]);
+             posFloats.emplace_back(posFloats[globalIndex * 3 + 1]);
+             posFloats.emplace_back(posFloats[globalIndex * 3 + 2]);
+@@ -1153,6 +1155,28 @@ namespace RT64 {
              const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
              const FixedRect viewportClipRect = viewport.rect(clipRatios.data());
              drawRect = viewportClipRect.intersection(scissorRect.intersection(drawRect));
@@ -245,6 +1154,32 @@ index 1da2550..dd7e97e 100644
              if (!drawRect.isNull()) {
                  fbPair.drawColorRect.merge(drawRect);
                  if (otherModeStack[otherModeStackSize - 1].zUpd()) {
+diff --git a/src/hle/rt64_workload.cpp b/src/hle/rt64_workload.cpp
+index b4c85f5..458b7f8 100644
+--- a/src/hle/rt64_workload.cpp
++++ b/src/hle/rt64_workload.cpp
+@@ -95,6 +95,7 @@ namespace RT64 {
+         drawData.worldTransformSegmentedAddresses.clear();
+         drawData.worldTransformPhysicalAddresses.clear();
+         drawData.worldTransformVertexIndices.clear();
++        drawData.vertexLoadStarts.clear();
+         drawData.viewportClipRatios.push_back(1);
+         drawData.viewportClipRatios.push_back(1);
+         drawData.viewportClipRatios.push_back(-1);
+diff --git a/src/hle/rt64_workload.h b/src/hle/rt64_workload.h
+index 8ea27d5..b829b93 100644
+--- a/src/hle/rt64_workload.h
++++ b/src/hle/rt64_workload.h
+@@ -76,6 +76,9 @@ namespace RT64 {
+         std::vector<uint32_t> worldTransformSegmentedAddresses;
+         std::vector<uint32_t> worldTransformPhysicalAddresses;
+         std::vector<uint32_t> worldTransformVertexIndices;
++        // BT: first vertex of every vertex load, in submission order. Lets a transform whose vertex count
++        // changed still pair the loads that did not (GameFrame::alignVertexLoads).
++        std::vector<uint32_t> vertexLoadStarts;
+ 
+         uint32_t vertexCount() const {
+             return uint32_t(worldIndices.size());
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
 index 5a331aa..bb7e320 100644
 --- a/src/hle/rt64_workload_queue.cpp

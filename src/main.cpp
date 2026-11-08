@@ -6,6 +6,7 @@
 // their overlay table come from RecompiledFuncs/.
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -119,8 +120,23 @@ ultramodern::renderer::WindowHandle create_window(
     flags |= SDL_WINDOW_VULKAN;
 #endif
 
+    // BT_WINDOW_POS=x,y (test harness): create the window at that position, in
+    // physical pixels, without activating it, so an unattended run can sit on a
+    // second monitor instead of popping up over whatever the user is doing.
+    int window_x = SDL_WINDOWPOS_CENTERED;
+    int window_y = SDL_WINDOWPOS_CENTERED;
+    if (const char* pos = std::getenv("BT_WINDOW_POS")) {
+        int x = 0;
+        int y = 0;
+        if (std::sscanf(pos, "%d,%d", &x, &y) == 2) {
+            window_x = x;
+            window_y = y;
+            SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "1");
+        }
+    }
+
     window = SDL_CreateWindow("Banjo-Tooie: Recompiled",
-                              SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                              window_x, window_y,
                               1600, 900, flags);
     if (window == nullptr) {
         exit_error("Failed to create window: %s\n", SDL_GetError());
@@ -178,7 +194,35 @@ static uint32_t discarded_output_frames = 0;
 
 constexpr uint32_t bytes_per_frame = input_channels * sizeof(float);
 
+// BT_PACELOG (src/recomp_api.cpp) reads these: the audio clock as the game
+// generates it, how much of it never reached the device, and how often the
+// device queue was found empty (an underrun proxy).
+std::atomic<uint64_t> g_audio_in_frames{0};
+std::atomic<uint64_t> g_audio_dropped_out_frames{0};
+std::atomic<uint32_t> g_audio_empty_queues{0};
+std::atomic<uint32_t> g_audio_buffers{0};
+
+extern "C" void tooie_audio_stats(uint64_t* in_frames, uint64_t* dropped_out,
+                                  uint32_t* empty_queues, uint32_t* buffers,
+                                  uint32_t* queued_us, uint32_t* in_rate,
+                                  uint32_t* out_rate) {
+    *in_frames = g_audio_in_frames.load(std::memory_order_relaxed);
+    *dropped_out = g_audio_dropped_out_frames.load(std::memory_order_relaxed);
+    *empty_queues = g_audio_empty_queues.load(std::memory_order_relaxed);
+    *buffers = g_audio_buffers.load(std::memory_order_relaxed);
+    const uint64_t queued = audio_device != 0 ? SDL_GetQueuedAudioSize(audio_device) : 0;
+    *queued_us = static_cast<uint32_t>(queued / (output_channels * sizeof(float)) *
+                                       1000000ULL / output_sample_rate);
+    *in_rate = sample_rate;
+    *out_rate = output_sample_rate;
+}
+
 void queue_samples(int16_t* audio_data, size_t sample_count) {
+    g_audio_buffers.fetch_add(1, std::memory_order_relaxed);
+    g_audio_in_frames.fetch_add(sample_count / input_channels, std::memory_order_relaxed);
+    if (SDL_GetQueuedAudioSize(audio_device) == 0) {
+        g_audio_empty_queues.fetch_add(1, std::memory_order_relaxed);
+    }
     static std::vector<float> swap_buffer;
     static std::array<float, duplicated_input_frames * input_channels>
         duplicated_sample_buffer;
@@ -234,6 +278,10 @@ void queue_samples(int16_t* audio_data, size_t sample_count) {
     const uint32_t skip_factor = cur_queued_microseconds / 100000;
     if (skip_factor != 0) {
         const uint32_t skip_ratio = 1 << skip_factor;
+        g_audio_dropped_out_frames.fetch_add(
+            (num_bytes_to_queue - num_bytes_to_queue / skip_ratio) /
+                (output_channels * sizeof(swap_buffer[0])),
+            std::memory_order_relaxed);
         num_bytes_to_queue /= skip_ratio;
         for (size_t i = 0;
              i < num_bytes_to_queue / (output_channels * sizeof(swap_buffer[0]));
@@ -382,17 +430,38 @@ std::vector<AutopadPress> autopad_script() {
     return presses;
 }
 
+// The BT_AUTOPAD clock: steady_clock ticks at the first input poll, shared with
+// the test harness (src/test_harness.cpp) so BT_POKE/BT_WARP/BT_POS times line
+// up with BT_AUTOPAD's.
+std::atomic<int64_t> g_harness_origin{0};
+
+double harness_seconds_since(int64_t origin) {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::duration(
+            std::chrono::steady_clock::now().time_since_epoch().count() - origin))
+        .count();
+}
+
+extern "C" double tooie_harness_seconds() {
+    const int64_t origin = g_harness_origin.load(std::memory_order_relaxed);
+    return origin == 0 ? -1.0 : harness_seconds_since(origin);
+}
+
 bool get_input_with_autopad(int player_index, uint16_t* buttons_out,
                             float* x_out, float* y_out) {
     static const std::vector<AutopadPress> presses = autopad_script();
+    if (g_harness_origin.load(std::memory_order_relaxed) == 0) {
+        int64_t expected = 0;
+        g_harness_origin.compare_exchange_strong(
+            expected, std::chrono::steady_clock::now().time_since_epoch().count());
+    }
     const bool connected = recompinput::profiles::get_n64_input(
         player_index, buttons_out, x_out, y_out);
     if (presses.empty() || player_index != 0) {
         return connected;
     }
-    static const auto origin = std::chrono::steady_clock::now();
-    const double now = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - origin).count();
+    const double now = harness_seconds_since(
+        g_harness_origin.load(std::memory_order_relaxed));
     for (const AutopadPress& press : presses) {
         if (now >= press.at && now < press.until) {
             *buttons_out |= press.button;
@@ -443,6 +512,11 @@ std::vector<recomp::GameEntry> supported_games = {
     },
 };
 
+// RT64's switch for vertex smoothing (lib/rt64 rt64_game_frame.cpp).
+extern "C" std::atomic<uint32_t> g_bt_rt64_vertex_smooth;
+// The sky seam blending switch (recomp_api.cpp, sky_seams, AGENTS.md §7.9).
+extern "C" std::atomic<uint32_t>* tooie_sky_seams_flag();
+
 void initialize_config() {
     const std::filesystem::path recomp_dir =
         recompui::file::get_app_folder_path();
@@ -452,7 +526,41 @@ void initialize_config() {
 
     recompui::config::GeneralTabOptions general_options{};
     recompui::config::create_general_tab(general_options);
-    recompui::config::create_graphics_tab();
+    recomp::config::Config& graphics = recompui::config::create_graphics_tab();
+    // Port option: smooth the whole-unit snapping of CPU-animated vertices
+    // (RT64 GameFrame::smoothVertexRange, AGENTS.md §7.7h). The change callback
+    // also fires on load, so RT64's flag follows the saved value from the start.
+    graphics.add_bool_option(
+        "bt_smooth_faces",
+        "Smooth Animated Faces",
+        "Smooths the per-vertex shimmer of characters the game animates on the CPU (Mingella, Grunty and "
+        "others), whose vertices snap to whole units every frame. Takes effect when the framerate is above "
+        "the original.",
+        true);
+    graphics.add_option_change_callback("bt_smooth_faces",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                g_bt_rt64_vertex_smooth.store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    // Port option: blend the texels either side of the sky's tile borders so the
+    // seams between sky tiles stop showing (AGENTS.md §7.9). The game data is
+    // rewritten once per sky, so turning it off takes effect at the next map load.
+    graphics.add_bool_option(
+        "bt_sky_seams",
+        "Blend Sky Seams",
+        "Hides the seams between the tiles the sky is made of. The game cuts each sky into square tiles that "
+        "cannot blend into each other, which shows as straight lines through the clouds. Turning this off "
+        "takes effect at the next area load.",
+        true);
+    graphics.add_option_change_callback("bt_sky_seams",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_sky_seams_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
     recompui::config::create_controls_tab();
     recompui::config::create_sound_tab();
     recompui::config::create_mods_tab();

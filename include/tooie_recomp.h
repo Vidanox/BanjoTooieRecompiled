@@ -61,6 +61,11 @@ void tooie_probe_gate(uint8_t* rdram, recomp_context* ctx);
 // sound-object release delivered as an external runtime message.
 void tooie_yield_pending_sound(uint8_t* rdram, recomp_context* ctx);
 
+// Gives the cooperative scheduler a preemption point inside the new-game
+// intro's wall-clock wait (glintrosyncDll_entrypoint_1), which otherwise
+// starves the audio thread for the whole wait (AGENTS.md 6.9).
+void tooie_yield_intro_sync(uint8_t* rdram, recomp_context* ctx);
+
 // Clears the runtime's RDP freeze bit when Tooie signals the frame barrier.
 void tooie_clear_dp_freeze(uint8_t* rdram, recomp_context* ctx);
 

@@ -415,6 +415,14 @@ extern "C" void tooie_probe_task_dispatch(uint8_t* rdram, recomp_context* ctx,
 // `yield_self_1ms` is the runtime's own timed external-message drain followed
 // by its priority check.
 extern "C" void yield_self_1ms(uint8_t* rdram);
+// Read by BT_PACELOG: every scheduling point the sweep has spent waiting.
+std::atomic<uint32_t> g_sound_release_yields{0};
+// src/main.cpp (audio clock) and ultramodern's VI thread, for BT_PACELOG.
+extern "C" void tooie_audio_stats(uint64_t* in_frames, uint64_t* dropped_out,
+                                  uint32_t* empty_queues, uint32_t* buffers,
+                                  uint32_t* queued_us, uint32_t* in_rate,
+                                  uint32_t* out_rate);
+extern uint64_t total_vis;
 
 extern "C" void tooie_yield_pending_sound(uint8_t* rdram, recomp_context* ctx) {
     // `s3` counts the entries this pass refused, i.e. the work still pending.
@@ -424,6 +432,7 @@ extern "C" void tooie_yield_pending_sound(uint8_t* rdram, recomp_context* ctx) {
         return;
     }
     static uint32_t yields = 0;
+    g_sound_release_yields.fetch_add(1, std::memory_order_relaxed);
     if (yields == 64U) {
         std::fprintf(stderr,
             "[Tooie] sound-release spin: 64 scheduling points at frame %u "
@@ -432,6 +441,33 @@ extern "C" void tooie_yield_pending_sound(uint8_t* rdram, recomp_context* ctx) {
         std::fflush(stderr);
     }
     ++yields;
+    yield_self_1ms(rdram);
+}
+
+// The new-game intro keeps its scenes on the music's schedule with a wall-clock
+// busy-wait: at the end of each scene `glintrosyncDll_entrypoint_1` polls
+// `osGetCount` until the scene's cue time (a per-scene table in the overlay)
+// has passed, then the next map loads. That loop makes no OS call, so in the
+// cooperative runtime nothing else runs while it spins -- in particular the
+// audio thread, which on hardware preempts it. Measured over the whole intro:
+// 11 waits of 1.9-6.5 s, ~0.1 s of audio generated during each, and the score
+// 34 s behind the pictures by Spiral Mountain (AGENTS.md 6.9).
+//
+// Hooked at the loop head (0x808002BC), so it runs only while the wait has
+// not been met; the loop condition and the cue bookkeeping are untouched.
+// BT_INTROSYNC_YIELD=off restores the starving spin for A/B.
+std::atomic<uint32_t> g_intro_sync_yields{0};
+
+extern "C" void tooie_yield_intro_sync(uint8_t* rdram, recomp_context* ctx) {
+    (void)ctx;
+    static const bool off = [] {
+        const char* v = std::getenv("BT_INTROSYNC_YIELD");
+        return v != nullptr && std::strcmp(v, "off") == 0;
+    }();
+    if (off) {
+        return;
+    }
+    g_intro_sync_yields.fetch_add(1, std::memory_order_relaxed);
     yield_self_1ms(rdram);
 }
 
@@ -1271,7 +1307,12 @@ struct RootScope {
 struct PlayerModelKey {
     uint32_t player;
     uint32_t model;
+    uint32_t last_frame;  // g_rt64_frame_serial of the last draw that used it
 };
+
+// Counts tooie_rt64_begin_frame calls, i.e. the frames RT64 pairs with each
+// other. Only differences are used, so wrapping is harmless.
+uint32_t g_rt64_frame_serial = 0;
 
 // The player draw runs on one guest thread, and the ids only have to be stable
 // between adjacent frames, so this state is thread-local and never shared.
@@ -1299,20 +1340,70 @@ uint32_t stable_player_key(uint8_t* rdram, uint32_t player_state) {
     return kPlayerStateSlotCount + 1U + ((player_state >> 4U) % 240U);
 }
 
-uint32_t player_model_transform_id(uint32_t player, uint32_t model) {
+// BT_RT64_SLOTCAP=n shrinks the table so exhaustion can be reached in seconds
+// (test aid); BT_RT64_SLOTRECLAIM=off restores the old never-reuse behaviour.
+uint32_t player_slot_capacity() {
+    static const uint32_t capacity = [] {
+        const char* value = std::getenv("BT_RT64_SLOTCAP");
+        const long parsed = (value != nullptr) ? std::strtol(value, nullptr, 10) : 0;
+        return (parsed > 0 && parsed < static_cast<long>(kPlayerModelCount))
+            ? static_cast<uint32_t>(parsed) : kPlayerModelCount;
+    }();
+    return capacity;
+}
+
+bool player_slot_reclaim_off() {
+    static const bool off = [] {
+        const char* value = std::getenv("BT_RT64_SLOTRECLAIM");
+        return value != nullptr && (std::strcmp(value, "off") == 0 ||
+                                    std::strcmp(value, "0") == 0);
+    }();
+    return off;
+}
+
+// The model key is a guest ADDRESS, and the player's model does not stay put:
+// every room load reloads it, and the heap compactor moves it during play
+// (measured: 4 new addresses in 60 s of walking around Spiral Mountain, 8 in
+// 230 s with two trips through Banjo's house). Slots used to be append-only, so
+// after ~256 moves every new address got id 0 -- the player and everything it
+// draws went untagged for the rest of the session and RT64's heuristic pairing
+// sheared them (AGENTS.md §7.7d). Ids only have to be stable between adjacent
+// frames, so a slot nobody drew in this frame or the previous one is reused:
+// RT64 pairs a transform only with the previous frame's, so an id that was idle
+// for a whole frame cannot be blended with its old owner.
+uint32_t player_model_transform_id(uint32_t player, uint32_t model,
+                                   bool* assigned) {
     for (uint32_t slot = 0; slot < g_player_model_count; ++slot) {
         if (g_player_models[slot].player == player &&
             g_player_models[slot].model == model) {
+            g_player_models[slot].last_frame = g_rt64_frame_serial;
             return kPlayerTransformIdBase + slot * kPlayerTransformIdStride;
         }
     }
 
-    if (g_player_model_count >= kPlayerModelCount) {
-        return 0;
+    uint32_t slot = g_player_model_count;
+    if (slot < player_slot_capacity()) {
+        ++g_player_model_count;
+    }
+    else {
+        if (player_slot_reclaim_off()) {
+            return 0;
+        }
+        uint32_t best_idle = 1U;  // must have missed at least one whole frame
+        for (uint32_t i = 0; i < g_player_model_count; ++i) {
+            const uint32_t idle = g_rt64_frame_serial - g_player_models[i].last_frame;
+            if (idle > best_idle) {
+                best_idle = idle;
+                slot = i;
+            }
+        }
+        if (slot >= g_player_model_count) {
+            return 0;
+        }
     }
 
-    const uint32_t slot = g_player_model_count++;
-    g_player_models[slot] = {player, model};
+    g_player_models[slot] = {player, model, g_rt64_frame_serial};
+    *assigned = true;
     return kPlayerTransformIdBase + slot * kPlayerTransformIdStride;
 }
 
@@ -1650,6 +1741,14 @@ bool demo_pacing_off() {
 // switch itself off every other frame (3, 2, 3, 2 -- still 1.2x). The divisor
 // also feeds G_EX_SETREFRESHRATE, so RT64 interpolates at the delivered rate.
 // Capped at 6 so a recorded load stall (15) does not freeze the screen.
+bool pace_log_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BT_PACELOG");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
 uint32_t g_pacing_override = 0;
 uint32_t g_pacing_saved_divisor = 0;
 bool g_recorded_timing = false;
@@ -1685,10 +1784,27 @@ void pace_recorded_frame(uint8_t* rdram) {
         return;
     }
 
-    const uint32_t step = std::min(read_byte(rdram, kFrameStepVis), 6U);
-    if (step > read_byte(rdram, kFrameElapsedVis)) {
+    // Only a recordable step may latch. The first frame after a map load
+    // carries the load stall in the step byte (14-15) while the elapsed byte
+    // can read less (measured: step 15, elapsed 5 entering the intro's map
+    // 0x0A5). Latching on that frame locked a normal-play scene at the capped
+    // divisor of 6 -- 10 Hz for the whole scene -- because once paced every
+    // frame really lasts 6 VIs, so step stays above the divisor and the quiet
+    // release below can never fire (AGENTS.md 7.8).
+    const uint32_t raw_step = read_byte(rdram, kFrameStepVis);
+    const uint32_t step = std::min(raw_step, 6U);
+    const uint32_t elapsed = read_byte(rdram, kFrameElapsedVis);
+    if (raw_step <= 6U && step > elapsed) {
+        if (!g_recorded_timing && pace_log_enabled()) {
+            std::fprintf(stderr, "[pacing] latch: frame %u step %u elapsed %u divisor %u\n",
+                         frame, raw_step, elapsed, divisor);
+        }
         g_recorded_timing = true;
         g_pacing_quiet_frames = 0;
+    }
+    else if (raw_step > 6U && raw_step > elapsed && pace_log_enabled()) {
+        std::fprintf(stderr, "[pacing] load-stall frame ignored: frame %u step %u elapsed %u\n",
+                     frame, raw_step, elapsed);
     }
     // Belt and braces for normal play: if the latch ever trips without a demo,
     // ~3 s of steps no longer than the divisor releases it. The demo's own runs
@@ -1704,15 +1820,68 @@ void pace_recorded_frame(uint8_t* rdram) {
     }
 }
 
+// BT_PACELOG=1: one line per game frame comparing the clocks -- wall time,
+// the VI clock, the VIs the world advanced by (sum of the step byte), and the
+// audio frames the game generated -- so drift and transition gaps can be
+// measured silently (AGENTS.md 9).
+void pace_log(uint8_t* rdram) {
+    if (!pace_log_enabled()) {
+        return;
+    }
+    static uint64_t world_vis = 0;
+    static uint32_t frames = 0;
+    static const auto origin = std::chrono::steady_clock::now();
+    const uint32_t step = read_byte(rdram, kFrameStepVis);
+    world_vis += step;
+    ++frames;
+    uint64_t in_frames = 0;
+    uint64_t dropped = 0;
+    uint32_t empty = 0;
+    uint32_t buffers = 0;
+    uint32_t queued_us = 0;
+    uint32_t in_rate = 0;
+    uint32_t out_rate = 0;
+    tooie_audio_stats(&in_frames, &dropped, &empty, &buffers, &queued_us, &in_rate,
+                      &out_rate);
+    const double t = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - origin).count();
+    // The intro's own schedule clock, seconds (glintrosyncDll: 0x801275D8,
+    // advanced per frame and padded to each scene's cue by the wait).
+    const uint32_t clock_bits = read_word(rdram, 0x801275D8U);
+    float intro_clock = 0.0f;
+    std::memcpy(&intro_clock, &clock_bits, sizeof(intro_clock));
+    std::fprintf(stderr,
+                 "[pace] t=%.4f n=%u f=%u map=%03X div=%u step=%u el=%u wvi=%llu "
+                 "vi=%llu au=%llu rate=%u q=%u drop=%llu empty=%u buf=%u yld=%u isy=%u ic=%.3f\n",
+                 t, frames, read_word(rdram, kGameFrameCount),
+                 read_word(rdram, 0x80132DC0U) & 0xFFFFU,
+                 read_word(rdram, kViRetraceInterval), step,
+                 read_byte(rdram, kFrameElapsedVis),
+                 static_cast<unsigned long long>(world_vis),
+                 static_cast<unsigned long long>(total_vis),
+                 static_cast<unsigned long long>(in_frames), in_rate, queued_us,
+                 static_cast<unsigned long long>(dropped), empty, buffers,
+                 g_sound_release_yields.load(std::memory_order_relaxed),
+                 g_intro_sync_yields.load(std::memory_order_relaxed), intro_clock);
+}
+
 } // namespace
 
+namespace tooie::harness {
+void on_frame(uint8_t* rdram, recomp_context* ctx);
+}
+
 extern "C" void tooie_rt64_begin_frame(uint8_t* rdram, recomp_context* ctx) {
-    (void)ctx;
+    // BT_POKE / BT_WARP / BT_POS (src/test_harness.cpp): once per game frame, on
+    // the game thread. A single null check when none of them is set.
+    tooie::harness::on_frame(rdram, ctx);
     // Runs before the RT64 gate on purpose: pacing is game timing, not metadata.
     pace_recorded_frame(rdram);
+    pace_log(rdram);
     if (rt64_disabled()) {
         return;
     }
+    ++g_rt64_frame_serial;
 
     const uint32_t frame = read_word(rdram, kGameFrameCount);
     if (rt64_trace_enabled()) {
@@ -1921,7 +2090,17 @@ extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
     scope.bone_flags = kBoneGroupFlags;
     const bool animated = read_word(rdram, kAnimationMatrixList) != 0U;
     if (in_player) {
-        scope.transform_id = player_model_transform_id(g_player_key, model);
+        bool assigned = false;
+        scope.transform_id =
+            player_model_transform_id(g_player_key, model, &assigned);
+        // BT_RT64_CAMLOG: every (re)assignment of a player slot, and every draw
+        // left without an id (only possible with BT_RT64_SLOTRECLAIM=off).
+        if (rt64_camlog_enabled() && (assigned || scope.transform_id == 0U)) {
+            std::fprintf(stderr,
+                         "[player-slot] frame=%u key=%u model=%08X id=%08X slots=%u\n",
+                         read_word(rdram, kGameFrameCount), g_player_key, model,
+                         scope.transform_id, g_player_model_count);
+        }
     }
     else {
         root_flags = kActorGroupFlags;
@@ -2109,6 +2288,490 @@ extern "C" void tooie_rt64_pop_player_bone(uint8_t* rdram,
     g_bone_scopes[depth] = false;
 }
 
+// Sky seam blending (enhancement, AGENTS.md Â§7.9).
+//
+// Every Tooie sky measured (Spiral Mountain, Jinjo Village, Mayahem Temple) is a
+// panorama cut into clamped tiles (64x64 IA8, 32x32 RGBA32, 32x32 RGBA16) and
+// mapped edge to edge, each tile across [-0.5, N - 0.5]. The tiles do not
+// overlap, so at every tile border the filter has nothing to blend the last
+// texel with: each side holds its own edge texel flat for half a texel and the
+// image steps by one texel's difference. That step is the seam, and it is
+// NATIVE -- identical with interpolation off and at the original resolution
+// (measured, Â§7.9); a hardware N64 clamps the same way.
+//
+// The fix is to the DATA: after the sky has been drawn, the display list it
+// emitted is walked, every textured triangle edge lying on a clamped tile border
+// is collected, and edges two tiles share are paired. Each pair's border texels
+// are then replaced by their common average, so both sides of the seam meet at
+// the same value and the step is gone. Three guards keep it from touching
+// anything that is not a continuation of one image:
+//   * the two triangles must lie on opposite sides of the shared edge (two
+//     coincident layers, e.g. Spiral Mountain's cross-faded cloud quads, are not
+//     neighbours);
+//   * both must come from the same model (one vertex segment);
+//   * the borders must already agree to within the texture's own texel-to-texel
+//     variation: mean |difference| <= 2 x (mean |edge - next texel|) + 3, on a
+//     0-255 scale. Measured, real seams sit at 0.1-1.3x and mismatched art at
+//     2.9-14x, so the band is wide on both sides.
+// Averaging is idempotent, so a texture that is processed twice is unchanged.
+// The work runs once per sky (keyed on the emitted display list and a sample of
+// what was written), not per frame.
+namespace sky_seams {
+
+std::atomic<uint32_t> g_enabled{1};
+
+// BT_SKY_SEAMS=off disables the blending for A/B, overriding the graphics
+// option; =log prints one summary per processed sky, =log2 adds each pair's
+// verdict.
+int env_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("BT_SKY_SEAMS");
+        if (v == nullptr) return 0;
+        if (std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0) return -1;
+        if (std::strcmp(v, "log") == 0) return 2;
+        if (std::strcmp(v, "log2") == 0) return 3;
+        return 0;
+    }();
+    return mode;
+}
+
+uint32_t phys(uint32_t a) { return a & 0x007FFFFFU; }
+uint8_t rd8(const uint8_t* rdram, uint32_t a) { return rdram[phys(a) ^ 3U]; }
+void wr8(uint8_t* rdram, uint32_t a, uint8_t v) { rdram[phys(a) ^ 3U] = v; }
+uint32_t rd32(const uint8_t* rdram, uint32_t a) {
+    return *reinterpret_cast<const uint32_t*>(rdram + (phys(a) & ~3U));
+}
+
+struct Vert { int16_t p[3]; float st[2]; };
+struct Tex {
+    uint32_t addr = 0;   // RDRAM address of texel (0,0)
+    uint32_t stride = 0; // bytes per row
+    uint8_t fmt = 0, siz = 0;
+    uint16_t w = 0, h = 0;
+    bool clamp[2] = {false, false};
+};
+struct Edge {
+    int16_t p[2][3];
+    int16_t opp[3];      // the triangle's third vertex
+    float along[2];      // the other texcoord at p[0], p[1]
+    uint32_t group;
+    Tex tex;
+    uint8_t axis, side;  // axis 0: an s border (column), 1: a t border (row)
+};
+
+bool supported(uint8_t fmt, uint8_t siz) {
+    return (fmt == 3 && siz == 1) || (fmt == 4 && siz == 1) || (fmt == 3 && siz == 2) ||
+           (fmt == 0 && siz == 2) || (fmt == 0 && siz == 3);
+}
+uint32_t bytes_per_texel(uint8_t siz) { return siz == 3 ? 4U : (siz == 2 ? 2U : 1U); }
+
+// A texel as up to four 0-255 channels.
+void read_texel(const uint8_t* rdram, uint32_t a, const Tex& t, float out[4]) {
+    if (t.siz == 1) {
+        const uint8_t b = rd8(rdram, a);
+        if (t.fmt == 3) { out[0] = out[1] = out[2] = (b >> 4) * 17.0f; out[3] = (b & 15) * 17.0f; }
+        else { out[0] = out[1] = out[2] = out[3] = b; }
+    }
+    else if (t.siz == 2) {
+        const uint16_t v = uint16_t(rd8(rdram, a) << 8 | rd8(rdram, a + 1));
+        if (t.fmt == 3) { out[0] = out[1] = out[2] = float(v >> 8); out[3] = float(v & 0xFF); }
+        else {
+            out[0] = ((v >> 11) & 31) * (255.0f / 31.0f); out[1] = ((v >> 6) & 31) * (255.0f / 31.0f);
+            out[2] = ((v >> 1) & 31) * (255.0f / 31.0f); out[3] = (v & 1) ? 255.0f : 0.0f;
+        }
+    }
+    else {
+        for (int c = 0; c < 4; ++c) out[c] = rd8(rdram, a + c);
+    }
+}
+
+void write_texel(uint8_t* rdram, uint32_t a, const Tex& t, const float in[4]) {
+    auto q = [](float v, float scale) { return int(std::lround(std::clamp(v, 0.0f, 255.0f) * scale / 255.0f)); };
+    if (t.siz == 1) {
+        if (t.fmt == 3) wr8(rdram, a, uint8_t(q(in[0], 15) << 4 | q(in[3], 15)));
+        else wr8(rdram, a, uint8_t(q(in[0], 255)));
+    }
+    else if (t.siz == 2) {
+        uint16_t v;
+        if (t.fmt == 3) v = uint16_t(q(in[0], 255) << 8 | q(in[3], 255));
+        else v = uint16_t(q(in[0], 31) << 11 | q(in[1], 31) << 6 | q(in[2], 31) << 1 | (in[3] >= 127.5f ? 1 : 0));
+        wr8(rdram, a, uint8_t(v >> 8));
+        wr8(rdram, a + 1, uint8_t(v));
+    }
+    else {
+        for (int c = 0; c < 4; ++c) wr8(rdram, a + c, uint8_t(q(in[c], 255)));
+    }
+}
+
+uint32_t texel_addr(const Tex& t, int s, int tt) {
+    return t.addr + uint32_t(tt) * t.stride + uint32_t(s) * bytes_per_texel(t.siz);
+}
+// The address of texel `i` along an edge's border.
+uint32_t border_addr(const Edge& e, int i, int inward) {
+    const Tex& t = e.tex;
+    if (e.axis == 0) return texel_addr(t, e.side ? t.w - 1 - inward : inward, i);
+    return texel_addr(t, i, e.side ? t.h - 1 - inward : inward);
+}
+int border_len(const Edge& e) { return e.axis == 0 ? e.tex.h : e.tex.w; }
+
+struct Walker {
+    const uint8_t* rdram = nullptr;
+    uint32_t seg[16] = {};
+    bool seg_known[16] = {};
+    Vert verts[64] = {};
+    float scale[2] = {1.0f, 1.0f};
+    bool tex_on = false;
+    uint8_t render_tile = 0;
+    struct Tile { uint8_t fmt, siz, cms, cmt; uint16_t line, tmem; uint16_t uls, ult, lrs, lrt; bool sized; };
+    Tile tiles[8] = {};
+    uint32_t img_addr = 0, img_width = 0;
+    uint8_t img_siz = 0;
+    // TMEM address -> where its texels came from.
+    struct Load { uint16_t tmem; uint32_t addr; uint32_t stride; bool valid; };
+    Load loads[4] = {};
+    uint32_t group = 0;
+    uint32_t commands = 0;
+    std::vector<Edge> edges;
+
+    bool resolve(uint32_t a, uint32_t& out) const {
+        const uint32_t s = (a >> 24) & 0x0F;
+        if ((a >> 24) == 0x80 || (a >> 24) == 0x00) { out = 0x80000000U | phys(a); return true; }
+        if ((a >> 24) > 0x0F || !seg_known[s]) return false;
+        out = 0x80000000U | phys(seg[s] + (a & 0x00FFFFFFU));
+        return true;
+    }
+
+    bool texture_of(Tex& t) const {
+        const Tile& tile = tiles[render_tile];
+        if (!tile.sized || !supported(tile.fmt, tile.siz) || tile.uls != 0 || tile.ult != 0) return false;
+        for (const Load& l : loads) {
+            if (!l.valid || l.tmem != tile.tmem) continue;
+            t.addr = l.addr;
+            t.stride = l.stride ? l.stride : uint32_t(tile.line) * (tile.siz == 3 ? 16U : 8U);
+            t.fmt = tile.fmt; t.siz = tile.siz;
+            t.w = uint16_t(tile.lrs + 1); t.h = uint16_t(tile.lrt + 1);
+            t.clamp[0] = (tile.cms & 2) != 0; t.clamp[1] = (tile.cmt & 2) != 0;
+            return t.w >= 2 && t.h >= 2 && t.w <= 256 && t.h <= 256 &&
+                   t.stride >= t.w * bytes_per_texel(t.siz);
+        }
+        return false;
+    }
+
+    void triangle(int a, int b, int c) {
+        if (!tex_on || a >= 64 || b >= 64 || c >= 64) return;
+        Tex t;
+        if (!texture_of(t)) return;
+        const int idx[3] = {a, b, c};
+        for (int e = 0; e < 3; ++e) {
+            const Vert& p = verts[idx[e]];
+            const Vert& q = verts[idx[(e + 1) % 3]];
+            const Vert& o = verts[idx[(e + 2) % 3]];
+            for (uint8_t axis = 0; axis < 2; ++axis) {
+                if (!t.clamp[axis]) continue;
+                const float lo = -0.5f;
+                const float hi = (axis == 0 ? t.w : t.h) - 0.5f;
+                for (uint8_t side = 0; side < 2; ++side) {
+                    const float v = side ? hi : lo;
+                    if (std::fabs(p.st[axis] - v) > 0.1f || std::fabs(q.st[axis] - v) > 0.1f) continue;
+                    Edge ed;
+                    std::memcpy(ed.p[0], p.p, sizeof(p.p));
+                    std::memcpy(ed.p[1], q.p, sizeof(q.p));
+                    std::memcpy(ed.opp, o.p, sizeof(o.p));
+                    ed.along[0] = p.st[axis ^ 1];
+                    ed.along[1] = q.st[axis ^ 1];
+                    ed.group = group;
+                    ed.tex = t;
+                    ed.axis = axis;
+                    ed.side = side;
+                    if (edges.size() < 4096) edges.push_back(ed);
+                }
+            }
+        }
+    }
+
+    void walk(uint32_t start, uint32_t end, int depth) {
+        for (uint32_t pc = start; pc < end && commands < 20000; pc += 8) {
+            ++commands;
+            const uint32_t w0 = rd32(rdram, pc);
+            const uint32_t w1 = rd32(rdram, pc + 4);
+            switch (w0 >> 24) {
+            case 0x01: {
+                const uint32_t n = (w0 >> 12) & 0xFF;
+                const uint32_t last = (w0 & 0xFF) >> 1;
+                uint32_t a;
+                if (n == 0 || last > 64 || n > last || !resolve(w1, a)) break;
+                for (uint32_t k = 0; k < n; ++k) {
+                    Vert& v = verts[last - n + k];
+                    const uint32_t va = a + k * 16;
+                    const uint32_t xy = rd32(rdram, va), zf = rd32(rdram, va + 4), st = rd32(rdram, va + 8);
+                    v.p[0] = int16_t(xy >> 16); v.p[1] = int16_t(xy); v.p[2] = int16_t(zf >> 16);
+                    v.st[0] = int16_t(st >> 16) * scale[0] / 32.0f;
+                    v.st[1] = int16_t(st) * scale[1] / 32.0f;
+                }
+                break;
+            }
+            case 0x05:
+                triangle(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
+                break;
+            case 0x06: case 0x07:
+                triangle(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
+                triangle(((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
+                break;
+            case 0xD7:
+                tex_on = ((w0 >> 1) & 0x7F) != 0;
+                render_tile = (w0 >> 8) & 7;
+                scale[0] = ((w1 >> 16) & 0xFFFF) / 65536.0f;
+                scale[1] = (w1 & 0xFFFF) / 65536.0f;
+                break;
+            case 0xDB:
+                if (((w0 >> 16) & 0xFF) == 0x06) {
+                    const uint32_t s = ((w0 & 0xFFFF) / 4) & 0x0F;
+                    seg[s] = w1; seg_known[s] = true;
+                    if (s == 1) ++group; // each model points segment 1 at its vertices
+                }
+                break;
+            case 0xDE: {
+                uint32_t a;
+                if (depth < 8 && resolve(w1, a)) walk(a, a + 8 * 4096, depth + 1);
+                if (((w0 >> 16) & 0xFF) == 0x01) return; // branch: no return here
+                break;
+            }
+            case 0xDF:
+                if (depth > 0) return;
+                break;
+            case 0xFD:
+                if (!resolve(w1, img_addr)) img_addr = 0;
+                img_siz = (w0 >> 19) & 3;
+                img_width = (w0 & 0xFFF) + 1;
+                break;
+            case 0xF5: {
+                Tile& t = tiles[(w1 >> 24) & 7];
+                t.fmt = (w0 >> 21) & 7; t.siz = (w0 >> 19) & 3;
+                t.line = (w0 >> 9) & 0x1FF; t.tmem = w0 & 0x1FF;
+                t.cmt = (w1 >> 18) & 3; t.cms = (w1 >> 8) & 3;
+                break;
+            }
+            case 0xF2: {
+                Tile& t = tiles[(w1 >> 24) & 7];
+                t.uls = ((w0 >> 12) & 0xFFF) >> 2; t.ult = (w0 & 0xFFF) >> 2;
+                t.lrs = ((w1 >> 12) & 0xFFF) >> 2; t.lrt = (w1 & 0xFFF) >> 2;
+                t.sized = true;
+                break;
+            }
+            case 0xF3: case 0xF4: {
+                const Tile& t = tiles[(w1 >> 24) & 7];
+                Load nl{t.tmem, img_addr, 0, img_addr != 0};
+                if ((w0 >> 24) == 0xF4) {
+                    const uint32_t bpp = img_siz == 3 ? 4U : (img_siz == 2 ? 2U : 1U);
+                    nl.stride = img_width * bpp;
+                    nl.addr += (((w0 & 0xFFF) >> 2) * nl.stride) + (((w0 >> 12) & 0xFFF) >> 2) * bpp;
+                }
+                // One record per TMEM address, newest wins.
+                bool placed = false;
+                for (Load& c : loads) {
+                    if (c.valid && c.tmem == nl.tmem) { c = nl; placed = true; break; }
+                }
+                if (!placed) {
+                    std::memmove(&loads[1], &loads[0], sizeof(Load) * 3);
+                    loads[0] = nl;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+    }
+};
+
+bool same_point(const int16_t a[3], const int16_t b[3]) { return a[0] == b[0] && a[1] == b[1] && a[2] == b[2]; }
+
+// Opposite sides of the shared edge p0-p1: the components of each third vertex
+// perpendicular to the edge point away from each other.
+bool opposite_sides(const Edge& a, const Edge& b) {
+    float e[3], na[3], nb[3];
+    for (int i = 0; i < 3; ++i) e[i] = float(a.p[1][i] - a.p[0][i]);
+    const float ee = e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+    if (ee <= 0.0f) return false;
+    float da = 0, db = 0;
+    for (int i = 0; i < 3; ++i) { na[i] = float(a.opp[i] - a.p[0][i]); nb[i] = float(b.opp[i] - a.p[0][i]); da += na[i] * e[i]; db += nb[i] * e[i]; }
+    float dot = 0;
+    for (int i = 0; i < 3; ++i) { na[i] -= e[i] * da / ee; nb[i] -= e[i] * db / ee; dot += na[i] * nb[i]; }
+    return dot < 0.0f;
+}
+
+struct State {
+    uint32_t sample_addr[4] = {};
+    uint8_t sample_value[4] = {};
+    uint32_t key = 0;
+    bool have = false;
+};
+State g_state;
+
+void process(uint8_t* rdram, uint32_t dl_start, uint32_t dl_end, int log) {
+    const auto t0 = std::chrono::steady_clock::now();
+    Walker w;
+    w.rdram = rdram;
+    w.edges.reserve(512);
+    w.walk(dl_start, dl_end, 0);
+    const std::vector<Edge>& edges = w.edges;
+
+    // Pair edges that share both endpoints.
+    // One slot per border texel touched; a flat open-addressed table keeps
+    // this allocation-free after the first sky (it runs on the game thread).
+    struct Slot { uint32_t addr; Tex tex; float own[4]; float sum[4]; uint32_t n; uint32_t seen[6]; };
+    static std::vector<Slot> slots;
+    static std::vector<uint32_t> table_key;
+    static std::vector<uint32_t> table_val;
+    constexpr uint32_t kTable = 1U << 14;
+    slots.clear();
+    table_key.assign(kTable, 0U);
+    table_val.resize(kTable);
+    auto slot_for = [&](uint32_t addr, const Tex& t) -> size_t {
+        uint32_t h = (addr * 2654435761U) >> 18;
+        for (;; h = (h + 1U) & (kTable - 1U)) {
+            if (table_key[h] == addr) return table_val[h];
+            if (table_key[h] == 0U) break;
+        }
+        if (slots.size() >= kTable / 2) return SIZE_MAX;
+        Slot s{addr, t, {}, {}, 0, {}};
+        read_texel(rdram, addr, t, s.own);
+        slots.push_back(s);
+        table_key[h] = addr;
+        table_val[h] = uint32_t(slots.size() - 1);
+        return slots.size() - 1;
+    };
+    uint32_t accepted = 0, rejected = 0, skipped = 0;
+    for (size_t i = 0; i < edges.size(); ++i) {
+        for (size_t j = i + 1; j < edges.size(); ++j) {
+            const Edge& a = edges[i];
+            const Edge& b = edges[j];
+            if (a.group != b.group) continue;
+            bool forward;
+            if (same_point(a.p[0], b.p[0]) && same_point(a.p[1], b.p[1])) forward = true;
+            else if (same_point(a.p[0], b.p[1]) && same_point(a.p[1], b.p[0])) forward = false;
+            else continue;
+            if (a.tex.addr == b.tex.addr && a.axis == b.axis && a.side == b.side) continue;
+            if (!opposite_sides(a, b)) { ++skipped; continue; }
+            const float a0 = a.along[0], a1 = a.along[1];
+            const float b0 = forward ? b.along[0] : b.along[1];
+            const float b1 = forward ? b.along[1] : b.along[0];
+            if (std::fabs(a1 - a0) < 1.0f) continue;
+            // Map A's border texels onto B's.
+            std::pair<int, int> map[256];
+            size_t mapped = 0;
+            float diff = 0, grad = 0;
+            const int la = border_len(a), lb = border_len(b);
+            for (int k = 0; k < la; ++k) {
+                if (k < std::min(a0, a1) - 0.01f || k > std::max(a0, a1) + 0.01f) continue;
+                const float u = (k - a0) / (a1 - a0);
+                const int m = std::clamp(int(std::lround(b0 + u * (b1 - b0))), 0, lb - 1);
+                float va[4], vb[4], ia[4], ib[4];
+                read_texel(rdram, border_addr(a, k, 0), a.tex, va);
+                read_texel(rdram, border_addr(b, m, 0), b.tex, vb);
+                read_texel(rdram, border_addr(a, k, 1), a.tex, ia);
+                read_texel(rdram, border_addr(b, m, 1), b.tex, ib);
+                for (int c = 0; c < 3; ++c) {
+                    diff += std::fabs(va[c] - vb[c]) / 3.0f;
+                    grad += (std::fabs(va[c] - ia[c]) + std::fabs(vb[c] - ib[c])) / 6.0f;
+                }
+                if (mapped < 256) map[mapped++] = {k, m};
+            }
+            if (mapped < 2) continue;
+            diff /= float(mapped);
+            grad /= float(mapped);
+            const bool ok = diff <= 2.0f * grad + 3.0f;
+            if (log >= 2) {
+                std::fprintf(stderr, "[skyseam] pair %08X/%d%d %08X/%d%d texels=%zu diff=%.1f grad=%.1f %s\n",
+                             a.tex.addr, a.axis, a.side, b.tex.addr, b.axis, b.side, mapped, diff, grad,
+                             ok ? "blend" : "REJECT");
+            }
+            if (!ok) { ++rejected; continue; }
+            ++accepted;
+            for (size_t q = 0; q < mapped; ++q) {
+                const auto [k, m] = map[q];
+                const uint32_t aa = border_addr(a, k, 0), ba = border_addr(b, m, 0);
+                const size_t ia = slot_for(aa, a.tex);
+                const size_t ib = slot_for(ba, b.tex);
+                if (ia == SIZE_MAX || ib == SIZE_MAX) continue;
+                // Each distinct partner counts once, however many seams name it.
+                for (int dir = 0; dir < 2; ++dir) {
+                    Slot& self = slots[dir ? ib : ia];
+                    const Slot& other = slots[dir ? ia : ib];
+                    if (std::find(self.seen, self.seen + std::min<uint32_t>(self.n, 6U), other.addr) !=
+                        self.seen + std::min<uint32_t>(self.n, 6U) || self.n >= 6U) continue;
+                    self.seen[self.n] = other.addr;
+                    for (int c = 0; c < 4; ++c) self.sum[c] += other.own[c];
+                    ++self.n;
+                }
+            }
+        }
+    }
+    uint32_t written = 0;
+    for (Slot& s : slots) {
+        if (s.n == 0) continue;
+        float v[4];
+        for (int c = 0; c < 4; ++c) v[c] = (s.own[c] + s.sum[c]) / float(1 + s.n);
+        write_texel(rdram, s.addr, s.tex, v);
+        ++written;
+    }
+    g_state.have = written != 0;
+    for (int k = 0; k < 4 && written != 0; ++k) {
+        g_state.sample_addr[k] = slots[(slots.size() - 1) * size_t(k) / 3].addr;
+        g_state.sample_value[k] = rd8(rdram, g_state.sample_addr[k]);
+    }
+    if (log) {
+        std::fprintf(stderr, "[skyseam] dl=%08X-%08X cmds=%u models=%u border-edges=%zu pairs blended=%u rejected=%u "
+                     "same-side=%u texels=%u us=%.0f\n", dl_start, dl_end, w.commands, w.group, edges.size(), accepted,
+                     rejected, skipped, written,
+                     std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        std::fflush(stderr);
+    }
+}
+
+uint32_t g_dl_cursor_ptr = 0;
+uint32_t g_dl_start = 0;
+
+void on_sky_entry(uint8_t* rdram, recomp_context* ctx) {
+    (void)rdram;
+    g_dl_cursor_ptr = static_cast<uint32_t>(ctx->r4);
+    g_dl_start = 0;
+    if ((g_dl_cursor_ptr >> 24) == 0x80) g_dl_start = static_cast<uint32_t>(MEM_W(0, ctx->r4));
+}
+
+void on_sky_exit(uint8_t* rdram, recomp_context* ctx) {
+    (void)ctx;
+    const int mode = env_mode();
+    if (mode < 0 || g_enabled.load(std::memory_order_relaxed) == 0 || g_dl_start == 0) return;
+    const uint32_t end = rd32(rdram, g_dl_cursor_ptr);
+    if ((end >> 24) != 0x80 || end <= g_dl_start || end - g_dl_start > 0x10000) return;
+    // Key: the model and texture addresses the sky draw emitted (its segment
+    // commands) and the parts of the model it called. A new sky, or the same one
+    // reloaded elsewhere, is redone -- and so is a new view of the same one, since
+    // the model renderer only emits the segments in view, and a seam can only be
+    // paired while both of its sides are drawn. Re-blending a blended seam
+    // changes nothing (both sides already hold the average).
+    uint32_t key = 2166136261U;
+    for (uint32_t pc = g_dl_start; pc < end; pc += 8) {
+        const uint32_t w0 = rd32(rdram, pc);
+        if ((w0 >> 24) == 0xDB || (w0 >> 24) == 0xDE) key = (key ^ rd32(rdram, pc + 4)) * 16777619U;
+    }
+    if (g_state.key == key) {
+        // Reloaded in place: what was written is gone, so do it again.
+        bool intact = true;
+        for (int k = 0; k < 4 && g_state.have; ++k) {
+            intact = intact && rd8(rdram, g_state.sample_addr[k]) == g_state.sample_value[k];
+        }
+        if (intact) return;
+    }
+    g_state.key = key;
+    process(rdram, g_dl_start, end, mode >= 2 ? mode - 1 : 0);
+}
+
+} // namespace sky_seams
+
+extern "C" std::atomic<uint32_t>* tooie_sky_seams_flag() { return &sky_seams::g_enabled; }
+
 // func_800BFD6C is Tooie's sky draw (`sky_draw`'s analogue: it sets near/far to
 // 5..15000, fills the screen, loads its own projection via func_800E44FC, then
 // draws up to three sky layers through the shared model renderer). Stage 1 runs
@@ -2116,8 +2779,13 @@ extern "C" void tooie_rt64_pop_player_bone(uint8_t* rdram,
 // and the normal path reach, so the flag can never be left set.
 extern "C" void tooie_rt64_sky_scope(uint8_t* rdram, recomp_context* ctx,
                                      uint32_t stage) {
-    (void)rdram;
-    (void)ctx;
+    // Seam blending is independent of RT64 tagging (BT_RT64_SKY=off etc.).
+    if (stage == 1U) {
+        sky_seams::on_sky_entry(rdram, ctx);
+    }
+    else {
+        sky_seams::on_sky_exit(rdram, ctx);
+    }
     if (rt64_disabled() || rt64_sky_off()) {
         return;
     }

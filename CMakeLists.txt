@@ -108,6 +108,7 @@ set(SOURCES
     ${CMAKE_SOURCE_DIR}/src/recomp_api.cpp
     ${CMAKE_SOURCE_DIR}/src/register_overlays.cpp
     ${CMAKE_SOURCE_DIR}/src/rom_decompression.cpp
+    ${CMAKE_SOURCE_DIR}/src/test_harness.cpp
     ${CMAKE_SOURCE_DIR}/rsp/n_aspMain.cpp
     # Banjo-Tooie is a CIC-NUS-6105 cartridge: the PIF challenge/response
     # protection is checked at runtime, so the SI DMA path needs the same

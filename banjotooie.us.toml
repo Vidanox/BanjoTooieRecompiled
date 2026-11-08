@@ -328,6 +328,16 @@ func = "func_800C2AB8"
 before_vram = 0x800C2B50
 text = "tooie_yield_pending_sound(rdram, ctx);"
 
+# Gives the cooperative scheduler a preemption point in the new-game intro's
+# busy-wait for its next music cue (`osGetCount` polled until the scene's cue
+# time). On hardware the audio thread preempts it and the score keeps playing;
+# without this it is starved for the whole wait and the music falls ~34 s
+# behind the pictures by the end of the intro (AGENTS.md 6.9).
+[[patches.hook]]
+func = "glintrosyncDll_entrypoint_1"
+before_vram = 0x808002BC
+text = "tooie_yield_intro_sync(rdram, ctx);"
+
 # TEMPORARY diagnostic: chanim_entrypoint_7 is entered with a0 = NULL although
 # the syscall site that dispatches it had a0 = 0x801DD74C.
 [[patches.hook]]
