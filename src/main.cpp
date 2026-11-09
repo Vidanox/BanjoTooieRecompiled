@@ -535,8 +535,12 @@ std::vector<recomp::GameEntry> supported_games = {
 
 // RT64's switch for vertex smoothing (lib/rt64 rt64_game_frame.cpp).
 extern "C" std::atomic<uint32_t> g_bt_rt64_vertex_smooth;
+// RT64's switch for the improved shadows (lib/rt64 rt64_state.cpp).
+extern "C" std::atomic<uint32_t> g_bt_rt64_improved_shadows;
 // The sky seam blending switch (recomp_api.cpp, sky_seams, AGENTS.md §7.9).
 extern "C" std::atomic<uint32_t>* tooie_sky_seams_flag();
+// The texture seam blending switch (recomp_api.cpp, texseam, AGENTS.md §7.14).
+extern "C" std::atomic<uint32_t>* tooie_tex_seams_flag();
 // The hold-Start-to-skip switch (cutscene_skip.cpp, AGENTS.md §7.15).
 extern "C" std::atomic<uint32_t>* tooie_hold_skip_flag();
 // The any-button-to-file-select switch (cutscene_skip.cpp, AGENTS.md §7.16).
@@ -615,6 +619,36 @@ void initialize_config() {
            recomp::config::OptionChangeContext) {
             if (const bool* on = std::get_if<bool>(&cur_value)) {
                 tooie_sky_seams_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    // Port option: the same blending for the world and for character models,
+    // done once per piece of geometry (AGENTS.md §7.14).
+    graphics.add_bool_option(
+        "bt_tex_seams",
+        "Blend Texture Seams",
+        "Hides the seams where the square tiles a picture is cut into meet on the world and on characters, "
+        "the same way Blend Sky Seams does for the sky. Turning this off takes effect at the next area load.",
+        true);
+    graphics.add_option_change_callback("bt_tex_seams",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_tex_seams_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    // Port option: character shadows drawn whole on any ground and eased between
+    // lights (RT64 rt64_state.cpp btImproveShadows + the composite pass, AGENTS.md §7.13).
+    graphics.add_bool_option(
+        "bt_improved_shadows",
+        "Improved Shadows",
+        "Draws character shadows whole on stairs, ledges, slopes and uneven floors, where the original cuts "
+        "them along the ground's edges, and eases them between lights instead of snapping.",
+        true);
+    graphics.add_option_change_callback("bt_improved_shadows",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                g_bt_rt64_improved_shadows.store(*on ? 1U : 0U, std::memory_order_relaxed);
             }
         });
     recompui::config::create_controls_tab();

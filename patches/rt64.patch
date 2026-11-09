@@ -1,3 +1,15 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 79dfc38..2d1aa1a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -542,6 +542,7 @@ build_pixel_shader(  rt64 "src/shaders/RtCopyDepthToColorPS.hlsl" "src/shaders/R
+ build_pixel_shader(  rt64 "src/shaders/RtCopyDepthToColorPS.hlsl" "src/shaders/RtCopyDepthToColor4XPS.hlsl" "-D SAMPLES_4X")
+ build_pixel_shader(  rt64 "src/shaders/RtCopyDepthToColorPS.hlsl" "src/shaders/RtCopyDepthToColor8XPS.hlsl" "-D SAMPLES_8X")
+ build_pixel_shader(  rt64 "src/shaders/TextureCopyPS.hlsl")
++build_pixel_shader(  rt64 "src/shaders/ShadowCompositePS.hlsl")
+ build_compute_shader(rt64 "src/shaders/TextureDecodeCS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/TextureResolveSamples2XPS.hlsl" "-D SAMPLES_2X")
+ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/TextureResolveSamples4XPS.hlsl" "-D SAMPLES_4X")
 diff --git a/src/common/rt64_math.cpp b/src/common/rt64_math.cpp
 index c20fb51..38d33ad 100644
 --- a/src/common/rt64_math.cpp
@@ -144,6 +156,20 @@ index ee8bc1f..108064a 100644
          // Before configuring multisampling, make sure the device actually supports it for the formats we'll use. If it doesn't, turn off antialiasing in the configuration.
          const RenderSampleCounts colorSampleCounts = device->getSampleCountsSupported(RenderTarget::colorBufferFormat(usesHDR));
          const RenderSampleCounts depthSampleCounts = device->getSampleCountsSupported(RenderTarget::depthBufferFormat());
+diff --git a/src/hle/rt64_game_call.h b/src/hle/rt64_game_call.h
+index 038eace..b410f7f 100644
+--- a/src/hle/rt64_game_call.h
++++ b/src/hle/rt64_game_call.h
+@@ -17,6 +17,9 @@ namespace RT64 {
+         DrawCall callDesc;
+         ShaderDescription shaderDesc;
+ 
++        // Banjo-Tooie "Improved Shadows": a shadow composite strip the full-screen pass replaces (not drawn).
++        bool btSkip = false;
++
+         struct {
+             // Only applies to raw triangle geometry from LLE triangle commands.
+             uint32_t rawVertexStart;
 diff --git a/src/hle/rt64_game_frame.cpp b/src/hle/rt64_game_frame.cpp
 index 87392d0..62a18a0 100644
 --- a/src/hle/rt64_game_frame.cpp
@@ -1886,6 +1912,399 @@ index 1da2550..0595393 100644
              if (!drawRect.isNull()) {
                  fbPair.drawColorRect.merge(drawRect);
                  if (otherModeStack[otherModeStackSize - 1].zUpd()) {
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index 2970e71..7a89f44 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -4,8 +4,12 @@
+ 
+ #include "rt64_state.h"
+ 
++#include <algorithm>
++#include <atomic>
+ #include <cassert>
++#include <chrono>
+ #include <cinttypes>
++#include <cmath>
+ 
+ #include "im3d/im3d.h"
+ #include "im3d/im3d_math.h"
+@@ -27,6 +31,10 @@
+ #define MI_INTR_DP          0x00000020
+ #define MI_INTR_SP          0x00000001
+ 
++// The "Improved Shadows" graphics option (State::btImproveShadows), written by the game side when the option
++// loads or changes; 1 = on, the default.
++extern "C" { std::atomic<uint32_t> g_bt_rt64_improved_shadows{1}; }
++
+ namespace RT64 {
+     const float ShiftScaleMap[] = {
+         1.0f,
+@@ -1775,6 +1783,7 @@ namespace RT64 {
+         }
+         
+         // Advance the workload queue at the end of a full synchronization.
++        btImproveShadows(workload);
+         advanceWorkload(workload, false);
+         ext.workloadQueue->advanceToNextWorkload();
+ 
+@@ -2654,6 +2663,344 @@ namespace RT64 {
+         }
+     }
+ 
++    // Banjo-Tooie "Improved Shadows" (AGENTS.md 7.13). The game draws each caster black into an offscreen
++    // buffer through VP_s = F * VP_m -- F an affine map from the caster's model space onto a horizontal plane:
++    // rows 0/2 its horizontal axes, row 1 the light's shear per unit of height, row 3 (x, plane_y, z) -- as a
++    // ZMODE_DEC decal against the scene's depth, then composites strips of that buffer over a bounding box of its
++    // own. Here: the decal test becomes a bounded depth window around the plane (complete on stairs, seams and
++    // uneven floors), F is eased per caster (no snaps between lights or step heights), and the strips are
++    // replaced by one full-screen composite so the result does not depend on the game's box.
++    namespace {
++        struct BtShadowCaster {
++            float x = 0.0f;
++            float z = 0.0f;
++            // The eased part of F: the light's shear (row 1), the plane's tilt (the world-y terms of rows 0 and 2),
++            // its height, and the light's stretch of the model's horizontal axes.
++            float shear[3] = {};
++            float tilt[2] = {};
++            float planeY = 0.0f;
++            float scale[2][2] = { { 1.0f, 0.0f }, { 0.0f, 1.0f } };
++            float age = 0.0f;
++            bool seen = false;
++            bool initialized = false;
++        };
++
++        struct BtShadowState {
++            std::vector<BtShadowCaster> casters;
++            std::chrono::steady_clock::time_point last;
++            bool haveLast = false;
++            // The composite's darkness, eased too: the game draws a lamp's shadow at 0.2 and the overhead one at 0.5.
++            float darkness = 0.0f;
++            float darknessAge = 0.0f;
++            bool haveDarkness = false;
++        };
++
++        BtShadowState &btShadowState() {
++            static BtShadowState state;
++            return state;
++        }
++
++        // BT_RT64_SHADOWS=off forces the improvement off for A/B (overriding the graphics option); =log prints
++        // one [shadow] line per caster per game frame; =ab applies only the depth window, on every other game frame
++        // (no easing), so consecutive frames of one run differ by the window alone.
++        int btShadowMode() {
++            static const int mode = []() {
++                const char *env = std::getenv("BT_RT64_SHADOWS");
++                if (env == nullptr) {
++                    return 1;
++                }
++
++                if ((env[0] == 'o') && (env[1] == 'f')) {
++                    return 0;
++                }
++
++                if ((env[0] == 'a') && (env[1] == 'b')) {
++                    return 3;
++                }
++
++                return (env[0] == 'l') ? 2 : 1;
++            }();
++            return mode;
++        }
++
++        // The window of linear view depth around the shadow's plane that may receive it: up to this far behind
++        // the plane (a lower step, the floor under water), a quarter of it in front (a step up, a wall's foot).
++        constexpr float BtShadowDepthWindow = 200.0f;
++
++        // How quickly an eased shadow follows the game's, in seconds.
++        constexpr float BtShadowEaseTime = 0.12f;
++
++        bool btIsShadowDecal(const GameCall &call) {
++            const uint32_t L = call.shaderDesc.otherMode.L;
++            return (((L >> 10) & 3U) == 3U) && ((L & 0x10U) != 0U) && ((L & 0x20U) == 0U);
++        }
++
++        bool btIsShadowComposite(const Workload &workload, const GameCall &call) {
++            if ((call.shaderDesc.colorCombiner.L != 0xFCFFE7FFU) || (call.shaderDesc.colorCombiner.H != 0xFFCF9FCFU)) {
++                return false;
++            }
++
++            for (uint32_t t = 0; t < call.callDesc.tileCount; t++) {
++                if (workload.drawData.callTiles[call.callDesc.tileIndex + t].tileCopyUsed) {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++    }
++
++    void State::btImproveShadows(Workload &workload) {
++        workload.btShadow.compositePair = -1;
++        workload.btShadow.shadowPair = -1;
++        if ((btShadowMode() == 0) || (g_bt_rt64_improved_shadows.load(std::memory_order_relaxed) == 0U)) {
++            return;
++        }
++
++        BtShadowState &state = btShadowState();
++        const auto now = std::chrono::steady_clock::now();
++        float dt = state.haveLast ? std::chrono::duration<float>(now - state.last).count() : 1.0f;
++        dt = std::clamp(dt, 1.0f / 120.0f, 0.25f);
++        state.last = now;
++        state.haveLast = true;
++        const float ease = 1.0f - std::exp(-dt / BtShadowEaseTime);
++        for (BtShadowCaster &caster : state.casters) {
++            caster.seen = false;
++            caster.age += dt;
++        }
++
++        DrawData &drawData = workload.drawData;
++        for (uint32_t s = 1; (s + 1) < workload.fbPairCount; s++) {
++            FramebufferPair &shadowPair = workload.fbPairs[s];
++            if (!shadowPair.depthRead || shadowPair.depthWrite) {
++                continue;
++            }
++
++            // The main pair: the last earlier one writing the same depth image into another colour image.
++            int32_t m = -1;
++            for (int32_t f = int32_t(s) - 1; f >= 0; f--) {
++                const FramebufferPair &fbPair = workload.fbPairs[f];
++                if (fbPair.depthWrite && (fbPair.depthImage.address == shadowPair.depthImage.address) && (fbPair.colorImage.address != shadowPair.colorImage.address)) {
++                    m = f;
++                    break;
++                }
++            }
++
++            if (m < 0) {
++                continue;
++            }
++
++            // The composite pair: the next one, back on the main colour image, opening with the composite strips.
++            const uint32_t c = s + 1;
++            FramebufferPair &compositePair = workload.fbPairs[c];
++            const FramebufferPair &mainPair = workload.fbPairs[m];
++            if ((compositePair.colorImage.address != mainPair.colorImage.address) || (compositePair.projectionCount == 0)) {
++                continue;
++            }
++
++            Projection &compositeProj = compositePair.projections[0];
++            bool compositeFound = (compositeProj.type == Projection::Type::Rectangle) && (compositeProj.gameCallCount > 0);
++            float darkness = 0.0f;
++            for (uint32_t d = 0; compositeFound && (d < compositeProj.gameCallCount); d++) {
++                const GameCall &call = compositeProj.gameCalls[d];
++                if (btIsShadowComposite(workload, call)) {
++                    darkness = std::max(darkness, drawData.rdpParams[call.callDesc.callIndex].primColor.w);
++                }
++            }
++
++            compositeFound = compositeFound && (darkness > 0.0f);
++
++            // The camera: the main pair's perspective projection with the most triangles.
++            int32_t mainTi = -1;
++            uint32_t mainTris = 0;
++            for (uint32_t p = 0; p < mainPair.projectionCount; p++) {
++                const Projection &proj = mainPair.projections[p];
++                if (proj.type != Projection::Type::Perspective) {
++                    continue;
++                }
++
++                uint32_t tris = 0;
++                for (uint32_t d = 0; d < proj.gameCallCount; d++) {
++                    tris += proj.gameCalls[d].callDesc.triangleCount;
++                }
++
++                if (tris >= mainTris) {
++                    mainTris = tris;
++                    mainTi = int32_t(proj.transformsIndex);
++                }
++            }
++
++            if (mainTi < 0) {
++                continue;
++            }
++
++            const interop::float4x4 mainViewProj = drawData.viewProjTransforms[mainTi];
++            const hlslpp::float4x4 mainInverse = hlslpp::inverse(hlslpp::float4x4(mainViewProj));
++
++            // Linear depth: clip z = alpha * clip w + beta for any perspective camera.
++            float zDotW = 0.0f, wDotW = 0.0f;
++            for (int i = 0; i < 3; i++) {
++                zDotW += mainViewProj[i][2] * mainViewProj[i][3];
++                wDotW += mainViewProj[i][3] * mainViewProj[i][3];
++            }
++
++            if (!(wDotW > 0.0f)) {
++                continue;
++            }
++
++            const float depthAlpha = zDotW / wDotW;
++            const float depthBeta = mainViewProj[3][2] - depthAlpha * mainViewProj[3][3];
++
++            bool shadowFound = false;
++            for (uint32_t p = 0; p < shadowPair.projectionCount; p++) {
++                Projection &proj = shadowPair.projections[p];
++                if ((proj.type != Projection::Type::Perspective) || (proj.gameCallCount == 0)) {
++                    continue;
++                }
++
++                bool allDecal = true;
++                for (uint32_t d = 0; d < proj.gameCallCount; d++) {
++                    allDecal = allDecal && btIsShadowDecal(proj.gameCalls[d]);
++                }
++
++                if (!allDecal) {
++                    continue;
++                }
++
++                shadowFound = true;
++                static uint32_t abFrame = 0;
++                const bool abWindow = (btShadowMode() != 3) || ((abFrame++ & 1U) == 0U);
++
++                // The bounded depth window, read by RasterPS's decal test (keyScale.x < 0 marks it; the chroma key
++                // these fields normally carry is off for these draws).
++                const interop::RSPViewport &viewport = drawData.rspViewports[proj.transformsIndex];
++                for (uint32_t d = 0; abWindow && (d < proj.gameCallCount); d++) {
++                    interop::RDPParams &rdpParams = drawData.rdpParams[proj.gameCalls[d].callDesc.callIndex];
++                    rdpParams.keyCenter = { depthAlpha, depthBeta, viewport.scale.z };
++                    rdpParams.keyScale = { -1.0f, viewport.translate.z, BtShadowDepthWindow };
++                }
++
++                // Easing F needs the full-screen composite: an eased silhouette may leave the game's own box.
++                if (!compositeFound || (btShadowMode() == 3)) {
++                    continue;
++                }
++
++                const uint32_t ti = proj.transformsIndex;
++                const hlslpp::float4x4 shadowViewProj(drawData.viewProjTransforms[ti]);
++                hlslpp::float4x4 F = hlslpp::mul(shadowViewProj, mainInverse);
++                // F must be affine (a tilted plane is fine: it shows as world-y terms in rows 0 and 2).
++                const bool affine = (std::abs(F[0][3]) < 1e-4f) && (std::abs(F[1][3]) < 1e-4f) && (std::abs(F[2][3]) < 1e-4f) && (std::abs(F[3][3] - 1.0f) < 1e-3f);
++                if (!affine) {
++                    if (btShadowMode() == 2) {
++                        fprintf(stderr, "[shadow] wl=%llu ti=%u not affine\n", (unsigned long long)(workloadId + 1), ti);
++                    }
++
++                    continue;
++                }
++
++                // Polar split of the in-plane axes, A = R * P (row vectors: model axes are rotated, then stretched in
++                // world space): the rotation (the caster's facing) is kept as is so it never lags a turn; the stretch
++                // (the light's, in the world frame) is eased.
++                const float a00 = F[0][0], a01 = F[0][2], a10 = F[2][0], a11 = F[2][2];
++                const float angle = std::atan2(a01 - a10, a00 + a11);
++                const float cs = std::cos(angle), sn = std::sin(angle);
++                // R = [[c, s], [-s, c]]; P = R^T * A.
++                const float s00 = cs * a00 - sn * a10, s01 = cs * a01 - sn * a11;
++                const float s10 = sn * a00 + cs * a10, s11 = sn * a01 + cs * a11;
++                const float x = F[3][0], z = F[3][2];
++
++                BtShadowCaster *match = nullptr;
++                float bestDistance = 250.0f * 250.0f;
++                for (BtShadowCaster &caster : state.casters) {
++                    const float dx = caster.x - x, dz = caster.z - z;
++                    const float distance = dx * dx + dz * dz;
++                    if (!caster.seen && (distance < bestDistance)) {
++                        bestDistance = distance;
++                        match = &caster;
++                    }
++                }
++
++                const float shearX = F[1][0], shearZ = F[1][2], planeY = F[3][1];
++                const float current[10] = { F[1][0], F[1][1], F[1][2], F[0][1], F[2][1], planeY, s00, s01, s10, s11 };
++                if (match == nullptr) {
++                    state.casters.emplace_back();
++                    match = &state.casters.back();
++                }
++
++                float *easedParts[10] = { &match->shear[0], &match->shear[1], &match->shear[2], &match->tilt[0], &match->tilt[1], &match->planeY,
++                    &match->scale[0][0], &match->scale[0][1], &match->scale[1][0], &match->scale[1][1] };
++                const bool fresh = !match->initialized;
++                match->initialized = true;
++                for (int k = 0; k < 10; k++) {
++                    *easedParts[k] = fresh ? current[k] : (*easedParts[k] + (current[k] - *easedParts[k]) * ease);
++                }
++
++                match->x = x;
++                match->z = z;
++                match->age = 0.0f;
++                match->seen = true;
++
++                // Recompose A' = R * P' and F', and draw the caster through F' * VP_m.
++                const float (&S)[2][2] = match->scale;
++                F[0][0] = cs * S[0][0] + sn * S[1][0];
++                F[0][2] = cs * S[0][1] + sn * S[1][1];
++                F[2][0] = -sn * S[0][0] + cs * S[1][0];
++                F[2][2] = -sn * S[0][1] + cs * S[1][1];
++                F[1][0] = match->shear[0];
++                F[1][1] = match->shear[1];
++                F[1][2] = match->shear[2];
++                F[0][1] = match->tilt[0];
++                F[2][1] = match->tilt[1];
++                F[3][1] = match->planeY;
++                const hlslpp::float4x4 eased = hlslpp::mul(F, hlslpp::float4x4(mainViewProj));
++                drawData.viewProjTransforms[ti] = eased;
++                drawData.viewTransforms[ti] = hlslpp::float4x4::identity();
++                drawData.projTransforms[ti] = eased;
++
++                if (btShadowMode() == 2) {
++                    fprintf(stderr, "[shadow] wl=%llu ti=%u at=(%.1f %.1f) shear=(%.3f %.3f)->(%.3f %.3f) plane=%.1f->%.1f stretch=(%.3f %.3f %.3f %.3f) dark=%.2f\n",
++                        (unsigned long long)(workloadId + 1), ti, x, z, shearX, shearZ, match->shear[0], match->shear[2], planeY, match->planeY,
++                        S[0][0], S[0][1], S[1][0], S[1][1], darkness);
++                }
++            }
++
++            // Take the composite over: skip the game's strips; the full-screen pass draws the whole buffer.
++            if (shadowFound && compositeFound && (workload.btShadow.compositePair < 0)) {
++                for (uint32_t d = 0; d < compositeProj.gameCallCount; d++) {
++                    GameCall &call = compositeProj.gameCalls[d];
++                    call.btSkip = btIsShadowComposite(workload, call);
++                }
++
++                if (!state.haveDarkness || (dt >= 0.25f)) {
++                    state.darkness = darkness;
++                    state.haveDarkness = true;
++                }
++                else {
++                    state.darkness += (darkness - state.darkness) * ease;
++                }
++
++                workload.btShadow.compositePair = int32_t(c);
++                workload.btShadow.shadowPair = int32_t(s);
++                workload.btShadow.darkness = state.darkness;
++                workload.btShadow.coverage = (btShadowMode() == 3);
++            }
++        }
++
++        if (workload.btShadow.compositePair < 0) {
++            state.darknessAge += dt;
++            if (state.darknessAge > 0.5f) {
++                state.haveDarkness = false;
++            }
++        }
++        else {
++            state.darknessAge = 0.0f;
++        }
++
++        // Casters not seen this frame are forgotten.
++        // A caster the game stops drawing for a moment (a few frames on a ramp's edge) keeps its eased state.
++        state.casters.erase(std::remove_if(state.casters.begin(), state.casters.end(), [](const BtShadowCaster &caster) { return caster.age > 0.5f; }), state.casters.end());
++    }
++
+     void State::advanceWorkload(Workload &workload, bool paused) {
+         workload.workloadId = ++workloadId;
+         workload.presentId = presentId;
+diff --git a/src/hle/rt64_state.h b/src/hle/rt64_state.h
+index 7a8c13b..727ab48 100644
+--- a/src/hle/rt64_state.h
++++ b/src/hle/rt64_state.h
+@@ -152,6 +152,7 @@ namespace RT64 {
+         void updateMultisampling();
+         void inspect();
+         void advanceWorkload(Workload &workload, bool paused);
++        void btImproveShadows(Workload &workload);
+         void advancePresent(Present &present, bool paused);
+         void dpInterrupt();
+         void spInterrupt();
 diff --git a/src/hle/rt64_workload.cpp b/src/hle/rt64_workload.cpp
 index b4c85f5..458b7f8 100644
 --- a/src/hle/rt64_workload.cpp
@@ -1899,7 +2318,7 @@ index b4c85f5..458b7f8 100644
          drawData.viewportClipRatios.push_back(1);
          drawData.viewportClipRatios.push_back(-1);
 diff --git a/src/hle/rt64_workload.h b/src/hle/rt64_workload.h
-index 8ea27d5..b829b93 100644
+index 8ea27d5..74f4f04 100644
 --- a/src/hle/rt64_workload.h
 +++ b/src/hle/rt64_workload.h
 @@ -76,6 +76,9 @@ namespace RT64 {
@@ -1912,11 +2331,27 @@ index 8ea27d5..b829b93 100644
  
          uint32_t vertexCount() const {
              return uint32_t(worldIndices.size());
+@@ -235,6 +238,15 @@ namespace RT64 {
+         uint64_t presentId = 0;
+         bool paused = false;
+ 
++        // Banjo-Tooie "Improved Shadows" (State::btImproveShadows): the framebuffer pair whose shadow composite
++        // is replaced by one full-screen pass, the shadow buffer it reads and how dark it draws.
++        struct {
++            int32_t compositePair = -1;
++            int32_t shadowPair = -1;
++            float darkness = 0.0f;
++            bool coverage = false;
++        } btShadow;
++
+         struct {
+             uint32_t testZIndexCount = 0;
+             float ditherNoiseStrength = 1.0f;
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..e042f4c 100644
+index 5a331aa..086f589 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
-@@ -4,6 +4,14 @@
+@@ -4,9 +4,18 @@
  
  #include "rt64_workload_queue.h"
  
@@ -1931,7 +2366,11 @@ index 5a331aa..e042f4c 100644
  #include "common/rt64_thread.h"
  
  #include "rt64_present_queue.h"
-@@ -221,8 +229,10 @@ namespace RT64 {
++#include "shared/rt64_texture_copy.h"
+ 
+ #define ENABLE_HIGH_RESOLUTION_RENDERER 1
+ 
+@@ -221,8 +230,10 @@ namespace RT64 {
          case UserConfiguration::RefreshRate::Manual:
              workloadConfig.targetRate = ext.sharedResources->userConfig.refreshRateTarget;
  
@@ -1944,7 +2383,7 @@ index 5a331aa..e042f4c 100644
                  workloadConfig.targetRate = ext.sharedResources->swapChainRate;
              }
  
-@@ -507,7 +517,136 @@ namespace RT64 {
+@@ -507,7 +518,156 @@ namespace RT64 {
              resizedTargets.clear();
              colorDepthPairs.clear();
  
@@ -2002,6 +2441,12 @@ index 5a331aa..e042f4c 100644
 +                            std::fprintf(stderr, "[proj] wl=%llu fb=%u p=%u type=%d xf=%u id=%08X aspect=%u calls=%u tris=%u sc=(%d,%d,%d,%d)\n",
 +                                (unsigned long long)(workload.workloadId), f, p, int(proj.type), proj.transformsIndex, matrixId, aspect, proj.gameCallCount, tris,
 +                                proj.scissorRect.ulx / 4, proj.scissorRect.uly / 4, proj.scissorRect.lrx / 4, proj.scissorRect.lry / 4);
++                            if ((std::getenv("BT_RT64_CALLLOG_MTX") != nullptr) && (proj.transformsIndex < workload.drawData.viewProjTransforms.size())) {
++                                const interop::float4x4 &vp = workload.drawData.viewProjTransforms[proj.transformsIndex];
++                                std::fprintf(stderr, "[vp] wl=%llu fb=%u p=%u m=%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f,%.3f,%.3f\n",
++                                    (unsigned long long)(workload.workloadId), f, p, vp[0][0], vp[0][1], vp[0][2], vp[0][3], vp[1][0], vp[1][1], vp[1][2], vp[1][3],
++                                    vp[2][0], vp[2][1], vp[2][2], vp[2][3], vp[3][0], vp[3][1], vp[3][2], vp[3][3]);
++                            }
 +
 +                            // Perspective: where the triangles land on the CPU-side (4:3) screen -- on it, wholly off one
 +                            // side of it, or with a vertex behind the eye.
@@ -2043,6 +2488,17 @@ index 5a331aa..e042f4c 100644
 +                                        if (anyBehind && (outMask & 0x30)) cAllBehind++;
 +                                    }
 +
++                                    static const bool callLogMatrices = (std::getenv("BT_RT64_CALLLOG_MTX") != nullptr);
++                                    if (callLogMatrices && (gc.callDesc.triangleCount > 0) && (gc.callDesc.minWorldMatrix < workload.drawData.worldTransforms.size())) {
++                                        const uint32_t wi = gc.callDesc.minWorldMatrix;
++                                        const uint32_t wg = (wi < workload.drawData.worldTransformGroups.size()) ? workload.drawData.worldTransformGroups[wi] : 0U;
++                                        const uint32_t wid = (wg < workload.drawData.transformGroups.size()) ? workload.drawData.transformGroups[wg].matrixId : 0U;
++                                        const interop::float4x4 &m = workload.drawData.worldTransforms[wi];
++                                        std::fprintf(stderr, "[mtx] wl=%llu f=%u d=%u w=%u id=%08X tris=%u om=%08X m=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f\n",
++                                            (unsigned long long)(workload.workloadId), f, d, wi, wid, gc.callDesc.triangleCount, gc.shaderDesc.otherMode.L,
++                                            m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0], m[2][1], m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3]);
++                                    }
++
 +                                    if (((f == 1) || (f == 2)) && (gc.callDesc.triangleCount > 0)) {
 +                                        const interop::RDPParams &rdpP = workload.drawData.rdpParams[gc.callDesc.callIndex];
 +                                        std::fprintf(stderr, "[cc] wl=%llu f=%u d=%u tris=%u on=%u off=%u behind=%u zout=%u w=[%.1f,%.1f] mtx=%u-%u prim=%.2f,%.2f,%.2f,%.2f env=%.2f,%.2f,%.2f,%.2f om=%08X:%08X cc=%08X:%08X geo=%08X col=%.1f tex=%016llX:%d:%d n=%u\n", (unsigned long long)(workload.workloadId), f, d,
@@ -2069,9 +2525,12 @@ index 5a331aa..e042f4c 100644
 +                                }
 +
 +                                if ((proj.type == Projection::Type::Rectangle) || tileCopy) {
-+                                    std::fprintf(stderr, "[call] wl=%llu fb=%u p=%u d=%u rect=(%d,%d,%d,%d) cycle=%u fill=%08X tiles=%u copy=%d tris=%u\n",
++                                    std::fprintf(stderr, "[call] wl=%llu fb=%u p=%u d=%u rect=(%d,%d,%d,%d) cycle=%u fill=%08X tiles=%u copy=%d tris=%u om=%08X:%08X cc=%08X:%08X prim=%.2f,%.2f,%.2f,%.2f env=%.2f,%.2f,%.2f,%.2f\n",
 +                                        (unsigned long long)(workload.workloadId), f, p, d, dc.rect.ulx / 4, dc.rect.uly / 4, dc.rect.lrx / 4, dc.rect.lry / 4,
-+                                        (dc.otherMode.H >> 20) & 3U, dc.fillColor, dc.tileCount, tileCopy, dc.triangleCount);
++                                        (dc.otherMode.H >> 20) & 3U, dc.fillColor, dc.tileCount, tileCopy, dc.triangleCount,
++                                        proj.gameCalls[d].shaderDesc.otherMode.H, proj.gameCalls[d].shaderDesc.otherMode.L, proj.gameCalls[d].shaderDesc.colorCombiner.H, proj.gameCalls[d].shaderDesc.colorCombiner.L,
++                                        workload.drawData.rdpParams[dc.callIndex].primColor.x, workload.drawData.rdpParams[dc.callIndex].primColor.y, workload.drawData.rdpParams[dc.callIndex].primColor.z, workload.drawData.rdpParams[dc.callIndex].primColor.w,
++                                        workload.drawData.rdpParams[dc.callIndex].envColor.x, workload.drawData.rdpParams[dc.callIndex].envColor.y, workload.drawData.rdpParams[dc.callIndex].envColor.z, workload.drawData.rdpParams[dc.callIndex].envColor.w);
 +                                }
 +                            }
 +                        }
@@ -2082,7 +2541,7 @@ index 5a331aa..e042f4c 100644
              for (uint32_t f = 0; f < fbPairCount; f++) {
                  const FramebufferPair &fbPair = workload.fbPairs[f];
  #           if RT_ENABLED
-@@ -635,7 +774,8 @@ namespace RT64 {
+@@ -635,7 +795,8 @@ namespace RT64 {
                      drawParams.rtEnabled = workloadConfig.raytracingEnabled;
                      drawParams.submissionFrame = workload.submissionFrame;
                      drawParams.deltaTimeMs = deltaTimeMs;
@@ -2092,7 +2551,11 @@ index 5a331aa..e042f4c 100644
                      drawParams.postBlendNoise = workloadConfig.postBlendNoise;
                      drawParams.postBlendNoiseNegative = workloadConfig.postBlendNoiseNegative;
                      drawParams.maxGameCall = std::min(gameCallCountMax - gameCallCursor, fbPair.gameCallCount);
-@@ -709,6 +849,15 @@ namespace RT64 {
+@@ -706,9 +867,19 @@ namespace RT64 {
+             
+             // Record all framebuffer pairs.
+             uint32_t framebufferIndex = 0;
++            RenderTarget *btShadowTarget = nullptr;
              for (uint32_t f = 0; f < fbPairCount; f++) {
                  const FramebufferPair &fbPair = workload.fbPairs[f];
                  bool validTargets = getTargetsFromPair(f);
@@ -2108,7 +2571,54 @@ index 5a331aa..e042f4c 100644
                  fbManager.recordOperations(ext.workloadGraphicsWorker, &workload.fbChangePool, &workload.fbStorage, ext.shaderLibrary, ext.textureCache,
                      fbPair.startFbOperations, targetManager, fixedResScale, f, workload.submissionFrame);
  
-@@ -882,6 +1031,10 @@ namespace RT64 {
+@@ -789,8 +960,46 @@ namespace RT64 {
+                         }
+                     }
+                     
++                    // Banjo-Tooie "Improved Shadows" (State::btImproveShadows): the game's composite strips are skipped
++                    // and the whole shadow buffer is composited here instead, before anything else draws into the pair.
++                    if ((int32_t(f) == workload.btShadow.compositePair) && (btShadowTarget != nullptr) && (colorTarget != nullptr) &&
++                        (btShadowTarget != colorTarget) && !btShadowTarget->isEmpty() && !colorTarget->isEmpty())
++                    {
++                        RenderCommandList *commandList = ext.workloadGraphicsWorker->commandList.get();
++                        btShadowTarget->resolveTarget(ext.workloadGraphicsWorker, ext.shaderLibrary);
++                        if (btShadowTarget->textureCopyDescSet == nullptr) {
++                            btShadowTarget->textureCopyDescSet = std::make_unique<TextureCopyDescriptorSet>(ext.workloadGraphicsWorker->device);
++                            btShadowTarget->textureCopyDescSet->setTexture(btShadowTarget->textureCopyDescSet->gInput, btShadowTarget->getResolvedTexture(), RenderTextureLayout::SHADER_READ, btShadowTarget->getResolvedTextureView());
++                        }
++
++                        colorTarget->setupColorFramebuffer(ext.workloadGraphicsWorker);
++                        RenderTextureBarrier compositeBarriers[] = {
++                            RenderTextureBarrier(colorTarget->texture.get(), RenderTextureLayout::COLOR_WRITE),
++                            RenderTextureBarrier(btShadowTarget->getResolvedTexture(), RenderTextureLayout::SHADER_READ)
++                        };
++
++                        commandList->barriers(RenderBarrierStage::GRAPHICS, compositeBarriers, uint32_t(std::size(compositeBarriers)));
++                        commandList->setFramebuffer(colorTarget->textureFramebuffer.get());
++                        commandList->setViewports(RenderViewport(0.0f, 0.0f, float(colorTarget->width), float(colorTarget->height)));
++                        commandList->setScissors(RenderRect(0, 0, int32_t(colorTarget->width), int32_t(colorTarget->height)));
++                        commandList->setPipeline(ext.shaderLibrary->btShadowComposite.pipeline.get());
++                        commandList->setGraphicsPipelineLayout(ext.shaderLibrary->btShadowComposite.pipelineLayout.get());
++                        commandList->setGraphicsDescriptorSet(btShadowTarget->textureCopyDescSet->get(), 0);
++                        interop::TextureCopyCB compositeCB;
++                        compositeCB.uvScroll = { workload.btShadow.darkness, workload.btShadow.coverage ? 1.0f : 0.0f };
++                        compositeCB.uvScale = { float(btShadowTarget->width), float(btShadowTarget->height) };
++                        commandList->setGraphicsPushConstants(0, &compositeCB);
++                        commandList->setVertexBuffers(0, nullptr, 0, nullptr);
++                        commandList->drawInstanced(3, 1, 0, 0);
++                        colorTarget->markForResolve();
++                    }
++
+                     framebufferRenderer->recordFramebuffer(ext.workloadGraphicsWorker, framebufferIndex++);
+ 
++                    if (int32_t(f) == workload.btShadow.shadowPair) {
++                        btShadowTarget = colorTarget;
++                    }
++
+                     // Transition the render targets in case the present queue will show them so it doesn't have to perform transitions.
+                     if (colorTarget != nullptr && depthTarget != nullptr) {
+                         RenderTextureBarrier textureBarriers[] = {
+@@ -882,6 +1091,10 @@ namespace RT64 {
          Thread::setCurrentThreadName("RT64 Workload");
  
          WorkloadConfiguration workloadConfig;
@@ -2119,7 +2629,7 @@ index 5a331aa..e042f4c 100644
          int64_t logicalTicks = 0;
          int64_t displayTicks = 0;
          uint32_t originalRateForTicks = 0;
-@@ -988,7 +1141,15 @@ namespace RT64 {
+@@ -988,7 +1201,15 @@ namespace RT64 {
                      const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
                      generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty();
  
@@ -2136,7 +2646,7 @@ index 5a331aa..e042f4c 100644
                      if (resetTicks) {
                          logicalTicks = 0;
                          displayTicks = 0;
-@@ -999,20 +1160,44 @@ namespace RT64 {
+@@ -999,20 +1220,44 @@ namespace RT64 {
  
                  // Estimate amount of frames to render based on how many display frames it'd take to reach the next logical frame.
                  uint32_t displayFrames = 1;
@@ -2185,7 +2695,7 @@ index 5a331aa..e042f4c 100644
                  }
                  else if (workload.viOriginalRate > 0) {
                      deltaTimeMs = 1.0f / float(workload.viOriginalRate);
-@@ -1071,7 +1256,7 @@ namespace RT64 {
+@@ -1071,7 +1316,7 @@ namespace RT64 {
                          const int64_t expectedTimeMicro = frame * maxTimePerFrameMicro;
                          const int64_t measuredFrameMicro = renderTimeTotalMicro / framesRendered;
                          if ((currentTimeMicro > expectedTimeMicro) || ((currentTimeMicro + measuredFrameMicro) > adjustedTimeWindowMicro)) {
@@ -2194,7 +2704,7 @@ index 5a331aa..e042f4c 100644
                              skippedFrames = true;
                              continue;
                          }
-@@ -1080,9 +1265,9 @@ namespace RT64 {
+@@ -1080,9 +1325,9 @@ namespace RT64 {
                      RenderTarget *overrideTarget = nullptr;
                      uint32_t overrideModifier = 0;
                      if (generateInterpolatedFrames) {
@@ -2207,7 +2717,7 @@ index 5a331aa..e042f4c 100644
  
                          // Override the render target.
                          if (usingMSAA || (frame > 0)) {
-@@ -1143,7 +1328,7 @@ namespace RT64 {
+@@ -1143,7 +1388,7 @@ namespace RT64 {
  
                          // Add the amount of display ticks that correspond to the remaining frames.
                          if (skipWorkloadNow) {
@@ -2217,7 +2727,7 @@ index 5a331aa..e042f4c 100644
  
                          ext.sharedResources->interpolatedCondition.notify_all();
 diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
-index 9fae0d4..ff85358 100644
+index 9fae0d4..89aa29b 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
 +++ b/src/render/rt64_framebuffer_renderer.cpp
 @@ -16,6 +16,9 @@
@@ -2285,7 +2795,7 @@ index 9fae0d4..ff85358 100644
                  if (useWideViewport) {
                      projInvRatioScale = 1.0f;
                  }
-@@ -1506,6 +1543,74 @@ namespace RT64 {
+@@ -1506,8 +1543,81 @@ namespace RT64 {
                  viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
              }
  
@@ -2359,7 +2869,14 @@ index 9fae0d4..ff85358 100644
 +
              for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
                  const GameCall &call = proj.gameCalls[d];
++                if (call.btSkip) {
++                    // A Banjo-Tooie shadow composite strip; the full-screen composite draws it (WorkloadQueue).
++                    continue;
++                }
++
                  renderIndices.instanceIndex = call.callDesc.callIndex;
+                 renderIndices.faceIndicesStart = call.meshDesc.faceIndicesStart;
+                 renderIndices.rdpTileIndex = call.callDesc.tileIndex;
 diff --git a/src/render/rt64_projection_processor.cpp b/src/render/rt64_projection_processor.cpp
 index e842dcc..41110e5 100644
 --- a/src/render/rt64_projection_processor.cpp
@@ -2602,8 +3119,79 @@ index e842dcc..41110e5 100644
          }
      }
  
+diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
+index d1c5273..974c1e0 100644
+--- a/src/render/rt64_shader_library.cpp
++++ b/src/render/rt64_shader_library.cpp
+@@ -40,6 +40,7 @@
+ #include "shaders/RtCopyDepthToColor4XPS.hlsl.spirv.h"
+ #include "shaders/RtCopyDepthToColor8XPS.hlsl.spirv.h"
+ #include "shaders/TextureCopyPS.hlsl.spirv.h"
++#include "shaders/ShadowCompositePS.hlsl.spirv.h"
+ #include "shaders/TextureDecodeCS.hlsl.spirv.h"
+ #include "shaders/TextureResolveSamples2XPS.hlsl.spirv.h"
+ #include "shaders/TextureResolveSamples4XPS.hlsl.spirv.h"
+@@ -86,6 +87,7 @@
+ #   include "shaders/RtCopyDepthToColor4XPS.hlsl.dxil.h"
+ #   include "shaders/RtCopyDepthToColor8XPS.hlsl.dxil.h"
+ #   include "shaders/TextureCopyPS.hlsl.dxil.h"
++#   include "shaders/ShadowCompositePS.hlsl.dxil.h"
+ #   include "shaders/TextureDecodeCS.hlsl.dxil.h"
+ #   include "shaders/TextureResolveSamples2XPS.hlsl.dxil.h"
+ #   include "shaders/TextureResolveSamples4XPS.hlsl.dxil.h"
+@@ -131,6 +133,7 @@
+ #   include "shaders/RtCopyDepthToColor4XPS.hlsl.metal.h"
+ #   include "shaders/RtCopyDepthToColor8XPS.hlsl.metal.h"
+ #   include "shaders/TextureCopyPS.hlsl.metal.h"
++#   include "shaders/ShadowCompositePS.hlsl.metal.h"
+ #   include "shaders/TextureDecodeCS.hlsl.metal.h"
+ #   include "shaders/TextureResolveSamples2XPS.hlsl.metal.h"
+ #   include "shaders/TextureResolveSamples4XPS.hlsl.metal.h"
+@@ -851,6 +854,30 @@ namespace RT64 {
+             pipelineDesc.multisampling = multisampling;
+             postProcess.pipeline = device->createGraphicsPipeline(pipelineDesc);
+         }
++
++        // Banjo-Tooie "Improved Shadows": the full-screen shadow composite (black, alpha-blended, the target's alpha kept).
++        {
++            TextureCopyDescriptorSet descriptorSet;
++            layoutBuilder.begin();
++            layoutBuilder.addPushConstant(0, 0, sizeof(interop::TextureCopyCB), RenderShaderStageFlag::PIXEL);
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            btShadowComposite.pipelineLayout = layoutBuilder.create(device);
++
++            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(ShadowCompositePSBlobDXIL, ShadowCompositePSBlobSPIRV, ShadowCompositePSBlobMSL, "PSMain", shaderFormat));
++            RenderBlendDesc blendDesc = RenderBlendDesc::AlphaBlend();
++            blendDesc.srcBlendAlpha = RenderBlend::ZERO;
++            blendDesc.dstBlendAlpha = RenderBlend::ONE;
++            RenderGraphicsPipelineDesc pipelineDesc;
++            pipelineDesc.pipelineLayout = btShadowComposite.pipelineLayout.get();
++            pipelineDesc.renderTargetBlend[0] = blendDesc;
++            pipelineDesc.renderTargetFormat[0] = RenderTarget::colorBufferFormat(usesHDR);
++            pipelineDesc.renderTargetCount = 1;
++            pipelineDesc.vertexShader = fullScreenVertexShader.get();
++            pipelineDesc.pixelShader = pixelShader.get();
++            pipelineDesc.multisampling = multisampling;
++            btShadowComposite.pipeline = device->createGraphicsPipeline(pipelineDesc);
++        }
+         
+         // Raytracing debug.
+         {
+diff --git a/src/render/rt64_shader_library.h b/src/render/rt64_shader_library.h
+index 641f3ec..a775a87 100644
+--- a/src/render/rt64_shader_library.h
++++ b/src/render/rt64_shader_library.h
+@@ -53,6 +53,7 @@ namespace RT64 {
+         ShaderRecord rtCopyDepthToColorMS;
+         ShaderRecord textureDecode;
+         ShaderRecord textureCopy;
++        ShaderRecord btShadowComposite;
+         ShaderRecord textureResolve;
+         ShaderRecord videoInterfaceLinear;
+         ShaderRecord videoInterfaceNearest;
 diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
-index e7895c3..6655c86 100644
+index e7895c3..0027c3b 100644
 --- a/src/shaders/RasterPS.hlsl
 +++ b/src/shaders/RasterPS.hlsl
 @@ -64,11 +64,12 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
@@ -2624,3 +3212,60 @@ index e7895c3..6655c86 100644
      const float MaxDepth = simulateDepthClipF3D && !renderFlagRect(rp.flags) && !zSourcePrim ? (1022.0f / 1024.0f) : 1.0f;
      
      // FIXME: This can be implemented by checking feature support for the API and embedding the depth bounds into the pipeline.
+@@ -106,7 +107,23 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+         // Perform the decal depth tolerance check.
+         const float DepthTolerance = max(CoplanarDepthTolerance(surfaceDepth), dz);
+         const float pixelDepth = select(depthClampNear, max(vertexPosition.z, 0.0f), vertexPosition.z);
+-        if (abs(pixelDepth - surfaceDepth) > DepthTolerance) {
++        // Banjo-Tooie "Improved Shadows" (State::btImproveShadows): a shadow-buffer decal also passes wherever the
++        // surface lies within a window of linear view depth around the shadow's plane -- a lower step, a sloped
++        // or uneven floor -- instead of only where it is coplanar. keyScale.x < 0 marks it (the chroma key those
++        // fields carry is off for these draws); keyCenter = (alpha, beta, viewport z scale) with clip z =
++        // alpha * clip w + beta, keyScale.yz = (viewport z offset, window behind the plane).
++        bool shadowWindow = false;
++        const RDPParams shadowParams = instanceRDPParams[instanceIndex];
++        if (shadowParams.keyScale.x < 0.0f) {
++            const float ndcSurface = (surfaceDepth - shadowParams.keyScale.y) / shadowParams.keyCenter.z;
++            const float ndcPixel = (pixelDepth - shadowParams.keyScale.y) / shadowParams.keyCenter.z;
++            const float wSurface = shadowParams.keyCenter.y / (ndcSurface - shadowParams.keyCenter.x);
++            const float wPixel = shadowParams.keyCenter.y / (ndcPixel - shadowParams.keyCenter.x);
++            const float behind = wSurface - wPixel;
++            shadowWindow = (wSurface > 0.0f) && (behind <= shadowParams.keyScale.z) && (behind >= -0.25f * shadowParams.keyScale.z);
++        }
++
++        if (!shadowWindow && (abs(pixelDepth - surfaceDepth) > DepthTolerance)) {
+             return false;
+         }
+     }
+diff --git a/src/shaders/ShadowCompositePS.hlsl b/src/shaders/ShadowCompositePS.hlsl
+new file mode 100644
+index 0000000..4354113
+--- /dev/null
++++ b/src/shaders/ShadowCompositePS.hlsl
+@@ -0,0 +1,26 @@
++//
++// RT64
++//
++
++#include "shared/rt64_texture_copy.h"
++
++// Banjo-Tooie "Improved Shadows" (State::btImproveShadows): the game's shadow composite over the whole frame. The
++// shadow buffer is white with the casters drawn black; the game darkens with alpha = (1 - TEXEL0) * PRIM_ALPHA and
++// CLR_MEM * (1 - A), which is what this draws through alpha blending. uvScroll.x = PRIM_ALPHA, uvScale = the
++// shadow buffer's size in texels (it is sampled at the same place on screen).
++
++[[vk::push_constant]] ConstantBuffer<TextureCopyCB> gConstants : register(b0);
++
++Texture2D<float4> gInput : register(t1);
++
++float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET {
++    const uint2 pixelPos = min(uint2(uv * gConstants.uvScale), uint2(gConstants.uvScale) - 1);
++    const float3 shadow = gInput.Load(uint3(pixelPos, 0)).rgb;
++    const float intensity = dot(shadow, float3(0.299f, 0.587f, 0.114f));
++    // uvScroll.y = 1 (BT_RT64_SHADOWS=ab only): the shadow's coverage in solid magenta, to measure it.
++    if (gConstants.uvScroll.y > 0.5f) {
++        return float4(1.0f, 0.0f, 1.0f, (intensity < 0.5f) ? 1.0f : 0.0f);
++    }
++
++    return float4(0.0f, 0.0f, 0.0f, saturate((1.0f - intensity) * gConstants.uvScroll.x));
++}

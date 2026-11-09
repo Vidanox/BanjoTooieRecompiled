@@ -746,6 +746,8 @@ Cheato after the intro" (144 Hz only). Re-measured at a TRUE 144 (`BT_RT64_UNCAP
 * **The same irregular frames tripped the §7.8 pacing latch** (once, measured):
   step 3, then step 1 with elapsed 0, latched "recorded timing" and locked the rest
   of the throne-room scene at 20 Hz. Fixed in §7.8 (a latch needs elapsed > 0).
+* **Found later (§7.6d):** the "jump" at a conversation start was a field-of-view snap
+  interpolated across one game frame, not frame timing.
 * **Not reproduced:** the Klungo and Cheato scenes themselves. Klungo's actor
   overlay (`chklungo`, game overlay 316) never loaded in Spiral Mountain from the
   user's save, nor from a fresh post-intro state with Banjo placed at the digger
@@ -783,6 +785,35 @@ those frames and flags none of them; the full natural intro (685 s, 12836
 camera frames) flags the same 88 cuts under both rules -- the coherence test
 never fired there. The roll term is untouched (it is OR'ed after the gate); no
 roll flip occurred in these runs.
+
+### 7.6d A field-of-view snap was not a cut: the picture "compressed" for one game frame
+
+"The screen tears when the conversation starts, everything compresses quickly" --
+talking to Jiggywiggy (his temple is map `0x151`, `BT_WARP=142:1@40,151:1@m142+5`;
+the greeting plays on arrival, B in front of him starts another), and "the same
+when you enter the King Jingaling cutscene". Not a literal tear (vsync presents carry
+no tearing flag; the same shows with vsync on at 60 Hz), not a pipeline hitch
+(`BT_RT64_FRAMEDUMP` timings even, `BT_PACELOG` regular), not the shadow pass
+(`BT_RT64_SHADOWS=off` unchanged). The conversation camera keeps its place (15
+units, 0.8°) and changes its field of view by 32% in one game frame; the throne
+room does the same 14 frames after its wipe opens (+28%). The cut rule tested only
+position, direction and roll, so neither was a cut, and RT64 interpolated the
+projection across that frame's in-betweens (`TOOIE_TRACE_PROJ`: `interp=1`, fov
+1.258 -> 1.221 -> 1.162 -> 1.108 -> 1.004). Measured by the height of the
+corridor's white arch per presented frame: 56, 44, 47, 50, 53, 56 px across one
+game frame, identically at 4:3; one in-between at 60 Hz; nothing at `Original`.
+⚠ The 4.8 in-betweens of that game frame are the whole event (33 ms): comparing
+with `Original` at fixed offsets missed it, and so did per-shot geometry checks.
+
+Fix (`evaluate_camera_cut`): the camera sample carries `zoom` = |clip-y column| /
+|clip-w column| of the loaded matrix (cot of half the vertical FOV), and a frame
+whose ln(zoom) changes by more than `BT_RT64_CUT_ZOOM` (0.1) AND unlike last frame's
+change (the same velocity rule as position) is a cut; right after a cut it needs
+twice that. A deliberate zoom changes ~2% a frame. Verified: the temple's
+conversation start and entry and the throne room's frame 14 now cut, the cut
+frame's in-betweens are identical (diffs 0.0) and the arch stays 56 px; the
+new-game intro's first 230 s gains no cut (20 before and after), the throne-room
+dialogue no other. `BT_RT64_CUT_ZOOM=0` restores the old rule; `[cam]` prints `zoom=`.
 
 ### 7.7 Every model through the shared renderer carries an id
 
@@ -1221,12 +1252,11 @@ inside the face): morphing 6.4%, fixed 1.1%, `Original` refresh 2.6% (the native
 hairline cracks along the jaw edge). `BT_RT64_VTXALIGN=morphpart` restores the
 partial morph for A/B.
 
-**Measured native, same video (2026-11-09):** the Jiggy-wipe transition into the
-throne-room corridor (`0x142` -> `0x144`, recipe (c)) and Banjo's shadow there. The
-user's capture matches a true-144 render frame for frame (the wipe's size and the
-tunnel's white arch to within 1 px over 12 frames of the opening, Banjo's backpack
-through the closing), and that render matches `Original` refresh and 4:3 at the same
-offsets. The shadow goes faint and large on the lower floor, vanishes for a frame
+**Same video (2026-11-09):** the "compression" during the Jiggy-wipe into the
+throne-room corridor was first called native here, wrongly: the user's capture did
+match a true-144 render frame for frame, but that render had the same fault, and
+`Original` was compared only at sparse offsets, which a one-game-frame event slips
+between. It is the FOV snap of §7.6d. Banjo's shadow there IS native: it goes faint and large on the lower floor, vanishes for a frame
 and comes back hard at his feet as he crosses the gold step, identically at
 `Original`: it is the §7.13 decal changing the plane it lands on.
 
@@ -1462,26 +1492,64 @@ user's settings: the beam crossing is smooth (mean luminance 74 -> 118, no dip),
 and the intro shot keeps its world. No split was kept whole across the 200 s
 intro or the Mayahem Temple runs.
 
-### 7.13 Measured native: Banjo's shadow moving with the light, and cutting at seams
+### 7.13 Character shadows: native cut-offs and snaps, and "Improved Shadows" (enhancement)
 
-* **The shadow is a decal, by design.** Each frame Banjo's model is drawn black
-  into an offscreen buffer (`0x3AB540`) with `ZMODE_DEC` against the scene's
-  depth (`BT_RT64_CALLLOG`: the second pass, `om=...:0C192E10`), then
-  composited as screen rectangles. It shows only where the ground is within the
-  decal tolerance of the plane it is flattened onto, so it ends at ledges and at
-  slope changes. In the Prison Compound (map `0x0B9`; `BT_WARP=B8:1@40,B9:0@mB8+4`,
-  stick up from 50 s, lands Banjo swimming) it is identical at `Expand`/144 and
-  at 4:3/`Original`.
-  ⚠ RT64's decal tolerance uses only the incoming triangle's dz, while the RDP
-  takes the max of that and the stored pixel's dz, so on slopes RT64 may cut a
-  little earlier than hardware. Emulating it needs a per-pixel dz buffer; not
-  attempted.
-* **Its direction follows the light.** Walking from Mumbo's door into the green
-  beam, the shadow swings from under Banjo to a long silhouette behind him; the
-  144 Hz game frames and `Original` match at the same times. The frames where it
-  vanished were §7.12's (the decal had no room depth to land on).
+**How the game draws them (measured).** Each frame a pass draws the room into the
+main framebuffer; then the colour image moves to an offscreen 304x228 buffer
+(`0x3AB540`), is filled white, and every caster's model is drawn black through
+`VP_s = F x VP_m` as a `ZMODE_DEC` decal against the room's depth (other mode
+`...:0C192E10`, depth read, no write). `F` is affine (logged at `guMtxF2L`, matrix
+stack base `0x8007B4F0`): rows 0/2 the model's horizontal axes (its facing, sometimes
+stretched by the light), row 1 the light's shear per unit of height (0 = straight
+down, -2.29 for a tunnel lamp), row 3 `(x, plane_y, z)`. A rectangle pass then
+composites strips of that buffer over a box the game computes separately:
+alpha = `(1 - TEXEL0) x PRIM_ALPHA`, `CLR_MEM x (1 - A)` (combiner
+`FCFFE7FF:FFCF9FCF`; `PRIM_ALPHA` 0.5 overhead, 0.2 for a lamp).
 
-### 7.14 World seams: clamped tiles are common, tile seams are rare -- not blended
+**Why it cuts and snaps, natively** (same at `Original` and 4:3): the decal passes
+only where the ground is coplanar with `plane_y`, so the shadow ends at every step,
+ledge and floor-triangle seam (the user's prison-compound ledge and swim cases); the
+game switches the light (shear 0 <-> a lamp's, darkness 0.5 <-> 0.2) and `plane_y`
+(a step height, 41-50 units) in one frame (the tunnel, Mumbo's beam); and the box
+follows on its own schedule, so a silhouette outside it is cut or gone for a frame.
+
+**The enhancement (RT64 patch; graphics option "Improved Shadows",
+`bt_improved_shadows`, default on).** Per workload, `State::btImproveShadows`
+(`rt64_state.cpp`) finds the shadow pass (a pair that reads but does not write the
+main depth, every call a decal), the main pair before it and the composite pair
+after it, and:
+
+* **Depth window.** The shadow pass's decal calls also pass wherever the surface
+  lies from 200 units behind to 50 in front of the shadow's plane in linear view
+  depth (`RasterPS`; the params ride the unused chroma-key fields, marked by
+  `keyScale.x < 0`). Complete across steps, seams and uneven floors; never drawn
+  where there is no surface (sky/void reads as far depth); bounded up walls.
+* **Easing.** `F = VP_s x inv(VP_m)` per caster (matched by position, kept 0.5 s
+  across gaps): the shear, the plane's height and tilt, and the light's stretch
+  (the polar factor of the horizontal axes, so the caster's own turning never lags)
+  follow the game's with a 0.12 s time constant, and the caster is drawn through
+  `F' x VP_m`. The composite's darkness eases the same way.
+* **Composite.** The game's strips are skipped (`GameCall::btSkip`) and the whole
+  buffer is composited with the same formula by one full-screen pass
+  (`ShadowCompositePS`, recorded before the composite pair), so an eased silhouette
+  can never leave the game's box.
+
+Measured at a true 144 (`BT_RT64_UNCAP=1`, `display=143-144/s` either way) with the
+user's settings: walking from Mumbo's door into the green beam the game's shear jumps
+2.34 -> 0.77 -> 1.86 and its plane 50 units in four frames; eased, the shadow slides
+(2.29, 1.93, 1.62, 1.37, 1.49 ...), and where the original vanishes as Banjo steps
+onto the platform (the decal loses the floor) the improved one stays on the floor.
+The tunnel's lamp-to-overhead switch (shear -2.29 -> 0, darkness 0.2 -> 0.5) eases
+over ~0.3 s. `BT_RT64_SHADOWS=ab` (coverage drawn magenta, window on every other
+frame) measured the window adding ~40% coverage on the frames a swim shadow crossed
+the pool's grass bank. Cost: one full-screen pass and one resolve of the shadow
+buffer per display frame, and a few matrix products per caster per game frame.
+`BT_RT64_SHADOWS=off` (or the option) restores the game's shadow exactly.
+⚠ Not covered yet: the exact user swim spot was not reproduced (the tested swim
+shadows were complete in both), and remote players' and enemies' shadows go through
+the same pass but were not separately checked.
+
+### 7.14 World and model seams: "Blend Texture Seams" (enhancement)
 
 "If it's not too complicated maybe we can add [seam blending] for the rest of the
 environment." Surveyed instead of built (`BT_WORLD_SEAMS=log`, §9): the §7.9
@@ -1513,6 +1581,52 @@ other use of that texture, where the sky's tiles belong to the sky alone.
 Before the 2D draws were excluded the survey also counted the level-title cards
 (an 18-tile RGBA32 image) and the file-select scene (119 CI8 pairs, CI being a
 format §7.9 cannot average at all); neither is world geometry.
+
+**Built after all (2026-11-09, the user's call): graphics option "Blend Texture
+Seams" (`bt_tex_seams`, default on), `texseam` in `recomp_api.cpp`,
+`BT_TEX_SEAMS=off|log|log2|dry`.** The cost problem above is solved by doing
+the work once per piece of geometry instead of per frame:
+
+* **Per frame** only the lists the frame itself emitted are scanned (no
+  recursion into static model lists): each static list a model group calls is
+  identified by its address and segment 1, and a group is walked (§7.9's walker,
+  restricted to that group) only when it calls a list never walked before.
+  Measured at a true 144 across the logos, file select, intro, Spiral Mountain,
+  Jinjo Village, the throne room and Mayahem Temple: the scan is **13 us a frame
+  median** (window averages up to 22 us, worst single frame 156 us). Keying on
+  more segments made every frame look new (they carry matrices).
+* **One-time** per map: 70-400 us of walking in its first 2 s; afterwards new
+  geometry coming into view costs walks of 13-360 us each, ~8 us a frame on
+  average while exploring, nothing standing still.
+* **Pairing** is §7.9's (shared endpoints, opposite sides, best match for both
+  edges) through an endpoint hash, with a borders-agree test tightened to
+  `diff <= min(grad + 3, 24)` -- the sky's `2 x grad + 3` passed a 111-vs-78
+  pair in the logos that was not a seam -- and identical borders are not written.
+  Borders may sit half a texel in (the sky) or on the texel edge.
+* **Shared tiles.** Each pairing is recorded per BORDER; a border that later
+  meets a different partner is a texture shared by surfaces that disagree, and
+  every pairing involved is undone and left native for good (1 such case, in the
+  intro). Render targets the frame sets (`G_SETCIMG`/`G_SETZIMG`) are never
+  written.
+* **Reloads and animated textures.** Eight written texels a frame are re-read;
+  one the game changed means the texture was reloaded or moved (forget it, walk
+  again) and a texture changed twice is never touched again.
+  ⚠ **Nothing is ever written back to an address not read this frame.** The
+  first build restored a forgotten texture's PARTNERS from their saved bytes,
+  guarded by "still holds what we wrote" -- with one-byte IA8 texels that test
+  passes by chance on memory the heap compactor has reused, and it crashed the
+  game intermittently (3 of ~20 runs, never with `=off` or `=dry`). Since: 0 of
+  11 under the same stress.
+
+**Measured result.** Per area 0-12 pairs blend (IA8 64x64 and RGBA16/RGBA32 32x32
+tiles); in Mayahem Temple the off/on crops show a vertical one-texel step in the
+wall gone and the rest of the frame identical (959 px of 370k changed, all on
+seam lines). **Characters: none.** Banjo (tagged through the player's root
+draws), King Jingaling and the Mayahem Temple NPCs yielded no pair: their
+clamped borders do not meet another tile on a shared edge in model space. ⚠
+Edges are matched on RAW vertex positions, so a seam across two BONES (vertices
+loaded under different matrices) cannot be found; that would need each vertex
+transformed by its `G_MTX` before matching -- not done.
 
 ### 7.15 Hold Start to skip a cutscene (feature)
 
@@ -1790,16 +1904,20 @@ Different failures need different tools. Choosing the wrong one wastes a session
 |**Per-vertex trajectories**|`BT_RT64_VTXDUMP=<path>:<n>[,<n>...]`|appends, for every vertex-interpolated transform with one of those vertex counts, a record `u32 id, u32 n, n×3 f32 game positions, n×3 f32 drawn positions` (binary, flushed per frame). For offline A/B of a filter on the identical input: dump with `BT_RT64_VTXSMOOTH=off` and replay.|
 |**Unattended runs that stay out of the way**|`BT_WINDOW_POS=x,y`|creates the window at that position (physical pixels) without activating it, e.g. on a second monitor. Launch with `--game bt` to skip the launcher menu (it ignores `BT_AUTOPAD` and posted clicks), and set `"background_input_mode": "Off"` in a portable `general.json` so a controller in use elsewhere does not drive the test.|
 |**Every presented frame, to disk**|`BT_RT64_FRAMEDUMP=<path>[,<step>[,<t0>[,<t1>[,<x>,<y>,<w>,<h>]]]]`|appends every presented frame (game and interpolated, so a true 144 Hz run gives 144 a second), point-sampled every `step` pixels of RT64's presented colour target, between `t0` and `t1` on the BT_AUTOPAD clock, optionally cropped to a `w`x`h` rectangle at (`x`,`y`) (a face close-up at step 1 for seconds instead of a full frame; the full-frame step-1 dump costs ~600 MB/s and itself drops presented frames). Record: `FDMP`, u32 seq, u32 index in its game frame, u32 frames in it, f64 t, u32 w, u32 h, w*h*3 RGB. D3D12 only (plume has no texture-to-buffer copy; under Vulkan it would crash). ~25 MB/s at step 5 on the 1600x900 window, so keep the window short. Use it instead of window captures, which the compositor caps at the monitor rate (§7.11, §7.12).|
+|**Improved Shadows, A/B and what it did**|`BT_RT64_SHADOWS=off`, `=log`, `=ab`|`off` restores the game's shadow (overrides the option, §7.13). `log` prints one `[shadow]` line per caster per game frame: position, the game's shear and plane height and the eased ones, the eased stretch, the composite's darkness. `ab` draws the shadow's coverage in solid magenta and applies the depth window on every other game frame without easing, so consecutive frames of one run differ by the window alone; count magenta pixels to measure what it recovers.|
+|**Matrices in the call log**|`BT_RT64_CALLLOG_MTX=1`|with `BT_RT64_CALLLOG`, adds `[vp]` (each projection's merged matrix) and `[mtx]` (each perspective call's world matrix and id) -- how §7.13's `F = VP_s x inv(VP_m)` was found.|
 |**What RT64 drew, per pass and per call**|`BT_RT64_CALLLOG=<t0>,<t1>`|once per workload in that window: `[calls]` per framebuffer pair (colour/depth image, write and scissor bounds, depth read/write), `[proj]` per projection (type, transform id, aspect mode, calls, triangles), `[clip]` where its triangles land in clip space, `[call]` per rectangle or framebuffer-sampling call, `[cc]` per call of passes 1-2 (clip counts, w range, prim/env, other mode, combiner, mean vertex colour, first texture hash), and `[fbrec]` per pass record (RDRAM reloads, format changes). Heavy; keep the window to a second (§7.12).|
 |**Draw only the first passes**|`BT_RT64_FBLIMIT=<n>`|renders only framebuffer pairs 0..n of every workload. Meaningful at `Original` refresh only (interpolated frames show stale targets).|
 |**View/projection split, A/B and failures**|`BT_RT64_SPLITFIX=off`, `BT_RT64_SPLITLOG=1`|`off` restores RT64's row-0 split (§7.12); `SPLITLOG` prints each merged matrix the split could not reproduce and kept whole.|
 |**Per-frame refresh rate, A/B**|`BT_RT64_STEPRATE=off`|reports the frame divisor's rate to RT64 for every frame again, instead of the frame's own step on irregular frames (§7.6b).|
+|**Camera FOV-snap cut threshold**|`BT_RT64_CUT_ZOOM=<ln>`|per-frame change of ln(cot(fovy/2)) that counts as a cut when it is also unlike last frame's (§7.6d), default 0.1, 0 = off. `[cam]` lines print `zoom=`.|
 |**Camera roll cut threshold**|`BT_RT64_CUT_ROLL=<deg>`|screen-up turn per frame that counts as a cut (§7.11), default 45, 0 = off. `[cam]` lines print `roll=`.|
 |**Hold-to-skip, A/B and what it did**|`BT_HOLDSKIP=off`, `=log`|`off` disables §7.15's hold-Start skip, overriding the option. `log` prints `[skip]` lines (the ticker's state per sequence, each hold, each skip and where it went, the frame-list buffers and the largest list) and `[flags]` lines -- the game's progress flag blocks and the five music players' song ids -- at every map change and again 5 s later, so a skipped run can be diffed against a played one where they meet, and `[flagset]`, every flag write (`func_800DA3B8`) with its map -- how a sequence's lasting flags are found (§7.15).|
 |**World seam survey**|`BT_WORLD_SEAMS=log`, `=log2`|every 2 s, walks the whole frame's display list (minus the sky and every 2D draw) and prints `[worldseam]`: textured and clamped triangles, clamped tile-border edges, the edges two different tiles share by format, and how many of those §7.9's blending could read and would accept. `log2` adds one line per pair. Writes nothing (§7.14).|
 |**What the frame draws in 2D**|`BT_HUDLOG=1`, `BT_HUDDUMP=<dir>`|once a second, every texture drawn by a texture rectangle or by a triangle after an orthographic projection: address, format, size, screen rectangle, palette. `BT_HUDDUMP` writes each one's texels (then palette) to `<dir>/hud_<addr>_<fmt>-<siz>_<w>x<h>_<line>.bin` -- how the pause screen's honeycomb was found (§7.15).|
 |**Coherent camera motion, A/B**|`BT_RT64_CUT_COHERENT=off`|restores the plain velocity rule, which flags the follow camera's swoop after a fall as cuts (§7.6c). `[cam]` lines print `coherent` where the coherence test overrode it.|
 |**Any button to the file select, A/B**|`BT_BOOTSKIP=off`|disables §7.16, overriding the option. With `BT_HOLDSKIP=log`, `[boot]` lines give each map's arrival in seconds since process start and on the pad clock, and each press that skipped.|
+|**Texture seams (world/models), A/B and cost**|`BT_TEX_SEAMS=off`, `=log`, `=log2`, `=dry`|`off` disables §7.14's blending, overriding the option; `log` prints a `[texseam]` line every 2 s (scan cost per frame, walks and their cost, pairs blended/rejected/conflicts, lists seen, borders, rewrites, volatile textures); `log2` adds each walk and each pair, tagged `PLAYER`/`MODEL`/`world` by the draw it came from; `dry` does everything except write.|
 |**Start somewhere specific (debug only)**|`BT_WARP`, `BT_POKE`, `BT_POS`|`src/test_harness.cpp`, run once per game frame from the `func_800A73F4` hook; unset = one null check. Syntax and verified recipes below.|
 |**Where am I, what is Banjo doing**|`BT_HARNESSLOG=1` (`=2`)|map id, Banjo's position and movement state once a second (`=2`: 4x a second plus every state change). Map changes are logged whenever any harness variable is set. States: `0x1` idle, `0x4` walk, `0x5` jump, `0x2D`/`0x2E` swimming/paddling, `0x73` locked in dialogue, `0x98` scripted walk, `0xA6`-`0xAA` Grip Grab.|
 
@@ -1949,7 +2067,7 @@ must be regenerated into its `patches/*.patch`:
 git -C lib/<dep> diff <pinned-commit> > patches/<dep>.patch
 ```
 
-This is the single way this repository can silently regress. Check with
+A file the patch ADDS must be marked first (`git -C lib/<dep> add -N <file>`), or `git diff` leaves it out (rt64.patch adds `src/shaders/ShadowCompositePS.hlsl`, §7.13). This is the single way this repository can silently regress. Check with
 `git ls-files -s lib/` for the pinned commits.
 
 ### Regenerating the recompiled code

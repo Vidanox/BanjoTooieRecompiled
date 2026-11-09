@@ -33,6 +33,8 @@
 #include <cstring>
 #include <span>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "funcs.h"
@@ -1165,8 +1167,9 @@ static_assert(kSkyProjectionGroupFlags == (kProjectionGroupFlags & ~0x78U),
 // documents). Because the ids still match, the frame after a cut interpolates
 // normally again. SKIP is 0, so masking a component's bits out is SKIP.
 //
-// Projections: pos + rot (bits 3-6). Model groups: pos, rot, scale, skew,
-// perspective and vertices (3-14).
+// Projections: pos + rot (bits 3-6); RT64 interpolates a projection only when its
+// view was, so that holds the whole projection, field of view included. Model
+// groups: pos, rot, scale, skew, perspective and vertices (3-14).
 constexpr uint32_t kCutProjectionMask = 0x78U;
 constexpr uint32_t kCutModelMask = 0x7FF8U;
 // Pushed once, at the cut frame's first perspective projection, so every
@@ -1658,6 +1661,19 @@ float cut_roll() {
     return value;
 }
 
+// How far the field of view may change in one game frame before the frame
+// counts as a cut, as |ln(zoom / previous zoom)| (0.1 = about 10%). BT_RT64_CUT_ZOOM
+// overrides it (0 = off). Starting a conversation with Jiggywiggy keeps the camera
+// where it is (15 units, 0.8 degrees) and changes the FOV by 32% in one frame; with
+// only position and direction tested that frame was not a cut, and RT64 blended
+// the projection from the old FOV to the new one across its in-betweens -- the
+// whole picture zooming in one game frame, "everything compresses quickly"
+// (AGENTS.md 7.6d). A deliberate zoom changes it by ~2% a frame.
+float cut_zoom() {
+    static const float value = env_float("BT_RT64_CUT_ZOOM", 0.1f);
+    return value;
+}
+
 // The limits right after a cut, when there is no previous step to compare with.
 constexpr float kCutUnknownDistance = 400.0f;
 constexpr float kCutUnknownAngle = 40.0f;
@@ -1722,6 +1738,7 @@ struct CameraSample {
     float pos[3];
     float rot[3];  // unit view direction
     float up[3];   // unit screen-up direction (clip y axis in world space)
+    float zoom;    // |clip y column| / |clip w column|: the vertical field of view's cot(fovy/2)
 };
 bool g_cam_sampled = false;
 bool g_frame_cut = false;
@@ -1730,6 +1747,7 @@ bool g_prev_cam_has_dir = false;
 CameraSample g_prev_cam = {};
 // Last frame's step and turn, valid only when last frame was not itself a cut.
 bool g_prev_cam_motion_known = false;
+float g_prev_cam_zoom_step = 0.0f;  // ln(zoom / previous zoom), valid with g_prev_cam_motion_known
 float g_prev_cam_step[3] = {};
 float g_prev_cam_turn = 0.0f;
 
@@ -1936,6 +1954,12 @@ bool g_frame_extended = false;
 // The gfx positions of this frame's orthographic (2D) and perspective
 // projection loads, in order, for BT_HUDLOG.
 struct ProjMark { uint32_t gfx; bool ortho; };
+// The player's draw (func_80098BA8) in this frame's list.
+uint32_t g_frame_player_lo = 0, g_frame_player_hi = 0;
+// Every model the shared renderer (func_800DE498) drew this frame: where in the
+// frame's list it starts and ends, and whether it is the player's.
+struct ModelRange { uint32_t lo, hi; bool player; };
+std::vector<ModelRange> g_frame_models;
 std::vector<ProjMark> g_frame_proj_marks;
 } // namespace
 
@@ -1943,6 +1967,8 @@ extern "C" void tooie_rt64_begin_frame(uint8_t* rdram, recomp_context* ctx) {
     g_frame_dl_head = read_word(rdram, kRenderBufferState);
     g_frame_extended = false;
     g_frame_proj_marks.clear();
+    g_frame_player_lo = g_frame_player_hi = 0;
+    g_frame_models.clear();
     // BT_POKE / BT_WARP / BT_POS (src/test_harness.cpp): once per game frame, on
     // the game thread. A single null check when none of them is set.
     tooie::harness::on_frame(rdram, ctx);
@@ -2094,6 +2120,9 @@ extern "C" void tooie_rt64_begin_frame(uint8_t* rdram, recomp_context* ctx) {
 // exactly the draws that belong to one player.
 extern "C" void tooie_rt64_player_scope(uint8_t* rdram, recomp_context* ctx,
                                         uint32_t stage) {
+    // Where in the frame's list the player is drawn, for BT_TEX_SEAMS=log2.
+    if (g_frame_player_lo == 0 && stage == 1U) g_frame_player_lo = read_word(rdram, kRenderBufferState);
+    if (g_frame_player_hi == 0 && stage != 1U) g_frame_player_hi = read_word(rdram, kRenderBufferState);
     if (rt64_disabled()) {
         return;
     }
@@ -2130,6 +2159,12 @@ extern "C" void tooie_rt64_player_scope(uint8_t* rdram, recomp_context* ctx,
 // otherwise the tracked draw (actor_transform_id).
 extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
                                             recomp_context* ctx) {
+    {
+        const uint32_t c = static_cast<uint32_t>(MEM_W(0xF8U, ctx->r29));
+        if (in_rdram(c, 4U) && g_frame_models.size() < 512) {
+            g_frame_models.push_back({read_word(rdram, c), 0U, g_player_scope_depth != 0U});
+        }
+    }
     if (rt64_disabled()) {
         return;
     }
@@ -2263,6 +2298,15 @@ extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
 // model matrix, so the N64 scope and the RT64 group close together.
 extern "C" void tooie_rt64_pop_player_root(uint8_t* rdram,
                                            recomp_context* ctx) {
+    {
+        const uint32_t c = static_cast<uint32_t>(MEM_W(0xF8U, ctx->r29));
+        for (size_t i = g_frame_models.size(); i-- > 0;) {
+            if (g_frame_models[i].hi == 0U) {
+                if (in_rdram(c, 4U)) g_frame_models[i].hi = read_word(rdram, c);
+                break;
+            }
+        }
+    }
     if (rt64_disabled()) {
         return;
     }
@@ -2548,6 +2592,16 @@ struct Walker {
     size_t mark = 0;
     bool in_ortho = false;
     uint32_t ortho_tris = 0;
+    // Texture seams (tex_seams, AGENTS.md 7.14): borders may also sit on the
+    // texel EDGE (st 0 / N) as well as half a texel in; groups are counted only
+    // where segment 1 is set from a list the frame emitted (dyn_lo..dyn_hi), and
+    // edges are kept only for the groups in `want`; textures in `skip_tex` are
+    // left out.
+    bool exact_edges = false;
+    uint32_t dyn_lo = 0, dyn_hi = 0;
+    const std::vector<uint8_t>* want = nullptr;
+    const std::vector<uint32_t>* skip_tex = nullptr;
+    bool group_wanted() const { return want == nullptr || (group < want->size() && (*want)[group] != 0); }
     std::vector<Edge> edges;
 
     bool resolve(uint32_t a, uint32_t& out) const {
@@ -2585,8 +2639,10 @@ struct Walker {
                 if (tile.sized && (tile.uls != 0 || tile.ult != 0)) ++offset_tile_tris;
             }
         }
+        if (!group_wanted()) return;
         Tex t;
         if (!texture_of(t)) return;
+        if (skip_tex != nullptr && std::find(skip_tex->begin(), skip_tex->end(), t.addr) != skip_tex->end()) return;
         const int idx[3] = {a, b, c};
         for (int e = 0; e < 3; ++e) {
             const Vert& p = verts[idx[e]];
@@ -2598,7 +2654,10 @@ struct Walker {
                 const float hi = (axis == 0 ? t.w : t.h) - 0.5f;
                 for (uint8_t side = 0; side < 2; ++side) {
                     const float v = side ? hi : lo;
-                    if (std::fabs(p.st[axis] - v) > 0.1f || std::fabs(q.st[axis] - v) > 0.1f) continue;
+                    const float v2 = exact_edges ? (side ? hi + 0.5f : lo + 0.5f) : v;
+                    const bool on = (std::fabs(p.st[axis] - v) <= 0.1f && std::fabs(q.st[axis] - v) <= 0.1f) ||
+                                    (std::fabs(p.st[axis] - v2) <= 0.1f && std::fabs(q.st[axis] - v2) <= 0.1f);
+                    if (!on) continue;
                     Edge ed;
                     std::memcpy(ed.p[0], p.p, sizeof(p.p));
                     std::memcpy(ed.p[1], q.p, sizeof(q.p));
@@ -2678,12 +2737,15 @@ struct Walker {
                 if (((w0 >> 16) & 0xFF) == 0x06) {
                     const uint32_t s = ((w0 & 0xFFFF) / 4) & 0x0F;
                     seg[s] = w1; seg_known[s] = true;
-                    if (s == 1) ++group; // each model points segment 1 at its vertices
+                    // each model points segment 1 at its vertices
+                    if (s == 1 && (dyn_hi == 0 || (cur_dl >= dyn_lo && cur_dl < dyn_hi))) ++group;
                 }
                 break;
             case 0xDE: {
                 uint32_t a;
-                if (depth < 8 && resolve(w1, a)) walk(a, a + 8 * 4096, depth + 1);
+                if (depth < 8 && resolve(w1, a) && (group_wanted() || (a >= dyn_lo && a < dyn_hi))) {
+                    walk(a, a + 8 * 4096, depth + 1);
+                }
                 if (((w0 >> 16) & 0xFF) == 0x01) return; // branch: no return here
                 break;
             }
@@ -3039,9 +3101,428 @@ void survey_frame(uint8_t* rdram, uint32_t start, uint32_t end) {
     process(rdram, start, end, mode, &survey);
 }
 
+// ---------------------------------------------------------------------------
+// Texture seams everywhere (AGENTS.md 7.14): the sky's blending (§7.9) for the
+// world and for character models, as a one-time job per piece of geometry.
+//
+// Per frame only the lists the frame itself emitted are scanned (`Scan`, no
+// recursion into static model lists): every static display list a model group
+// calls is identified by its address and segments, and a group is walked only
+// when it calls one never walked before. A walk collects the group's clamped
+// tile-border edges and pairs them exactly as the sky does (shared endpoints,
+// opposite sides, borders that already agree, the best match for both edges).
+// Each pairing is recorded per BORDER: a border blended with one partner that
+// later meets a different one belongs to a texture shared by surfaces that
+// disagree, so every pairing involved is undone (the original texels are kept)
+// and those borders are left native for good. A few written texels are
+// re-checked each frame: one the game rewrote means the texture was reloaded
+// (forget it and walk again) or is animated by the CPU (rewritten twice: never
+// touched again).
+namespace texseam {
+
+std::atomic<uint32_t> g_enabled{1};
+
+// BT_TEX_SEAMS=off disables it (overriding the option); =log prints a
+// [texseam] summary every 2 s; =log2 adds one line per walk and per pair.
+int env_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("BT_TEX_SEAMS");
+        if (v == nullptr) return 0;
+        if (std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0) return -1;
+        if (std::strcmp(v, "log") == 0) return 1;
+        if (std::strcmp(v, "log2") == 0) return 2;
+        if (std::strcmp(v, "dry") == 0) return 3;   // everything but the writes
+        return 0;
+    }();
+    return mode;
+}
+
+struct Rec {
+    uint64_t partner = 0;
+    bool conflicted = false;
+    uint32_t bytes = 0;                                 // per texel
+    std::vector<std::pair<uint32_t, uint32_t>> saved;   // texel address, original
+    std::vector<uint32_t> written;                      // what was written there
+};
+std::unordered_map<uint64_t, Rec> g_reg;   // border -> its pairing
+std::unordered_set<uint64_t> g_seen;       // static lists already walked
+std::vector<uint32_t> g_volatile;          // textures the CPU rewrites
+std::vector<uint32_t> g_buffers;           // colour/depth images seen this map
+std::unordered_map<uint32_t, uint32_t> g_rewrites;
+struct Sample { uint32_t addr, value, bytes, tex; };
+std::vector<Sample> g_samples;
+size_t g_sample_next = 0;
+uint32_t g_map = 0xFFFFFFFFU;
+struct Stats {
+    uint32_t frames = 0, walks = 0, blended = 0, conflicts = 0, rejected = 0, reloads = 0, edges_max = 0;
+    double steady_us = 0, steady_max = 0, walk_us = 0, walk_max = 0;
+} g_st;
+std::chrono::steady_clock::time_point g_next_log{};
+
+uint32_t tex_of(uint64_t key) { return uint32_t(key >> 8); }
+uint64_t border_key(const Edge& e) { return (uint64_t(e.tex.addr) << 8) | (uint64_t(e.axis) << 1) | e.side; }
+uint32_t bpt(const Tex& t) { return t.siz == 3 ? 4U : (t.siz == 2 ? 2U : 1U); }
+uint32_t raw_texel(const uint8_t* rdram, uint32_t a, uint32_t n) {
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < n; ++i) v = (v << 8) | rd8(rdram, a + i);
+    return v;
+}
+void put_raw(uint8_t* rdram, uint32_t a, uint32_t n, uint32_t v) {
+    for (uint32_t i = 0; i < n; ++i) wr8(rdram, a + i, uint8_t(v >> (8 * (n - 1 - i))));
+}
+// Puts back the original texels -- only where what this wrote is still there,
+// so memory the game has since reused (a reload, the heap compactor) is never
+// written with stale bytes.
+void restore(uint8_t* rdram, Rec& r) {
+    for (size_t i = 0; i < r.saved.size() && i < r.written.size(); ++i) {
+        if (raw_texel(rdram, r.saved[i].first, r.bytes) == r.written[i]) {
+            put_raw(rdram, r.saved[i].first, r.bytes, r.saved[i].second);
+        }
+    }
+    r.saved.clear();
+    r.written.clear();
+}
+
+// Pass 1: the frame's own lists. Marks the model groups (counted as the
+// Walker counts them) that call a static list not walked yet.
+struct Scan {
+    const uint8_t* rdram;
+    uint32_t head, end, sky_lo, sky_hi;
+    uint32_t seg[16] = {};
+    bool known[16] = {};
+    uint32_t group = 0, cmds = 0;
+    size_t mark = 0;
+    bool ortho = false;
+    std::vector<uint8_t> want;
+    std::vector<uint64_t> pending;
+    std::vector<uint32_t> player_groups, actor_groups;
+    bool resolve(uint32_t a, uint32_t& out) const {
+        const uint32_t s = (a >> 24) & 0x0F;
+        if ((a >> 24) == 0x80 || (a >> 24) == 0x00) { out = 0x80000000U | phys(a); return true; }
+        if ((a >> 24) > 0x0F || !known[s]) return false;
+        out = 0x80000000U | phys(seg[s] + (a & 0x00FFFFFFU));
+        return true;
+    }
+    void walk(uint32_t start, uint32_t stop, int depth) {
+        const bool dyn = start >= head && start < end;
+        for (uint32_t pc = start; pc < stop && cmds < 200000U; pc += 8) {
+            if (depth == 0 && pc >= sky_lo && pc < sky_hi) { pc = sky_hi - 8; continue; }
+            if (depth == 0) {
+                while (mark < g_frame_proj_marks.size() && g_frame_proj_marks[mark].gfx <= pc) {
+                    ortho = g_frame_proj_marks[mark++].ortho;
+                }
+            }
+            ++cmds;
+            const uint32_t w0 = rd32(rdram, pc), w1 = rd32(rdram, pc + 4);
+            const uint32_t op = w0 >> 24;
+            if (op == 0xDB && ((w0 >> 16) & 0xFF) == 0x06) {
+                const uint32_t s = ((w0 & 0xFFFF) / 4) & 0x0F;
+                seg[s] = w1; known[s] = true;
+                if (s == 1 && dyn) ++group;
+            }
+            else if (op == 0xDE) {
+                uint32_t a;
+                if (resolve(w1, a)) {
+                    if (a >= head && a < end) {
+                        if (depth < 8) walk(a, a + 8 * 4096, depth + 1);
+                    }
+                    else if (!ortho) {
+                        // Which kind of model calls it (BT_TEX_SEAMS=log2 only).
+                        for (const ModelRange& m : g_frame_models) {
+                            if (pc >= m.lo && pc < m.hi) {
+                                std::vector<uint32_t>& v = m.player ? player_groups : actor_groups;
+                                if (v.empty() || v.back() != group) v.push_back(group);
+                                break;
+                            }
+                        }
+                        // The list and the model's vertices (segment 1). Other
+                        // segments carry per-frame state (matrices) and would
+                        // make every frame's lists look new.
+                        const uint64_t id = (uint64_t(a) << 32) ^ (uint64_t(seg[1]) * 0x9E3779B1ULL);
+                        if (g_seen.find(id) == g_seen.end()) {
+                            if (want.size() <= group) want.resize(group + 1, 0);
+                            want[group] = 1;
+                            pending.push_back(id);
+                        }
+                    }
+                }
+                if (((w0 >> 16) & 0xFF) == 0x01) return;
+            }
+            else if (op == 0xDF && depth > 0) {
+                return;
+            }
+            else if (op == 0xFF || op == 0xFE) {
+                // G_SETCIMG / G_SETZIMG: a render target, never a texture to write.
+                uint32_t a;
+                if (resolve(w1, a) && g_buffers.size() < 32 &&
+                    std::find(g_buffers.begin(), g_buffers.end(), a) == g_buffers.end()) {
+                    g_buffers.push_back(a);
+                }
+            }
+        }
+    }
+};
+
+// Within 320 x 240 x 32 bits of a render target the frame set.
+bool in_buffers(uint32_t addr) {
+    for (uint32_t b : g_buffers) {
+        if (addr >= b && addr < b + 320U * 240U * 4U) return true;
+    }
+    return false;
+}
+
+bool measure(const uint8_t* rdram, const Edge& a, const Edge& b, bool forward,
+             std::vector<std::pair<int, int>>& map, float& diff, float& grad) {
+    const float a0 = a.along[0], a1 = a.along[1];
+    const float b0 = forward ? b.along[0] : b.along[1];
+    const float b1 = forward ? b.along[1] : b.along[0];
+    map.clear(); diff = 0; grad = 0;
+    if (std::fabs(a1 - a0) < 1.0f) return false;
+    const int la = border_len(a), lb = border_len(b);
+    for (int k = 0; k < la; ++k) {
+        if (k < std::min(a0, a1) - 0.01f || k > std::max(a0, a1) + 0.01f) continue;
+        const float u = (k - a0) / (a1 - a0);
+        const int m = std::clamp(int(std::lround(b0 + u * (b1 - b0))), 0, lb - 1);
+        float va[4], vb[4], ia[4], ib[4];
+        read_texel(rdram, border_addr(a, k, 0), a.tex, va);
+        read_texel(rdram, border_addr(b, m, 0), b.tex, vb);
+        read_texel(rdram, border_addr(a, k, 1), a.tex, ia);
+        read_texel(rdram, border_addr(b, m, 1), b.tex, ib);
+        for (int c = 0; c < 3; ++c) {
+            diff += std::fabs(va[c] - vb[c]) / 3.0f;
+            grad += (std::fabs(va[c] - ia[c]) + std::fabs(vb[c] - ib[c])) / 6.0f;
+        }
+        map.push_back({k, m});
+    }
+    if (map.size() < 2) return false;
+    diff /= float(map.size());
+    grad /= float(map.size());
+    return true;
+}
+
+void blend_pair(uint8_t* rdram, const Edge& a, const Edge& b, const std::vector<std::pair<int, int>>& map, int log,
+                const std::unordered_set<uint32_t>& cur_tex) {
+    if (env_mode() == 3) { ++g_st.blended; return; }
+    const uint64_t ka = border_key(a), kb = border_key(b);
+    Rec& ra = g_reg[ka];
+    Rec& rb = g_reg[kb];
+    ra.bytes = bpt(a.tex);
+    rb.bytes = bpt(b.tex);
+    if (ra.conflicted || rb.conflicted) return;
+    if (ra.partner == kb && rb.partner == ka) return;   // this seam is done
+    if (ra.partner != 0 || rb.partner != 0) {
+        // A border shared by surfaces that pair it differently: put back every
+        // pairing involved and leave all of those borders native.
+        ++g_st.conflicts;
+        // Only textures this walk has just read are written back: their
+        // addresses are known good this frame.
+        const uint64_t involved[4] = {ka, kb, ra.partner, rb.partner};
+        for (uint64_t k : involved) {
+            auto it = g_reg.find(k);
+            if (k == 0 || it == g_reg.end()) continue;
+            if (cur_tex.count(tex_of(k)) != 0) restore(rdram, it->second);
+            else it->second.saved.clear();
+            it->second.conflicted = true;
+        }
+        if (log >= 2) {
+            std::fprintf(stderr, "[texseam] CONFLICT %08X/%u%u - %08X/%u%u: a shared border pairs two ways, undone\n",
+                         a.tex.addr, a.axis, a.side, b.tex.addr, b.axis, b.side);
+        }
+        return;
+    }
+    ra.partner = kb;
+    rb.partner = ka;
+    for (const auto& [k, m] : map) {
+        const uint32_t aa = border_addr(a, k, 0), ba = border_addr(b, m, 0);
+        ra.saved.push_back({aa, raw_texel(rdram, aa, ra.bytes)});
+        rb.saved.push_back({ba, raw_texel(rdram, ba, rb.bytes)});
+        float va[4], vb[4], v[4];
+        read_texel(rdram, aa, a.tex, va);
+        read_texel(rdram, ba, b.tex, vb);
+        for (int c = 0; c < 4; ++c) v[c] = (va[c] + vb[c]) * 0.5f;
+        write_texel(rdram, aa, a.tex, v);
+        write_texel(rdram, ba, b.tex, v);
+        ra.written.push_back(raw_texel(rdram, aa, ra.bytes));
+        rb.written.push_back(raw_texel(rdram, ba, rb.bytes));
+    }
+    // One sample per border is enough to notice a reload.
+    if (!map.empty() && g_samples.size() < 16384) {
+        const uint32_t aa = border_addr(a, map[map.size() / 2].first, 0);
+        const uint32_t ba = border_addr(b, map[map.size() / 2].second, 0);
+        g_samples.push_back({aa, raw_texel(rdram, aa, ra.bytes), ra.bytes, a.tex.addr});
+        g_samples.push_back({ba, raw_texel(rdram, ba, rb.bytes), rb.bytes, b.tex.addr});
+    }
+    ++g_st.blended;
+}
+
+// `tex` no longer holds what was written: reloaded, animated, or moved by the
+// heap compactor. Its pairings are forgotten and NOTHING is written back -- the
+// partners' addresses may themselves be stale, and with one-byte texels a
+// "still holds what we wrote" test passes by chance on memory now used for
+// something else. A partner left blended was blended with this texture's own
+// content, so it is still right where that content is.
+void forget_texture(uint8_t* rdram, uint32_t tex) {
+    (void)rdram;
+    for (auto it = g_reg.begin(); it != g_reg.end();) {
+        if (tex_of(it->first) == tex || tex_of(it->second.partner) == tex) { it = g_reg.erase(it); continue; }
+        ++it;
+    }
+    g_samples.erase(std::remove_if(g_samples.begin(), g_samples.end(),
+                                   [&](const Sample& s) { return g_reg.find((uint64_t(s.tex) << 8)) == g_reg.end() &&
+                                                                 g_reg.find((uint64_t(s.tex) << 8) | 1) == g_reg.end() &&
+                                                                 g_reg.find((uint64_t(s.tex) << 8) | 2) == g_reg.end() &&
+                                                                 g_reg.find((uint64_t(s.tex) << 8) | 3) == g_reg.end(); }),
+                    g_samples.end());
+    g_sample_next = 0;
+}
+
+void walk_and_blend(uint8_t* rdram, uint32_t head, uint32_t end, Scan& scan, int log) {
+    const auto t0 = std::chrono::steady_clock::now();
+    Walker w;
+    w.rdram = rdram;
+    w.world_only = true;
+    w.exact_edges = true;
+    w.dyn_lo = head;
+    w.dyn_hi = end;
+    w.want = &scan.want;
+    w.skip_tex = &g_volatile;
+    w.skip_start = scan.sky_lo;
+    w.skip_end = scan.sky_hi;
+    w.edges.reserve(512);
+    w.walk(head, end, 0);
+    const std::vector<Edge>& edges = w.edges;
+    std::unordered_set<uint32_t> cur_tex;
+    for (const Edge& e : edges) cur_tex.insert(e.tex.addr);
+    // Candidates: edges of one group with the same two endpoints, found through
+    // a hash of the endpoint pair rather than by testing every pair of edges.
+    auto pkey = [](const int16_t p[3]) {
+        return (uint64_t(uint16_t(p[0])) << 32) | (uint64_t(uint16_t(p[1])) << 16) | uint16_t(p[2]);
+    };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> by_edge;
+    by_edge.reserve(edges.size() * 2 + 1);
+    for (uint32_t i = 0; i < edges.size(); ++i) {
+        uint64_t x = pkey(edges[i].p[0]), y = pkey(edges[i].p[1]);
+        if (x > y) std::swap(x, y);
+        by_edge[(x * 0x9E3779B97F4A7C15ULL) ^ y ^ (uint64_t(edges[i].group) << 56)].push_back(i);
+    }
+    struct Pairing { uint32_t i, j; float diff, grad; bool forward; };
+    std::vector<Pairing> cands;
+    std::vector<std::pair<int, int>> map;
+    for (const auto& entry : by_edge) {
+        const std::vector<uint32_t>& list = entry.second;
+        for (size_t x = 0; x < list.size(); ++x) {
+            for (size_t y = x + 1; y < list.size(); ++y) {
+                const Edge& a = edges[list[x]];
+                const Edge& b = edges[list[y]];
+                if (a.group != b.group) continue;
+                bool forward;
+                if (same_point(a.p[0], b.p[0]) && same_point(a.p[1], b.p[1])) forward = true;
+                else if (same_point(a.p[0], b.p[1]) && same_point(a.p[1], b.p[0])) forward = false;
+                else continue;
+                if (a.tex.addr == b.tex.addr && a.axis == b.axis && a.side == b.side) continue;
+                if (!opposite_sides(a, b)) continue;
+                float diff, grad;
+                if (!measure(rdram, a, b, forward, map, diff, grad)) continue;
+                // Tighter than the sky's 2 x grad + 3: real world and model
+                // seams measured 0.9-6 (0-255), and anything far past that is
+                // two textures that only happen to share an edge.
+                if (diff > std::min(grad + 3.0f, 24.0f)) { ++g_st.rejected; continue; }
+                if (diff < 0.5f) continue;   // already continuous: nothing to write
+                // Never a texture that is a frame or depth buffer this frame.
+                if (in_buffers(a.tex.addr) || in_buffers(b.tex.addr)) continue;
+                cands.push_back({list[x], list[y], diff, grad, forward});
+            }
+        }
+    }
+    std::vector<int32_t> best(edges.size(), -1);
+    auto score = [](const Pairing& c) { return c.diff / (c.grad + 1.0f); };
+    for (size_t c = 0; c < cands.size(); ++c) {
+        for (uint32_t e : {cands[c].i, cands[c].j}) {
+            if (best[e] < 0 || score(cands[c]) < score(cands[size_t(best[e])])) best[e] = int32_t(c);
+        }
+    }
+    uint32_t pairs = 0;
+    for (size_t c = 0; c < cands.size(); ++c) {
+        const Pairing& p = cands[c];
+        if (best[p.i] != int32_t(c) || best[p.j] != int32_t(c)) continue;
+        const Edge& a = edges[p.i];
+        const Edge& b = edges[p.j];
+        float diff, grad;
+        measure(rdram, a, b, p.forward, map, diff, grad);
+        if (log >= 2) {
+            std::fprintf(stderr, "[texseam] pair %08X/%u%u %08X/%u%u fmt=%u/%u %ux%u diff=%.1f grad=%.1f group=%u%s dl=%08X/%08X\n",
+                         a.tex.addr, a.axis, a.side, b.tex.addr, b.axis, b.side, a.tex.fmt, a.tex.siz, a.tex.w,
+                         a.tex.h, p.diff, p.grad, a.group,
+                         std::find(scan.player_groups.begin(), scan.player_groups.end(), a.group) !=
+                             scan.player_groups.end() ? " PLAYER" :
+                         (std::find(scan.actor_groups.begin(), scan.actor_groups.end(), a.group) !=
+                             scan.actor_groups.end() ? " MODEL" : " world"), a.dl, b.dl);
+        }
+        blend_pair(rdram, a, b, map, log, cur_tex);
+        ++pairs;
+    }
+    for (uint64_t id : scan.pending) g_seen.insert(id);
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    ++g_st.walks;
+    g_st.walk_us += us;
+    g_st.walk_max = std::max(g_st.walk_max, us);
+    g_st.edges_max = std::max<uint32_t>(g_st.edges_max, uint32_t(edges.size()));
+    if (log >= 2) {
+        std::fprintf(stderr, "[texseam] walk: %zu new lists, %u cmds, %zu border edges, %zu candidates, %u pairs, %.0f us\n",
+                     scan.pending.size(), w.commands, edges.size(), cands.size(), pairs, us);
+    }
+}
+
+void on_frame(uint8_t* rdram, uint32_t head, uint32_t end, uint32_t sky_lo, uint32_t sky_hi) {
+    const int log = env_mode();
+    if (log < 0 || g_enabled.load(std::memory_order_relaxed) == 0) return;
+    if ((head >> 24) != 0x80 || end <= head || end - head > 0x40000) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint32_t map = rd32(rdram, 0x80132DC0U) & 0xFFFFU;
+    if (map != g_map) {
+        // A map load decompresses its textures afresh: nothing written holds.
+        g_map = map;
+        g_reg.clear(); g_seen.clear(); g_volatile.clear(); g_rewrites.clear(); g_buffers.clear();
+        g_samples.clear(); g_sample_next = 0;
+    }
+    // A few written texels a frame: still ours?
+    for (int n = 0; n < 8 && !g_samples.empty(); ++n) {
+        if (g_sample_next >= g_samples.size()) g_sample_next = 0;
+        const Sample s = g_samples[g_sample_next++];
+        if (raw_texel(rdram, s.addr, s.bytes) == s.value) continue;
+        ++g_st.reloads;
+        if (++g_rewrites[s.tex] >= 2) g_volatile.push_back(s.tex);
+        forget_texture(rdram, s.tex);
+        g_seen.clear();   // walk what is drawn again
+        break;
+    }
+    Scan scan{rdram, head, end, sky_lo, sky_hi};
+    scan.walk(head, end, 0);
+    const double steady = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    ++g_st.frames;
+    g_st.steady_us += steady;
+    g_st.steady_max = std::max(g_st.steady_max, steady);
+    if (!scan.pending.empty()) walk_and_blend(rdram, head, end, scan, log);
+    if (log >= 1 && std::chrono::steady_clock::now() >= g_next_log) {
+        g_next_log = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        std::fprintf(stderr, "[texseam] map 0x%03X frames=%u steady avg=%.1f max=%.1f us | walks=%u total=%.0f max=%.0f us "
+                     "(edges max %u) | pairs blended=%u rejected=%u conflicts=%u | lists seen=%zu borders=%zu "
+                     "rewritten=%u volatile=%zu frame cmds=%u\n", map, g_st.frames,
+                     g_st.steady_us / double(std::max(1U, g_st.frames)), g_st.steady_max, g_st.walks, g_st.walk_us,
+                     g_st.walk_max, g_st.edges_max, g_st.blended, g_st.rejected, g_st.conflicts, g_seen.size(),
+                     g_reg.size(), g_st.reloads, g_volatile.size(), scan.cmds);
+        std::fflush(stderr);
+        g_st = Stats{};
+    }
+}
+
+} // namespace texseam
+
 } // namespace sky_seams
 
 extern "C" std::atomic<uint32_t>* tooie_sky_seams_flag() { return &sky_seams::g_enabled; }
+// "Blend Texture Seams" (texseam, AGENTS.md 7.14).
+extern "C" std::atomic<uint32_t>* tooie_tex_seams_flag() { return &sky_seams::texseam::g_enabled; }
 
 // func_800BFD6C is Tooie's sky draw (`sky_draw`'s analogue: it sets near/far to
 // 5..15000, fills the screen, loads its own projection via func_800E44FC, then
@@ -3149,6 +3630,9 @@ void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
             cam.rot[i] = read_mtx_element(rdram, mtx, i, 3U);
             cam.up[i] = read_mtx_element(rdram, mtx, i, 1U);
         }
+        const float w_len = std::sqrt(cam.rot[0] * cam.rot[0] + cam.rot[1] * cam.rot[1] + cam.rot[2] * cam.rot[2]);
+        const float y_len = std::sqrt(cam.up[0] * cam.up[0] + cam.up[1] * cam.up[1] + cam.up[2] * cam.up[2]);
+        cam.zoom = (w_len > 0.0f) ? (y_len / w_len) : 0.0f;
         have_dir = normalize3(cam.rot) && normalize3(cam.up);
     }
 
@@ -3166,6 +3650,7 @@ void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
     float step[3] = {};
     bool cut = false;
     bool coherent_held = false;  // the velocity rule fired, coherent motion overrode it
+    float zoom_step = 0.0f;
     if (finite && g_have_prev_cam) {
         float deviation = 0.0f;
         for (uint32_t i = 0; i < 3U; ++i) {
@@ -3219,8 +3704,18 @@ void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
             }
         }
         coherent_held = coherent && move > cut_distance() && deviation > move_limit;
+        // A field-of-view snap is a cut too, by the same velocity rule: the change
+        // must be large and unlike last frame's, so a steady zoom is never one.
+        if (have_dir && g_prev_cam_has_dir && cam.zoom > 0.0f && g_prev_cam.zoom > 0.0f) {
+            zoom_step = std::log(cam.zoom / g_prev_cam.zoom);
+        }
+        const float zoom_change = g_prev_cam_motion_known
+            ? std::fabs(zoom_step - g_prev_cam_zoom_step) : std::fabs(zoom_step);
+        const float zoom_limit = g_prev_cam_motion_known ? cut_zoom() : cut_zoom() * 2.0f;
+        const bool zoom_cut = cut_zoom() > 0.0f && std::fabs(zoom_step) > cut_zoom() &&
+                              zoom_change > zoom_limit;
         cut = (!coherent && move > cut_distance() && deviation > move_limit) ||
-              (turn > cut_angle() && turn_change > turn_limit) || roll_cut;
+              (turn > cut_angle() && turn_change > turn_limit) || roll_cut || zoom_cut;
     }
     g_frame_cut = cut && !rt64_cuts_off();
 
@@ -3230,10 +3725,10 @@ void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
             std::chrono::steady_clock::now().time_since_epoch()).count();
         std::fprintf(stderr,
                      "[cam] frame=%u t=%.2f vi=%u pos=(%.1f %.1f %.1f) "
-                     "dir=(%.3f %.3f %.3f) move=%.1f turn=%.1f roll=%.1f%s%s\n",
+                     "dir=(%.3f %.3f %.3f) move=%.1f turn=%.1f roll=%.1f zoom=%.4f%s%s\n",
                      frame, ms, read_word(rdram, kViRetraceInterval),
                      cam.pos[0], cam.pos[1], cam.pos[2], cam.rot[0],
-                     cam.rot[1], cam.rot[2], move, turn, roll,
+                     cam.rot[1], cam.rot[2], move, turn, roll, cam.zoom,
                      cut ? (g_frame_cut ? " CUT" : " CUT(not applied)") : "",
                      coherent_held && !cut ? " coherent" : "");
         std::fflush(stderr);
@@ -3246,6 +3741,7 @@ void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
             g_prev_cam_step[i] = step[i];
         }
         g_prev_cam_turn = turn;
+        g_prev_cam_zoom_step = zoom_step;
         g_prev_cam = cam;
         g_have_prev_cam = true;
     }
@@ -3484,6 +3980,8 @@ void on_frame_end(uint8_t* rdram, recomp_context* ctx, uint32_t dl_head, bool ex
 extern "C" void tooie_frame_end(uint8_t* rdram, recomp_context* ctx) {
     const uint32_t end = read_word(rdram, kRenderBufferState);
     sky_seams::survey_frame(rdram, g_frame_dl_head, end);
+    sky_seams::texseam::on_frame(rdram, g_frame_dl_head, end, sky_seams::g_frame_sky_start,
+                                 sky_seams::g_frame_sky_end > sky_seams::g_frame_sky_start ? sky_seams::g_frame_sky_end : 0U);
     sky_seams::g_frame_sky_start = sky_seams::g_frame_sky_end = 0;
     hud_log(rdram, g_frame_dl_head, end);
     tooie::cutscene_skip::on_frame_end(rdram, ctx, g_frame_dl_head, g_frame_extended);
