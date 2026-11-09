@@ -83,6 +83,12 @@ void tooie_expand_pickup_radius(uint8_t* rdram, recomp_context* ctx);
 // transform-group identities around the player's root and bone matrices
 // without touching a single game matrix; see src/recomp_api.cpp.
 void tooie_rt64_begin_frame(uint8_t* rdram, recomp_context* ctx);
+// Runs just before func_800E7EF4 closes and submits the frame's display list.
+void tooie_frame_end(uint8_t* rdram, recomp_context* ctx);
+// chintroticker's update, on entry (hold Start to skip a cutscene).
+void tooie_cutscene_ticker(uint8_t* rdram, recomp_context* ctx);
+// func_800DA3B8 (set a game flag), on entry: a0 = flag, a1 = value.
+void tooie_flag_write(uint8_t* rdram, recomp_context* ctx);
 void tooie_rt64_player_scope(uint8_t* rdram, recomp_context* ctx,
                              uint32_t stage);
 void tooie_rt64_push_player_root(uint8_t* rdram, recomp_context* ctx);

@@ -447,6 +447,9 @@ extern "C" double tooie_harness_seconds() {
     return origin == 0 ? -1.0 : harness_seconds_since(origin);
 }
 
+// RT64's BT_RT64_FRAMEDUMP times its window on this clock (rt64_present_queue.cpp).
+extern "C" double (*g_bt_rt64_harness_seconds)();
+
 bool get_input_with_autopad(int player_index, uint16_t* buttons_out,
                             float* x_out, float* y_out) {
     static const std::vector<AutopadPress> presses = autopad_script();
@@ -474,6 +477,24 @@ bool get_input_with_autopad(int player_index, uint16_t* buttons_out,
         }
     }
     return true;
+}
+
+// Controller 1's buttons that went down since the last read, for the
+// any-button skip to the file select (cutscene_skip.cpp, AGENTS.md §7.16). The
+// game's own button counters cannot serve: an attract demo replays its
+// recording INTO the raw pad buffer (_glrecord_entrypoint_0), so they report
+// the demo's presses as the player's.
+extern "C" std::atomic<uint32_t> g_bt_pad1_pressed;
+
+bool get_input_tracked(int player_index, uint16_t* buttons_out, float* x_out, float* y_out) {
+    const bool connected = get_input_with_autopad(player_index, buttons_out, x_out, y_out);
+    if (player_index == 0) {
+        static uint16_t last = 0;
+        const uint16_t now = static_cast<uint16_t>(*buttons_out & 0xFF3FU);
+        g_bt_pad1_pressed.fetch_or(static_cast<uint32_t>(now & ~last), std::memory_order_relaxed);
+        last = now;
+    }
+    return connected;
 }
 
 // --- RSP microcode ---------------------------------------------------------
@@ -516,6 +537,10 @@ std::vector<recomp::GameEntry> supported_games = {
 extern "C" std::atomic<uint32_t> g_bt_rt64_vertex_smooth;
 // The sky seam blending switch (recomp_api.cpp, sky_seams, AGENTS.md §7.9).
 extern "C" std::atomic<uint32_t>* tooie_sky_seams_flag();
+// The hold-Start-to-skip switch (cutscene_skip.cpp, AGENTS.md §7.15).
+extern "C" std::atomic<uint32_t>* tooie_hold_skip_flag();
+// The any-button-to-file-select switch (cutscene_skip.cpp, AGENTS.md §7.16).
+extern "C" std::atomic<uint32_t>* tooie_boot_skip_flag();
 
 void initialize_config() {
     const std::filesystem::path recomp_dir =
@@ -525,7 +550,38 @@ void initialize_config() {
     }
 
     recompui::config::GeneralTabOptions general_options{};
-    recompui::config::create_general_tab(general_options);
+    recomp::config::Config& general = recompui::config::create_general_tab(general_options);
+    // Port option: hold Start for a second to skip a cutscene sequence, through
+    // the game's own skip paths (cutscene_skip.cpp, AGENTS.md §7.15).
+    general.add_bool_option(
+        "bt_hold_skip",
+        "Hold Start to Skip Cutscenes",
+        "Hold Start for a second during a cutscene to skip it, the way the game itself skips the intro. "
+        "A short press of Start does what it always did.",
+        true);
+    general.add_option_change_callback("bt_hold_skip",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_hold_skip_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    // Port option: any button during the boot logos, the title or the attract
+    // demo goes straight to the file select, through the game's own Start paths
+    // (cutscene_skip.cpp, AGENTS.md §7.16).
+    general.add_bool_option(
+        "bt_boot_skip",
+        "Skip Straight to File Select",
+        "Press any button during the opening logos, the title screen or the attract demo to go straight to "
+        "the file select, instead of waiting for the logos to finish and pressing Start.",
+        true);
+    general.add_option_change_callback("bt_boot_skip",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_boot_skip_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
     recomp::config::Config& graphics = recompui::config::create_graphics_tab();
     // Port option: smooth the whole-unit snapping of CPU-animated vertices
     // (RT64 GameFrame::smoothVertexRange, AGENTS.md §7.7h). The change callback
@@ -734,6 +790,7 @@ void initialize_launcher_menu(recompui::LauncherMenu* menu) {
 int main(int argc, char** argv) {
     std::fprintf(stderr, "[tooie] main entered\n");
     std::fflush(stderr);
+    g_bt_rt64_harness_seconds = tooie_harness_seconds;
 
     std::set_terminate([]() {
         std::fprintf(stderr, "[tooie] std::terminate called\n");
@@ -878,7 +935,7 @@ int main(int argc, char** argv) {
 
     ultramodern::input::callbacks_t input_callbacks{
         .poll_input = recompinput::poll_inputs,
-        .get_input = get_input_with_autopad,
+        .get_input = get_input_tracked,
         .set_rumble = recompinput::set_rumble,
         .get_connected_device_info = get_connected_device_info,
     };

@@ -1,3 +1,73 @@
+diff --git a/src/common/rt64_math.cpp b/src/common/rt64_math.cpp
+index c20fb51..38d33ad 100644
+--- a/src/common/rt64_math.cpp
++++ b/src/common/rt64_math.cpp
+@@ -6,6 +6,8 @@
+ 
+ #include <cassert>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <memory>
+ 
+ namespace RT64 {
+@@ -52,7 +54,19 @@ namespace RT64 {
+         v[2][2] = -vp[2][3];
+         v[3][2] = -vp[3][3];
+ 
+-        p[2][2] = vp[0][2] / v[0][2];
++        // Every rotation row satisfies vp[i][2] = p[2][2] * v[i][2], so solve it from all three (least squares)
++        // instead of from row 0 alone. Row 0 is the view axis' x component, which is ~0 whenever the camera faces
++        // along Z: a 16.16 matrix then holds two tiny quantized values there (Banjo-Tooie: -0.0007 / -0.0007) and
++        // their ratio is not the projection's (-1.0 against -1.016), which pushed distant geometry past the clip
++        // volume for as long as the camera's yaw stayed within a few thousandths of zero.
++        // BT_RT64_SPLITFIX=off restores the original row-0 split and drops the round-trip check below (A/B only).
++        static const bool splitFixOff = []() {
++            const char *env = std::getenv("BT_RT64_SPLITFIX");
++            return (env != nullptr) && (env[0] == 'o') && (env[1] == 'f');
++        }();
++        const float zDotW = (vp[0][2] * v[0][2]) + (vp[1][2] * v[1][2]) + (vp[2][2] * v[2][2]);
++        const float wDotW = sqr(v[0][2]) + sqr(v[1][2]) + sqr(v[2][2]);
++        p[2][2] = splitFixOff ? (vp[0][2] / v[0][2]) : (zDotW / wDotW);
+         p[3][2] = vp[3][2] - p[2][2] * v[3][2];
+ 
+         p[0][0] = sqrtf(sqr(vp[0][0]) + sqr(vp[1][0]) + sqr(vp[2][0]));
+@@ -71,6 +85,35 @@ namespace RT64 {
+         if (matrixIsNaN(v) || matrixIsNaN(p)) {
+             v = hlslpp::float4x4::identity();
+             p = vp;
++            return;
++        }
++
++        if (splitFixOff) {
++            return;
++        }
++
++        // The split must reproduce the matrix the game loaded: it is what gets rendered whenever projections are
++        // processed (any aspect ratio or refresh rate other than Original). A merged matrix that is not a view times
++        // a symmetric perspective is kept whole, as a NaN split already was.
++        const hlslpp::float4x4 product = hlslpp::mul(v, p);
++        float rotationError = 0.0f;
++        float rotationScale = 0.0f;
++        for (int i = 0; i < 3; i++) {
++            rotationError += hlslpp::dot(hlslpp::abs(product[i] - vp[i]), 1.0f);
++            rotationScale += hlslpp::dot(hlslpp::abs(vp[i]), 1.0f);
++        }
++
++        const float translationError = hlslpp::dot(hlslpp::abs(product[3] - vp[3]), 1.0f);
++        const float translationScale = hlslpp::dot(hlslpp::abs(vp[3]), 1.0f) + 1.0f;
++        if ((rotationError > (1e-3f * rotationScale)) || (translationError > (1e-4f * translationScale))) {
++            // BT_RT64_SPLITLOG=1: one line per merged matrix the split could not reproduce (kept whole).
++            static const bool splitLog = (std::getenv("BT_RT64_SPLITLOG") != nullptr);
++            if (splitLog) {
++                std::fprintf(stderr, "[split] kept whole: rot err %.6f of %.4f, trans err %.6f of %.2f\n", rotationError, rotationScale, translationError, translationScale);
++            }
++
++            v = hlslpp::float4x4::identity();
++            p = vp;
+         }
+     }
+ 
 diff --git a/src/gbi/rt64_gbi_extended.cpp b/src/gbi/rt64_gbi_extended.cpp
 index 20c0d4d..b054be1 100644
 --- a/src/gbi/rt64_gbi_extended.cpp
@@ -48,8 +118,34 @@ index 20c0d4d..b054be1 100644
                      break;
                  }
                  case RT64_HOOK_OP_DISABLE:
+diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
+index ee8bc1f..108064a 100644
+--- a/src/hle/rt64_application.cpp
++++ b/src/hle/rt64_application.cpp
+@@ -6,6 +6,7 @@
+ #include "rhi/rt64_render_hooks.h"
+ 
+ #include <cinttypes>
++#include <cstdlib>
+ #include <filesystem>
+ 
+ #include "common/rt64_dynamic_libraries.h"
+@@ -342,6 +343,13 @@ namespace RT64 {
+ 
+         swapChain = presentGraphicsWorker->commandQueue->createSwapChain(swapChainDesc);
+ 
++        // BT_RT64_UNCAP=1 (testing): present without vsync, so a Manual target above the monitor's refresh
++        // is really rendered (the excess frames are dropped by the compositor, not by RT64). Paired with the
++        // target cap being lifted in WorkloadQueue. Never set in normal play.
++        if (std::getenv("BT_RT64_UNCAP") != nullptr) {
++            swapChain->setVsyncEnabled(false);
++        }
++
+         // Before configuring multisampling, make sure the device actually supports it for the formats we'll use. If it doesn't, turn off antialiasing in the configuration.
+         const RenderSampleCounts colorSampleCounts = device->getSampleCountsSupported(RenderTarget::colorBufferFormat(usesHDR));
+         const RenderSampleCounts depthSampleCounts = device->getSampleCountsSupported(RenderTarget::depthBufferFormat());
 diff --git a/src/hle/rt64_game_frame.cpp b/src/hle/rt64_game_frame.cpp
-index 87392d0..44550ce 100644
+index 87392d0..62a18a0 100644
 --- a/src/hle/rt64_game_frame.cpp
 +++ b/src/hle/rt64_game_frame.cpp
 @@ -9,6 +9,52 @@
@@ -120,7 +216,7 @@ index 87392d0..44550ce 100644
          }
      };
  
-@@ -252,6 +300,321 @@ namespace RT64 {
+@@ -252,6 +300,437 @@ namespace RT64 {
          return matchResult;
      }
  
@@ -354,6 +450,13 @@ index 87392d0..44550ce 100644
 +    // BT_RT64_SEAMLOG=<id >> 8, hex>[-<last>] (a model's root id without its bone byte). Finds vertex pairs on
 +    // different transforms of that model that coincide at both keyframes (a seam) and prints, per frame, how far
 +    // apart the blend RT64 will draw puts them at the midpoint, against a plain component-wise blend.
++    // The game's own (raw) positions of the workload being matched, copied before smoothing rewrites them, so
++    // logSeamGaps can also measure cracks the DRAWN positions open between vertices the game put together.
++    static std::vector<float> &seamRawPositions() {
++        thread_local std::vector<float> raw;
++        return raw;
++    }
++
 +    static void logSeamGaps(const Workload &curWorkload, const Workload &prevWorkload, const GameFrameMap::WorkloadMap &curMap) {
 +        static const char *seamLog = std::getenv("BT_RT64_SEAMLOG");
 +        if (seamLog == nullptr) {
@@ -363,7 +466,8 @@ index 87392d0..44550ce 100644
 +        static char *seamEnd = nullptr;
 +        static const uint32_t prefix = uint32_t(std::strtoul(seamLog, &seamEnd, 16));
 +        static const uint32_t prefixLast = (seamEnd != nullptr && *seamEnd == '-') ? uint32_t(std::strtoul(seamEnd + 1, nullptr, 16)) : prefix;
-+        struct SeamVertex { hlslpp::float3 w0, w1, mid, plain; uint32_t t; uint32_t id; };
++        struct SeamVertex { hlslpp::float3 w0, w1, mid, plain, raw1; uint32_t t; uint32_t id; };
++        const std::vector<float> &rawPos = seamRawPositions();
 +        thread_local std::vector<SeamVertex> verts;
 +        verts.clear();
 +        uint32_t movedTransforms = 0;
@@ -402,6 +506,8 @@ index 87392d0..44550ce 100644
 +                s.w1 = hlslpp::mul(vc, curM).xyz;
 +                s.mid = hlslpp::mul((vtxInterp && moved) ? ((vc + vp) * 0.5f) : vc, mid).xyz;
 +                s.plain = (s.w0 + s.w1) * 0.5f;
++                const size_t ri = (size_t(cd.worldTransformVertexIndices[t]) + i) * 3;
++                s.raw1 = (ri + 2 < rawPos.size()) ? hlslpp::mul(hlslpp::float4(rawPos[ri], rawPos[ri + 1], rawPos[ri + 2], 1.0f), curM).xyz : s.w1;
 +                s.t = t;
 +                s.id = id;
 +                verts.push_back(s);
@@ -411,10 +517,26 @@ index 87392d0..44550ce 100644
 +        uint32_t pairs = 0;
 +        float maxGap = 0.0f, maxPlain = 0.0f;
 +        uint32_t worstA = 0, worstB = 0;
++        // Keyframe cracks: pairs on different transforms the GAME put together this frame (raw positions within
++        // 0.05) and how far apart they are DRAWN on the game frame itself (smoothing changes those, AGENTS.md 7.7j).
++        uint32_t rawPairs = 0, keyCracks = 0;
++        float keyGap = 0.0f;
++        uint32_t keyA = 0, keyB = 0;
 +        for (size_t i = 0; i < verts.size(); i++) {
 +            for (size_t j = i + 1; j < verts.size(); j++) {
 +                if (verts[i].t == verts[j].t) {
 +                    continue;
++                }
++
++                if (float(hlslpp::length(verts[i].raw1 - verts[j].raw1)) <= 0.05f) {
++                    rawPairs++;
++                    const float drawnGap = hlslpp::length(verts[i].w1 - verts[j].w1);
++                    keyCracks += (drawnGap > 0.1f) ? 1 : 0;
++                    if (drawnGap > keyGap) {
++                        keyGap = drawnGap;
++                        keyA = verts[i].id;
++                        keyB = verts[j].id;
++                    }
 +                }
 +
 +                if ((float(hlslpp::length(verts[i].w0 - verts[j].w0)) > 0.5f) || (float(hlslpp::length(verts[i].w1 - verts[j].w1)) > 0.5f)) {
@@ -435,14 +557,116 @@ index 87392d0..44550ce 100644
 +        }
 +
 +        if (!verts.empty()) {
-+            std::fprintf(stderr, "[seam] verts=%zu moved=%u pairs=%u maxgap=%.2f plaingap=%.2f worst=%08X/%08X\n", verts.size(), movedTransforms, pairs, maxGap, maxPlain, worstA, worstB);
++            std::fprintf(stderr, "[seam] verts=%zu moved=%u pairs=%u maxgap=%.2f plaingap=%.2f worst=%08X/%08X rawpairs=%u keycracks=%u keygap=%.2f keyworst=%08X/%08X\n",
++                verts.size(), movedTransforms, pairs, maxGap, maxPlain, worstA, worstB, rawPairs, keyCracks, keyGap, keyA, keyB);
++        }
++
++        // [seam2]: the in-betweens exactly as RSPWorldCS draws them, M(w) * (pos - vel * (1 - w)), for EVERY mapped
++        // transform of the model, count changes included (a swapped part's velocities come from alignVertexLoads,
++        // AGENTS.md 7.7e/7.7i). Pairs the game puts together this frame (within 0.05 at w = 1) should stay together
++        // through the in-betweens wherever they were also together where the blend STARTS (w = 0): `gap` is the
++        // largest drawn separation of such pairs at w = 0.25 / 0.5 / 0.75. `open` counts pairs together at w = 1 but
++        // apart (> 0.1) at w = 0, split by whether a count-changed (swapped) transform is involved: legitimate for
++        // lips closing, a crack when a morph started a rim vertex from the wrong place (AGENTS.md 7.7k).
++        struct DrawnVertex { hlslpp::float3 w[5]; uint32_t id; uint32_t t; bool swapped; };
++        thread_local std::vector<DrawnVertex> dverts;
++        dverts.clear();
++        for (uint32_t t = 0; t < uint32_t(curMap.transforms.size()); t++) {
++            const GameFrameMap::TransformMap &tm = curMap.transforms[t];
++            const TransformGroup &group = cd.transformGroups[cd.worldTransformGroups[t]];
++            const uint32_t id = group.matrixId;
++            if (!tm.mapped || ((id >> 8) < prefix) || ((id >> 8) > prefixLast)) {
++                continue;
++            }
++
++            const uint32_t p = tm.prevTransformIndex;
++            const uint32_t count = cd.worldTransformVertexCount(t);
++            const bool swapped = (count != pd.worldTransformVertexCount(p));
++            const bool vtxInterp = (group.vertexInterpolation != G_EX_COMPONENT_SKIP);
++            const hlslpp::float4x4 &curM = cd.worldTransforms[t];
++            const hlslpp::float4x4 &prevM = pd.worldTransforms[p];
++            hlslpp::float4x4 mats[5];
++            for (uint32_t k = 0; k < 5; k++) {
++                mats[k] = (k == 0) ? prevM : ((k == 4) ? curM : tm.rigidBody.lerp(float(k) * 0.25f, prevM, curM, true));
++            }
++
++            const uint32_t base = cd.worldTransformVertexIndices[t];
++            for (uint32_t i = 0; i < count; i++) {
++                const size_t vi = (size_t(base) + i) * 3;
++                const hlslpp::float3 pos(cd.posFloats[vi], cd.posFloats[vi + 1], cd.posFloats[vi + 2]);
++                const hlslpp::float3 vel = (vtxInterp && (vi + 2 < cd.velFloats.size())) ?
++                    hlslpp::float3(cd.velFloats[vi], cd.velFloats[vi + 1], cd.velFloats[vi + 2]) : hlslpp::float3(0.0f, 0.0f, 0.0f);
++                DrawnVertex d;
++                for (uint32_t k = 0; k < 5; k++) {
++                    const hlslpp::float3 local = pos - vel * (1.0f - float(k) * 0.25f);
++                    d.w[k] = hlslpp::mul(hlslpp::float4(local, 1.0f), mats[k]).xyz;
++                }
++
++                d.id = id;
++                d.t = t;
++                d.swapped = swapped;
++                dverts.push_back(d);
++            }
++        }
++
++        uint32_t together = 0, openPlain = 0, openSwapped = 0;
++        float gap2 = 0.0f, openMax = 0.0f;
++        uint32_t gapA = 0, gapB = 0, openA = 0, openB = 0;
++        for (size_t i = 0; i < dverts.size(); i++) {
++            for (size_t j = i + 1; j < dverts.size(); j++) {
++                // Same-transform pairs count too: a swapped part's rim seals against the PAIRED loads of its own
++                // transform (AGENTS.md 7.7k).
++                if (float(hlslpp::length(dverts[i].w[4] - dverts[j].w[4])) > 0.05f) {
++                    continue;
++                }
++
++                const float g0 = hlslpp::length(dverts[i].w[0] - dverts[j].w[0]);
++                if (g0 > 0.1f) {
++                    const bool sw = dverts[i].swapped || dverts[j].swapped;
++                    (sw ? openSwapped : openPlain)++;
++                    if (sw && (g0 > openMax)) {
++                        openMax = g0;
++                        openA = dverts[i].id;
++                        openB = dverts[j].id;
++                    }
++
++                    continue;
++                }
++
++                together++;
++                for (uint32_t k = 1; k < 4; k++) {
++                    const float g = hlslpp::length(dverts[i].w[k] - dverts[j].w[k]);
++                    if (g > gap2) {
++                        gap2 = g;
++                        gapA = dverts[i].id;
++                        gapB = dverts[j].id;
++                    }
++                }
++            }
++        }
++
++        if (!dverts.empty()) {
++            std::fprintf(stderr, "[seam2] verts=%zu together=%u gap=%.2f gapworst=%08X/%08X open=%u openswapped=%u openmax=%.2f openworst=%08X/%08X\n",
++                dverts.size(), together, gap2, gapA, gapB, openPlain, openSwapped, openMax, openA, openB);
 +        }
 +    }
 +
      void GameFrame::match(RenderWorker *worker, WorkloadQueue &workloadQueue, const GameFrame &prevFrame, BufferUploader *velocityUploader, bool &velocityUploaderUsed, bool &tileInterpolationUsed, bool &lookAtInterpolationUsed) {
          tileInterpolationUsed = false;
          lookAtInterpolationUsed = false;
-@@ -309,12 +672,36 @@ namespace RT64 {
+@@ -296,6 +775,11 @@ namespace RT64 {
+                 prevWorkloadMap = &prevFrame.frameMap.workloads[workloadMap.prevWorkloadIndex];
+             }
+ 
++            static const bool seamLogging = (std::getenv("BT_RT64_SEAMLOG") != nullptr);
++            if (seamLogging) {
++                seamRawPositions() = curWorkload.drawData.posFloats;
++            }
++
+             // Match the transforms linearly in the order they were submitted.
+             ModifiedBuffers modifiedBuffers;
+             auto curIt = curWorkload.transformIdMap.begin();
+@@ -309,12 +793,36 @@ namespace RT64 {
                      prevIt++;
                  }
                  else {
@@ -482,7 +706,7 @@ index 87392d0..44550ce 100644
              if (!modifiedBuffers.empty()) {
                  workloadsModified[workloads[w]].merge(modifiedBuffers);
              }
-@@ -385,6 +772,10 @@ namespace RT64 {
+@@ -385,6 +893,10 @@ namespace RT64 {
                      uploads.emplace_back(BufferUploader::Upload{ workload.drawData.velFloats.data(), { 0, workload.drawData.velFloats.size() }, sizeof(float), RenderBufferFlag::FORMATTED, { RenderFormat::R32_FLOAT }, &workload.drawBuffers.velocityBuffer });
                  }
  
@@ -493,7 +717,7 @@ index 87392d0..44550ce 100644
                  if (it.second.texcoordVelocity) {
                      uploads.emplace_back(BufferUploader::Upload{ workload.drawData.tcVelFloats.data(), { 0, workload.drawData.tcVelFloats.size() }, sizeof(float), RenderBufferFlag::FORMATTED, { RenderFormat::R32_FLOAT }, &workload.drawBuffers.texcoordVelocityBuffer });
                  }
-@@ -460,6 +851,14 @@ namespace RT64 {
+@@ -460,6 +972,14 @@ namespace RT64 {
                  const TransformGroup &curProjGroup = curWorkload.drawData.transformGroups[curProjGroupIndex];
                  const TransformGroup &prevProjGroup = prevWorkload.drawData.transformGroups[prevProjGroupIndex];
  
@@ -508,7 +732,7 @@ index 87392d0..44550ce 100644
                  // Cameras usually look better with simple interpolation, so default decomposition to off.
                  bool projectionDecompose = false;
                  uint8_t projectionLinearComponent = G_EX_COMPONENT_INTERPOLATE;
-@@ -475,6 +874,9 @@ namespace RT64 {
+@@ -475,6 +995,9 @@ namespace RT64 {
                      projectionSkewComponent = curProjGroup.skewInterpolation;
                      projectionPerspectiveComponent = curProjGroup.perspectiveInterpolation;
                      viewProjMap.mapped = (curProjGroup.matrixId == prevProjGroup.matrixId);
@@ -518,7 +742,7 @@ index 87392d0..44550ce 100644
                  }
                  else {
                      viewProjMap.mapped = (curProjGroup.matrixId == G_EX_ID_AUTO);
-@@ -517,6 +919,11 @@ namespace RT64 {
+@@ -517,6 +1040,11 @@ namespace RT64 {
          tileCheckSet.clear();
          lookAtCheckSet.clear();
  
@@ -530,7 +754,7 @@ index 87392d0..44550ce 100644
          // Traverse the map and fill the set with all the combinations of transforms to check.
          for (std::pair<uint64_t, GameCallMap> curIt : curCallHashMap) {
              auto prevRange = prevCallHashMap.equal_range(curIt.first);
-@@ -543,6 +950,9 @@ namespace RT64 {
+@@ -543,6 +1071,9 @@ namespace RT64 {
                          const TransformGroup &prevGroup = prevWorkload.drawData.transformGroups[prevGroupIndex];
                          if ((curGroup.matrixId == prevGroup.matrixId) && ((curGroup.matrixId == G_EX_ID_AUTO) || ((curGroup.matrixId != G_EX_ID_IGNORE) && (curGroup.ordering == G_EX_ORDER_AUTO)))) {
                              transformCheckSet.emplace(curWorldMatrix, prevWorldMatrix);
@@ -540,7 +764,7 @@ index 87392d0..44550ce 100644
                          }
                      }
                  }
-@@ -588,13 +998,19 @@ namespace RT64 {
+@@ -588,13 +1119,19 @@ namespace RT64 {
  
              TransformMatchResult matchResult = computeTransformMatch(curTransform, firstCurViewProj, prevTransform, firstPrevViewProj, prevRigidBody);
              if (matchResult.valid) {
@@ -561,7 +785,7 @@ index 87392d0..44550ce 100644
              if (firstCurWorkloadMap.transforms[candidate.curIndex].mapped) {
                  continue;
              }
-@@ -709,6 +1125,386 @@ namespace RT64 {
+@@ -709,6 +1246,568 @@ namespace RT64 {
          }
      }
  
@@ -621,28 +845,29 @@ index 87392d0..44550ce 100644
 +        }
 +    }
 +
-+    // BT: temporal smoothing of CPU-animated vertex positions ("Smooth Animated Faces", on by default).
++    // BT: smoothing of CPU-animated vertex positions ("Smooth Animated Faces", on by default; AGENTS.md 7.7h).
 +    // A CPU-animated model (Mingella, Grunty, the dinosaur) is skinned by the game itself, which writes
-+    // every vertex back as an s16: each one snaps to a whole model unit on its own, so a close-up face
-+    // shimmers by +-0.5 unit (the PS1 look). Interpolation only blends between those snapped positions.
-+    // Per axis, each vertex is predicted from its own previous drawn position and drawn velocity (both
-+    // already in the previous workload; the prediction may catch up with the game's value but never pass
-+    // it), pulled toward the game's value by `gain`, and CLAMPED to within `band` of it -- so the drawn
-+    // vertex never strays further from the game's than the rounding did, which is what keeps expressions
-+    // from lagging and anything from drifting. A step larger than `pass` is motion, not rounding, and is
-+    // drawn exactly as the game wrote it; between `soft` and `pass` the smoothing fades out so that
-+    // hand-over is continuous. Off at Original refresh (no matching runs). See AGENTS.md 7.7h.
-+    // BT_RT64_VTXSMOOTH=off disables it, =<gain>,<vel>,<band>,<soft>,<pass> tunes it.
++    // every vertex back as an s16: each one snaps to a whole model unit on its own, so in a close-up the
++    // SURFACE shimmers -- neighbouring vertices step at different times and the triangles change shape
++    // (the PS1 look). The rounding is independent per vertex but the real motion is shared by the vertices
++    // around it, so each vertex is moved by the mean motion of its NEIGHBOURHOOD: the mean innovation
++    // (game value - previous drawn position) of the vertices within `radius` that move like it (each axis
++    // within `sim`). Averaged over a few dozen vertices the rounding cancels, so a patch of skin moves as
++    // one and keeps its shape. The result is pulled toward the vertex's own game value by `k` and CLAMPED
++    // to within `band` of it, so nothing lags or drifts by more than that and expressions come through.
++    // Stateless: the previous workload already holds what was DRAWN (positions). Off at Original refresh.
++    // BT_RT64_VTXSMOOTH=off disables it, =<k>,<band>,<radius>,<sim> tunes it, =bones also smooths the vertices of
++    // bone transforms (the old behaviour, for A/B: it opens cracks between bones, AGENTS.md 7.7j).
 +    // BT_RT64_VTXSMOOTHLOG=1 prints per-transform stats, on or off.
 +    // BT_RT64_VTXDUMP=<path>:<count>[,<count>...] appends raw and drawn positions of transforms with those vertex counts.
 +    struct VertexSmoothParams {
 +        bool enabled = true;
++        bool bones = false;
 +        bool log = false;
-+        float gain = 0.35f;
-+        float vel = 0.9f;
-+        float band = 0.5f;
-+        float soft = 3.0f;
-+        float pass = 6.0f;
++        float k = 0.1f;
++        float band = 0.75f;
++        float radius = 12.0f;
++        float sim = 1.5f;
 +    };
 +
 +    static const VertexSmoothParams &vertexSmoothParams() {
@@ -653,8 +878,11 @@ index 87392d0..44550ce 100644
 +                if (v[0] == 'o') {
 +                    p.enabled = false;
 +                }
++                else if (v[0] == 'b') {
++                    p.bones = true;
++                }
 +                else {
-+                    std::sscanf(v, "%f,%f,%f,%f,%f", &p.gain, &p.vel, &p.band, &p.soft, &p.pass);
++                    std::sscanf(v, "%f,%f,%f,%f", &p.k, &p.band, &p.radius, &p.sim);
 +                }
 +            }
 +
@@ -669,6 +897,16 @@ index 87392d0..44550ce 100644
 +        return vertexSmoothParams().enabled && (g_bt_rt64_vertex_smooth.load(std::memory_order_relaxed) != 0);
 +    }
 +
++    // Smoothing is for a transform that carries a WHOLE CPU-skinned body (vertex interpolation INTERPOLATE, the
++    // root of an animated model). A bone of a bone-animated character carries vertex interpolation as AUTO
++    // (AGENTS.md 7.7i): its CPU-modified mouth or beak is blended, but never smoothed. Smoothing moves vertices
++    // off the game's positions by up to `band`, on game frames as well, and a bone's seam partners sit on OTHER
++    // transforms that are not moved with them, so the seams between head, beak and jaw opened into thin dark
++    // cracks (King Jingaling's face, AGENTS.md 7.7j).
++    static bool vertexSmoothingFor(const TransformGroup &group) {
++        return vertexSmoothingActive() && ((group.vertexInterpolation == G_EX_COMPONENT_INTERPOLATE) || vertexSmoothParams().bones);
++    }
++
 +    struct VertexSmoothStats {
 +        uint32_t components = 0;
 +        uint32_t changed = 0;
@@ -678,44 +916,105 @@ index 87392d0..44550ce 100644
 +    };
 +
 +    // Smooths `count` vertices: curPos holds the game's (raw) positions on entry and the drawn ones on exit,
-+    // curVel receives drawn - previous drawn. prevPos/prevVel are the previous frame's drawn data. Returns
-+    // the number of components drawn somewhere other than the game's value (0 = nothing to re-upload).
++    // curVel receives drawn - previous drawn. prevPos/prevVel are the previous frame's drawn data (prevVel is
++    // only used for the log). Returns the number of components drawn somewhere other than the game's value
++    // (0 = nothing to re-upload).
 +    static uint32_t smoothVertexRange(float *curPos, float *curVel, const float *prevPos, const float *prevVel, uint32_t count, VertexSmoothStats *stats) {
 +        const VertexSmoothParams &p = vertexSmoothParams();
-+        const float fadeSpan = std::max(p.pass - p.soft, 1e-3f);
-+        uint32_t changed = 0;
-+        for (uint32_t i = 0; i < count * 3; i++) {
-+            const float q = curPos[i];
-+            const float fp = prevPos[i];
-+            const float vp = prevVel[i];
-+            const float d = std::fabs(q - fp);
-+            float f = q;
-+            if (d < p.pass) {
-+                // Predict along the drawn velocity only while the game's value still lies ahead in that
-+                // direction, and never PAST it: a vertex whose motion stops then settles onto the game's value
-+                // from behind instead of overshooting and ringing. A previous step of `pass` or more (a
-+                // pass-through, i.e. a jump) predicts nothing, or the frame after it would be thrown half a
-+                // unit off.
-+                float pred = fp;
-+                if ((std::fabs(vp) < p.pass) && ((q - fp) * vp > 0.0f)) {
-+                    pred = fp + p.vel * vp;
-+                    pred = (vp > 0.0f) ? std::min(pred, q) : std::max(pred, q);
-+                }
++        const float cell = std::max(p.radius, 1.0f);
++        const float radiusSq = p.radius * p.radius;
++        // A component further than this from where it was drawn is a jump (a part swapped or snapped into
++        // place), not motion to smooth: it is drawn exactly.
++        const float jump = 64.0f;
++        thread_local std::vector<uint64_t> cellKeys;
++        thread_local std::vector<uint32_t> order;
++        thread_local std::vector<float> innovation;
++        thread_local std::vector<float> drawn;
++        cellKeys.resize(count);
++        order.resize(count);
++        innovation.resize(size_t(count) * 3);
++        drawn.resize(size_t(count) * 3);
++        auto cellOf = [cell](float v) { return int32_t(std::floor(v / cell)); };
++        auto keyOf = [](int32_t x, int32_t y, int32_t z) {
++            return (uint64_t(uint32_t(x) & 0x1FFFFF) << 42) | (uint64_t(uint32_t(y) & 0x1FFFFF) << 21) | uint64_t(uint32_t(z) & 0x1FFFFF);
++        };
 +
-+                float s = pred + p.gain * (q - pred);
-+                s = std::min(std::max(s, q - p.band), q + p.band);
-+                const float w = std::min(1.0f, (p.pass - d) / fadeSpan);
-+                f = q + w * (s - q);
-+                if (std::fabs(f - q) < 1e-3f) {
-+                    f = q;
++        for (uint32_t i = 0; i < count; i++) {
++            for (uint32_t j = 0; j < 3; j++) {
++                innovation[i * 3 + j] = curPos[i * 3 + j] - prevPos[i * 3 + j];
++            }
++
++            cellKeys[i] = keyOf(cellOf(prevPos[i * 3 + 0]), cellOf(prevPos[i * 3 + 1]), cellOf(prevPos[i * 3 + 2]));
++            order[i] = i;
++        }
++
++        std::sort(order.begin(), order.end(), [](uint32_t a, uint32_t b) { return cellKeys[a] < cellKeys[b]; });
++        thread_local std::vector<uint64_t> sortedKeys;
++        sortedKeys.resize(count);
++        for (uint32_t i = 0; i < count; i++) {
++            sortedKeys[i] = cellKeys[order[i]];
++        }
++
++        uint32_t changed = 0;
++        for (uint32_t i = 0; i < count; i++) {
++            const float *pi = &prevPos[i * 3];
++            const float *ii = &innovation[i * 3];
++            const int32_t cx = cellOf(pi[0]), cy = cellOf(pi[1]), cz = cellOf(pi[2]);
++            float sum[3] = { 0.0f, 0.0f, 0.0f };
++            uint32_t n = 0;
++            for (int32_t dx = -1; dx <= 1; dx++) {
++                for (int32_t dy = -1; dy <= 1; dy++) {
++                    for (int32_t dz = -1; dz <= 1; dz++) {
++                        const uint64_t key = keyOf(cx + dx, cy + dy, cz + dz);
++                        auto it = std::lower_bound(sortedKeys.begin(), sortedKeys.end(), key);
++                        for (; (it != sortedKeys.end()) && (*it == key); it++) {
++                            const uint32_t jv = order[size_t(it - sortedKeys.begin())];
++                            const float *pj = &prevPos[jv * 3];
++                            const float *ij = &innovation[jv * 3];
++                            const float ddx = pj[0] - pi[0], ddy = pj[1] - pi[1], ddz = pj[2] - pi[2];
++                            if (((ddx * ddx) + (ddy * ddy) + (ddz * ddz)) > radiusSq) {
++                                continue;
++                            }
++
++                            if ((std::fabs(ij[0] - ii[0]) > p.sim) || (std::fabs(ij[1] - ii[1]) > p.sim) || (std::fabs(ij[2] - ii[2]) > p.sim)) {
++                                continue;
++                            }
++
++                            sum[0] += ij[0];
++                            sum[1] += ij[1];
++                            sum[2] += ij[2];
++                            n++;
++                        }
++                    }
 +                }
 +            }
 +
++            for (uint32_t j = 0; j < 3; j++) {
++                const float q = curPos[i * 3 + j];
++                float f = q;
++                if (std::fabs(ii[j]) < jump) {
++                    const float mean = (n >= 3) ? (sum[j] / float(n)) : ii[j];
++                    const float pred = pi[j] + mean;
++                    f = pred + p.k * (q - pred);
++                    f = std::min(std::max(f, q - p.band), q + p.band);
++                    if (std::fabs(f - q) < 1e-3f) {
++                        f = q;
++                    }
++                }
++
++                drawn[i * 3 + j] = f;
++            }
++        }
++
++        for (uint32_t i = 0; i < count * 3; i++) {
++            const float q = curPos[i];
++            const float f = drawn[i];
++            const float fp = prevPos[i];
 +            if (stats != nullptr) {
 +                const float off = std::fabs(f - q);
 +                stats->offsetSum += off;
 +                stats->offsetMax = std::max(stats->offsetMax, off);
-+                stats->rough += std::fabs((f - fp) - vp);
++                stats->rough += std::fabs((f - fp) - prevVel[i]);
 +            }
 +
 +            curPos[i] = f;
@@ -780,11 +1079,23 @@ index 87392d0..44550ce 100644
 +    // Returns the number of paired vertices. BT_RT64_VTXALIGN=off disables it; =noborrow leaves the swapped
 +    // part still instead (its seams then open by up to a frame's motion).
 +    static uint32_t alignVertexLoads(Workload &curWorkload, const Workload &prevWorkload, uint32_t curStart, uint32_t curCount,
-+        uint32_t prevStart, uint32_t prevCount, ModifiedBuffers &modifiedBuffers)
++        uint32_t prevStart, uint32_t prevCount, ModifiedBuffers &modifiedBuffers, bool smooth)
 +    {
 +        static const char *mode = std::getenv("BT_RT64_VTXALIGN");
 +        static const bool off = (mode != nullptr) && (mode[0] == 'o');
-+        static const bool noBorrow = (mode != nullptr) && (mode[0] == 'n');
++        static const bool noBorrow = (mode != nullptr) && (std::strcmp(mode, "noborrow") == 0);
++        // A swapped part (a mouth or eyelid shape) MORPHS from the old shape instead of snapping: each of its
++        // vertices starts from the nearest vertex of the part it replaces. =nomorph restores the snap.
++        static const bool noMorph = (mode != nullptr) && (std::strcmp(mode, "nomorph") == 0);
++        // A part swapped INSIDE a transform whose other loads pair (front/back) is not morphed: it travels with the
++        // skin (the borrowed velocity) and its shape changes on the game frame, as on the N64. Morphing it started
++        // each new vertex from the old part's nearest vertex, independently, which folded the part and opened black
++        // cracks across King Jingaling's chin for the frames of every mouth swap (AGENTS.md 7.7k): frames with a
++        // crack 15.8% morphed, 1.9% not, 4.7% at Original refresh. A transform whose WHOLE geometry is swapped
++        // still morphs (below). =morphpart restores the partial morph for A/B.
++        static const bool morphPart = (mode != nullptr) && (std::strcmp(mode, "morphpart") == 0);
++        constexpr float MorphMaxDistance = 16.0f;
++        constexpr uint32_t MorphMaxVertices = 512;
 +        if (off || (curCount == 0) || (prevCount == 0)) {
 +            return 0;
 +        }
@@ -841,7 +1152,44 @@ index 87392d0..44550ce 100644
 +        }
 +
 +        if ((paired * 2 < curCount) || (paired * 2 < prevCount)) {
-+            return 0;
++            // The whole transform's geometry was swapped (a bone that carries only a mouth shape, say). Morph
++            // it from the old shape when every new vertex has an old one close by; otherwise it steps.
++            if (noMorph || (curCount > MorphMaxVertices) || (prevCount > MorphMaxVertices)) {
++                return 0;
++            }
++
++            std::vector<float> &mPos = curWorkload.drawData.posFloats;
++            const std::vector<float> &mPrev = prevWorkload.drawData.posFloats;
++            std::vector<float> &mVel = curWorkload.drawData.velFloats;
++            thread_local std::vector<uint32_t> nearestPrev;
++            nearestPrev.resize(curCount);
++            for (uint32_t i = 0; i < curCount; i++) {
++                const float *c = &mPos[(curStart + i) * 3];
++                float bestD = FLT_MAX;
++                uint32_t bestU = UINT32_MAX;
++                for (uint32_t u = 0; u < prevCount; u++) {
++                    const float *q = &mPrev[(prevStart + u) * 3];
++                    const float d = ((c[0] - q[0]) * (c[0] - q[0])) + ((c[1] - q[1]) * (c[1] - q[1])) + ((c[2] - q[2]) * (c[2] - q[2]));
++                    if (d < bestD) {
++                        bestD = d;
++                        bestU = u;
++                    }
++                }
++
++                if ((bestU == UINT32_MAX) || (bestD > (MorphMaxDistance * MorphMaxDistance))) {
++                    return 0;
++                }
++
++                nearestPrev[i] = bestU;
++            }
++
++            for (uint32_t i = 0; i < curCount; i++) {
++                for (uint32_t j = 0; j < 3; j++) {
++                    mVel[(curStart + i) * 3 + j] = mPos[(curStart + i) * 3 + j] - mPrev[(prevStart + nearestPrev[i]) * 3 + j];
++                }
++            }
++
++            return curCount;
 +        }
 +
 +        std::vector<float> &curPos = curWorkload.drawData.posFloats;
@@ -850,6 +1198,8 @@ index 87392d0..44550ce 100644
 +        // (v, nearest paired vertex) for the swapped part, so smoothing can carry the same offset over.
 +        thread_local std::vector<std::pair<uint32_t, uint32_t>> borrowed;
 +        borrowed.clear();
++        thread_local std::vector<uint8_t> morphed;
++        morphed.clear();
 +        auto pairLoad = [&](const Load &curLoad, const Load &prevLoad) {
 +            for (uint32_t i = 0; i < curLoad.count; i++) {
 +                for (uint32_t j = 0; j < 3; j++) {
@@ -904,6 +1254,40 @@ index 87392d0..44550ce 100644
 +                    }
 +
 +                    borrowed.emplace_back(v, best);
++                    morphed.push_back(0);
++                }
++
++                // Morph: with the skin's motion taken out, the nearest vertex of the part being replaced is
++                // where this vertex starts from, so the shape changes over the frame instead of snapping.
++                if (!noMorph && morphPart && (best != UINT32_MAX) && (prevLoads.size() > front + back)) {
++                    float target[3];
++                    for (uint32_t j = 0; j < 3; j++) {
++                        target[j] = curPos[v * 3 + j] - curVel[v * 3 + j];
++                    }
++
++                    float bestD = MorphMaxDistance * MorphMaxDistance;
++                    uint32_t bestU = UINT32_MAX;
++                    for (size_t pl = front; pl < prevLoads.size() - back; pl++) {
++                        for (uint32_t k = 0; k < prevLoads[pl].count; k++) {
++                            const uint32_t u = prevLoads[pl].start + k;
++                            const float dx = prevPos[u * 3 + 0] - target[0];
++                            const float dy = prevPos[u * 3 + 1] - target[1];
++                            const float dz = prevPos[u * 3 + 2] - target[2];
++                            const float d = (dx * dx) + (dy * dy) + (dz * dz);
++                            if (d < bestD) {
++                                bestD = d;
++                                bestU = u;
++                            }
++                        }
++                    }
++
++                    if (bestU != UINT32_MAX) {
++                        for (uint32_t j = 0; j < 3; j++) {
++                            curVel[v * 3 + j] = curPos[v * 3 + j] - prevPos[bestU * 3 + j];
++                        }
++
++                        morphed.back() = 1;
++                    }
 +                }
 +            }
 +        }
@@ -911,28 +1295,50 @@ index 87392d0..44550ce 100644
 +        // Smoothing (smoothVertexRange) on the paired loads, against their own previous vertices. A vertex of
 +        // the swapped part has no previous self, so it takes its nearest paired vertex's offset from the
 +        // game's value as well as its velocity: a seam duplicate (same position) stays exactly on its partner.
-+        if (vertexSmoothingActive()) {
++        if (smooth) {
 +            thread_local std::vector<float> rawPos;
 +            rawPos.assign(curPos.begin() + curStart * 3, curPos.begin() + (curStart + curCount) * 3);
 +            uint32_t changed = 0;
-+            auto smoothLoad = [&](const Load &curLoad, const Load &prevLoad) {
-+                changed += smoothVertexRange(&curPos[curLoad.start * 3], &curVel[curLoad.start * 3], &prevPos[prevLoad.start * 3],
-+                    &prevWorkload.drawData.velFloats[prevLoad.start * 3], curLoad.count, nullptr);
++            // The paired loads are gathered and smoothed together, so a neighbourhood can span loads.
++            thread_local std::vector<float> gCur, gVel, gPrev, gPrevVel;
++            thread_local std::vector<uint32_t> gIndex;
++            gCur.clear(); gVel.clear(); gPrev.clear(); gPrevVel.clear(); gIndex.clear();
++            auto gatherLoad = [&](const Load &curLoad, const Load &prevLoad) {
++                for (uint32_t i = 0; i < curLoad.count; i++) {
++                    gIndex.push_back(curLoad.start + i);
++                    for (uint32_t j = 0; j < 3; j++) {
++                        gCur.push_back(curPos[(curLoad.start + i) * 3 + j]);
++                        gVel.push_back(0.0f);
++                        gPrev.push_back(prevPos[(prevLoad.start + i) * 3 + j]);
++                        gPrevVel.push_back(prevWorkload.drawData.velFloats[(prevLoad.start + i) * 3 + j]);
++                    }
++                }
 +            };
 +
 +            for (size_t i = 0; i < front; i++) {
-+                smoothLoad(curLoads[i], prevLoads[i]);
++                gatherLoad(curLoads[i], prevLoads[i]);
 +            }
 +
 +            for (size_t i = 0; i < back; i++) {
-+                smoothLoad(curLoads[curLoads.size() - 1 - i], prevLoads[prevLoads.size() - 1 - i]);
++                gatherLoad(curLoads[curLoads.size() - 1 - i], prevLoads[prevLoads.size() - 1 - i]);
 +            }
 +
-+            for (const std::pair<uint32_t, uint32_t> &b : borrowed) {
++            if (!gIndex.empty()) {
++                changed += smoothVertexRange(gCur.data(), gVel.data(), gPrev.data(), gPrevVel.data(), uint32_t(gIndex.size()), nullptr);
++                for (size_t g = 0; g < gIndex.size(); g++) {
++                    for (uint32_t j = 0; j < 3; j++) {
++                        curPos[gIndex[g] * 3 + j] = gCur[g * 3 + j];
++                        curVel[gIndex[g] * 3 + j] = gVel[g * 3 + j];
++                    }
++                }
++            }
++
++            for (size_t bi = 0; bi < borrowed.size(); bi++) {
++                const std::pair<uint32_t, uint32_t> &b = borrowed[bi];
 +                for (uint32_t j = 0; j < 3; j++) {
 +                    const float offset = curPos[b.second * 3 + j] - rawPos[(b.second - curStart) * 3 + j];
 +                    curPos[b.first * 3 + j] += offset;
-+                    curVel[b.first * 3 + j] = curVel[b.second * 3 + j];
++                    curVel[b.first * 3 + j] = morphed[bi] ? (curVel[b.first * 3 + j] + offset) : curVel[b.second * 3 + j];
 +                    changed += (offset != 0.0f) ? 1 : 0;
 +                }
 +            }
@@ -948,7 +1354,7 @@ index 87392d0..44550ce 100644
      void GameFrame::matchTransform(Workload &curWorkload, const Workload &prevWorkload, GameFrameMap::WorkloadMap &curWorkloadMap, const GameFrameMap::WorkloadMap *prevWorkloadMap, uint32_t curTransformIndex, uint32_t prevTransformIndex, ModifiedBuffers &modifiedBuffers) {
          GameFrameMap::TransformMap &curTransformMap = curWorkloadMap.transforms[curTransformIndex];
          if (prevWorkloadMap != nullptr) {
-@@ -723,12 +1519,30 @@ namespace RT64 {
+@@ -723,12 +1822,30 @@ namespace RT64 {
          curTransformMap.rigidBody.updateAngular(prevTransform, curTransform, curGroup.rotationInterpolation, curGroup.scaleInterpolation, curGroup.skewInterpolation);
          curTransformMap.rigidBody.updatePerspective(prevTransform, curTransform, curGroup.perspectiveInterpolation);
          curTransformMap.rigidBody.updateDecomposition(curTransform, curGroup.decompose);
@@ -979,13 +1385,10 @@ index 87392d0..44550ce 100644
          uint32_t curVertexIndex = curWorkload.drawData.worldTransformVertexIndices[curTransformIndex];
          uint32_t curVertexCount = curWorkload.drawData.worldTransformVertexCount(curTransformIndex);
          uint32_t prevVertexIndex = prevWorkload.drawData.worldTransformVertexIndices[prevTransformIndex];
-@@ -744,16 +1558,86 @@ namespace RT64 {
+@@ -744,13 +1861,107 @@ namespace RT64 {
                  const float *curPosFloatsRef = &curPosFloats[curVertexIndex * 3];
                  const float *prevPosFloatsRef = &prevPosFloats[prevVertexIndex * 3];
                  float *curVelFloatsRef = &curVelFloats[curVertexIndex * 3];
--                for (uint32_t i = 0; i < curVertexCount; i++) {
--                    for (uint32_t j = 0; j < 3; j++) {
--                        curVelFloatsRef[i * 3 + j] = (curPosFloatsRef[i * 3 + j] - prevPosFloatsRef[i * 3 + j]);
 +                const VertexSmoothParams &smoothParams = vertexSmoothParams();
 +                static const bool dumping = (std::getenv("BT_RT64_VTXDUMP") != nullptr);
 +                thread_local std::vector<float> rawCopy;
@@ -994,7 +1397,7 @@ index 87392d0..44550ce 100644
 +                }
 +
 +                VertexSmoothStats stats;
-+                if (vertexSmoothingActive()) {
++                if (vertexSmoothingFor(curGroup)) {
 +                    // The previous workload's positions are what was DRAWN there (already smoothed), and its
 +                    // velocities are the drawn motion into them, so no per-vertex state is kept anywhere else.
 +                    float *curPosMutable = &curWorkload.drawData.posFloats[curVertexIndex * 3];
@@ -1002,8 +1405,8 @@ index 87392d0..44550ce 100644
 +                        &prevWorkload.drawData.velFloats[prevVertexIndex * 3], curVertexCount, smoothParams.log ? &stats : nullptr);
 +                    if (changed > 0) {
 +                        modifiedBuffers.notePositions(curVertexIndex * 3, (curVertexIndex + curVertexCount) * 3);
-                     }
-                 }
++                    }
++                }
 +                else {
 +                    for (uint32_t i = 0; i < curVertexCount; i++) {
 +                        for (uint32_t j = 0; j < 3; j++) {
@@ -1016,7 +1419,7 @@ index 87392d0..44550ce 100644
 +                        for (uint32_t i = 0; i < curVertexCount * 3; i++) {
 +                            stats.rough += std::fabs(curVelFloatsRef[i] - prevVelRef[i]);
 +                        }
- 
++
 +                        stats.components = curVertexCount * 3;
 +                    }
 +                }
@@ -1051,24 +1454,47 @@ index 87392d0..44550ce 100644
 +            }
 +        }
 +        else if ((curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP) && (curVertexCount != prevVertexCount)) {
-+            paired = alignVertexLoads(curWorkload, prevWorkload, curVertexIndex, curVertexCount, prevVertexIndex, prevVertexCount, modifiedBuffers);
++            paired = alignVertexLoads(curWorkload, prevWorkload, curVertexIndex, curVertexCount, prevVertexIndex, prevVertexCount, modifiedBuffers, vertexSmoothingFor(curGroup));
 +            if (paired > 0) {
-                 modifiedBuffers.positionVelocity = true;
++                modifiedBuffers.positionVelocity = true;
 +                g_bt_rt64_vertex_interpolated.fetch_add(1, std::memory_order_relaxed);
-             }
-         }
- 
++            }
++        }
++
 +        // BT_RT64_VTXLOG: every vertex-interpolated transform, with both vertex counts and, when they differ,
 +        // how many vertices alignVertexLoads paired (0 = none: the transform steps at the game's rate).
-+        static const bool vtxLog = (std::getenv("BT_RT64_VTXLOG") != nullptr);
++        static const char *vtxLogEnv = std::getenv("BT_RT64_VTXLOG");
++        static const bool vtxLog = (vtxLogEnv != nullptr);
 +        if (vtxLog && (curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP)) {
 +            std::fprintf(stderr, "[vtx] id=%08X cur=%u prev=%u changed=%d paired=%u\n", curGroup.matrixId, curVertexCount, prevVertexCount,
 +                int((curVertexCount != prevVertexCount) || (curVertexHash != prevVertexHash)), paired);
 +        }
++        else if (vtxLog && (vtxLogEnv[0] == '2') && (curVertexCount > 0)) {
++            // BT_RT64_VTXLOG=2 also reports transforms WITHOUT vertex interpolation whose vertices changed (a
++            // bone carrying CPU-modified geometry, e.g. a talking mouth): counts, how many moved, the largest move.
++            const std::vector<float> &cp = curWorkload.drawData.posFloats;
++            const std::vector<float> &pp = prevWorkload.drawData.posFloats;
++            uint32_t moved = 0;
++            float maxMove = 0.0f;
++            if (curVertexCount == prevVertexCount) {
+                 for (uint32_t i = 0; i < curVertexCount; i++) {
++                    float m = 0.0f;
+                     for (uint32_t j = 0; j < 3; j++) {
+-                        curVelFloatsRef[i * 3 + j] = (curPosFloatsRef[i * 3 + j] - prevPosFloatsRef[i * 3 + j]);
++                        m = std::max(m, std::fabs(cp[(curVertexIndex + i) * 3 + j] - pp[(prevVertexIndex + i) * 3 + j]));
+                     }
 +
-         if ((curGroup.texcoordInterpolation != G_EX_COMPONENT_SKIP) && (curVertexCount == prevVertexCount)) {
-             const std::vector<float> &curTcFloats = curWorkload.drawData.tcFloats;
-             const std::vector<float> &prevTcFloats = prevWorkload.drawData.tcFloats;
++                    moved += (m > 0.0f) ? 1 : 0;
++                    maxMove = std::max(maxMove, m);
+                 }
++            }
+ 
+-                modifiedBuffers.positionVelocity = true;
++            if ((moved > 0) || (curVertexCount != prevVertexCount)) {
++                std::fprintf(stderr, "[vtx2] id=%08X cur=%u prev=%u moved=%u max=%.1f\n", curGroup.matrixId, curVertexCount, prevVertexCount, moved, maxMove);
+             }
+         }
+ 
 diff --git a/src/hle/rt64_game_frame.h b/src/hle/rt64_game_frame.h
 index 00a72f6..6d3ec68 100644
 --- a/src/hle/rt64_game_frame.h
@@ -1105,11 +1531,289 @@ index 00a72f6..6d3ec68 100644
          }
      };
  
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 7de5b69..f3995b8 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -9,7 +9,171 @@
+ 
+ #include "rt64_workload_queue.h"
+ 
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++
++// The BT_AUTOPAD clock (seconds since the first input poll, -1 before it), set by the game so a frame dump
++// is timed on the same clock as BT_AUTOPAD / BT_WARP. Null = the dump times itself from its first frame.
++extern "C" { double (*g_bt_rt64_harness_seconds)() = nullptr; }
++
+ namespace RT64 {
++    // BT_RT64_FRAMEDUMP=<path>[,<step>[,<t0>[,<t1>]]] (testing): appends EVERY presented frame (game and
++    // interpolated) to <path>, point-sampled every <step> pixels of the presented colour target, between t0 and
++    // t1 seconds on the BT_AUTOPAD clock, optionally cropped to the w x h rectangle at (x, y) of the presented target
++    // (,<x>,<y>,<w>,<h> after t1; a close-up of one face at step 1 costs a few MB/s instead of ~600). Record: "FDMP", u32 seq, u32 index in its game frame, u32 frames in
++    // that game frame, f64 t, u32 w, u32 h, then w*h*3 RGB. One readback per present; never set in normal play.
++    namespace {
++        struct FrameDump {
++            bool parsed = false;
++            FILE *file = nullptr;
++            uint32_t step = 5;
++            double t0 = 0.0;
++            double t1 = 1e12;
++            uint32_t cropX = 0;
++            uint32_t cropY = 0;
++            uint32_t cropW = 0;
++            uint32_t cropH = 0;
++            std::chrono::steady_clock::time_point start;
++            std::unique_ptr<RenderBuffer> buffer;
++            uint64_t bufferSize = 0;
++            uint32_t width = 0;
++            uint32_t height = 0;
++            uint32_t rowPitch = 0;
++            RenderFormat format = RenderFormat::UNKNOWN;
++            bool pending = false;
++            uint32_t seq = 0;
++            uint32_t index = 0;
++            uint32_t count = 0;
++            double t = 0.0;
++            std::vector<uint8_t> out;
++
++            double now() {
++                if (g_bt_rt64_harness_seconds != nullptr) {
++                    return g_bt_rt64_harness_seconds();
++                }
++
++                return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++            }
++
++            bool active() {
++                if (!parsed) {
++                    parsed = true;
++                    start = std::chrono::steady_clock::now();
++                    const char *env = std::getenv("BT_RT64_FRAMEDUMP");
++                    if (env != nullptr) {
++                        std::string spec(env);
++                        std::string path = spec;
++                        size_t comma = spec.find(',');
++                        if (comma != std::string::npos) {
++                            path = spec.substr(0, comma);
++                            std::sscanf(spec.c_str() + comma + 1, "%u,%lf,%lf,%u,%u,%u,%u", &step, &t0, &t1, &cropX, &cropY, &cropW, &cropH);
++                        }
++
++                        step = std::max(step, 1U);
++                        file = std::fopen(path.c_str(), "wb");
++                        std::fprintf(stderr, "[fdump] %s step=%u window=%.2f-%.2f %s\n", path.c_str(), step, t0, t1, (file != nullptr) ? "open" : "FAILED");
++                    }
++                }
++
++                if (file == nullptr) {
++                    return false;
++                }
++
++                const double s = now();
++                return (s >= t0) && (s <= t1);
++            }
++
++            // Records the copy of the presented texture into the readback buffer.
++            void record(RenderDevice *device, RenderCommandList *commandList, RenderTexture *texture, RenderFormat textureFormat, uint32_t w, uint32_t h, uint32_t i, uint32_t n) {
++                const uint32_t pixelSize = RenderFormatSize(textureFormat);
++                if ((pixelSize != 4) && (pixelSize != 8)) {
++                    return;
++                }
++
++                const uint32_t alignedWidth = (w + 63) & ~63U;
++                const uint64_t needed = uint64_t(alignedWidth) * pixelSize * h;
++                if ((buffer == nullptr) || (bufferSize < needed)) {
++                    buffer = device->createBuffer(RenderBufferDesc::ReadbackBuffer(needed));
++                    bufferSize = needed;
++                }
++
++                // Plume has no texture-to-buffer path of its own: D3D12 passes the footprint straight through but reads
++                // the destination's texture for its sample positions, so it is given the (single-sampled) source.
++                // Vulkan would take an image-to-image copy here, which is why this instrument is D3D12 only.
++                RenderTextureCopyLocation dst = RenderTextureCopyLocation::PlacedFootprint(buffer.get(), textureFormat, w, h, 1, alignedWidth);
++                dst.texture = texture;
++                commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(texture, RenderTextureLayout::COPY_SOURCE));
++                commandList->copyTextureRegion(dst, RenderTextureCopyLocation::Subresource(texture));
++                commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(texture, RenderTextureLayout::SHADER_READ));
++                width = w;
++                height = h;
++                rowPitch = alignedWidth * pixelSize;
++                format = textureFormat;
++                index = i;
++                count = n;
++                t = now();
++                pending = true;
++            }
++
++            // Writes the record once the GPU has finished with it.
++            void write() {
++                if (!pending) {
++                    return;
++                }
++
++                pending = false;
++                const uint32_t x0 = std::min(cropX, width);
++                const uint32_t y0 = std::min(cropY, height);
++                const uint32_t cw = (cropW > 0) ? std::min(cropW, width - x0) : (width - x0);
++                const uint32_t ch = (cropH > 0) ? std::min(cropH, height - y0) : (height - y0);
++                const uint32_t ow = cw / step;
++                const uint32_t oh = ch / step;
++                out.resize(size_t(ow) * oh * 3);
++                RenderRange readRange(0, bufferSize);
++                const uint8_t *data = reinterpret_cast<const uint8_t *>(buffer->map(0, &readRange));
++                if (data == nullptr) {
++                    return;
++                }
++
++                const bool wide = (format == RenderFormat::R16G16B16A16_UNORM);
++                for (uint32_t y = 0; y < oh; y++) {
++                    const uint8_t *row = data + size_t(y0 + y * step) * rowPitch;
++                    uint8_t *dst = out.data() + size_t(y) * ow * 3;
++                    for (uint32_t x = 0; x < ow; x++) {
++                        if (wide) {
++                            const uint16_t *p = reinterpret_cast<const uint16_t *>(row) + size_t(x0 + x * step) * 4;
++                            dst[x * 3 + 0] = uint8_t(p[0] >> 8);
++                            dst[x * 3 + 1] = uint8_t(p[1] >> 8);
++                            dst[x * 3 + 2] = uint8_t(p[2] >> 8);
++                        }
++                        else {
++                            const uint8_t *p = row + size_t(x0 + x * step) * 4;
++                            const bool bgra = (format == RenderFormat::B8G8R8A8_UNORM);
++                            dst[x * 3 + 0] = bgra ? p[2] : p[0];
++                            dst[x * 3 + 1] = p[1];
++                            dst[x * 3 + 2] = bgra ? p[0] : p[2];
++                        }
++                    }
++                }
++
++                buffer->unmap(0, nullptr);
++                const uint32_t header[4] = { 0x504D4446U, seq++, index, count };
++                const uint32_t size[2] = { ow, oh };
++                std::fwrite(header, sizeof(header), 1, file);
++                std::fwrite(&t, sizeof(t), 1, file);
++                std::fwrite(size, sizeof(size), 1, file);
++                std::fwrite(out.data(), 1, out.size(), file);
++                std::fflush(file);
++            }
++        };
++
++        FrameDump &frameDump() {
++            static FrameDump dump;
++            return dump;
++        }
++    }
++
+     // PresentQueue
+ 
+     PresentQueue::PresentQueue() {
+@@ -347,6 +511,9 @@ namespace RT64 {
+                 if (renderParams.texture != nullptr) {
+                     commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(renderParams.texture, RenderTextureLayout::SHADER_READ));
+                     viRenderer->render(renderParams);
++                    if (frameDump().active()) {
++                        frameDump().record(ext.device, commandList, renderParams.texture, renderParams.textureFormat, renderParams.textureWidth, renderParams.textureHeight, uint32_t(i), uint32_t(framesToPresent));
++                    }
+                 }
+ 
+                 RenderHookDraw *drawHook = GetRenderHookDraw();
+@@ -368,6 +535,8 @@ namespace RT64 {
+                     ext.presentGraphicsWorker->commandQueue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, ext.presentGraphicsWorker->commandFence.get());
+                     ext.presentGraphicsWorker->wait();
+                 }
++
++                frameDump().write();
+             }
+ 
+             if (lockedWorkloadMutex) {
+diff --git a/src/hle/rt64_rdp.cpp b/src/hle/rt64_rdp.cpp
+index a10c11a..b464c04 100644
+--- a/src/hle/rt64_rdp.cpp
++++ b/src/hle/rt64_rdp.cpp
+@@ -5,6 +5,8 @@
+ #include "rt64_rdp.h"
+ 
+ #include <cassert>
++#include <cstdio>
++#include <cstdlib>
+ 
+ #include "../include/rt64_extended_gbi.h"
+ 
+@@ -248,6 +250,10 @@ namespace RT64 {
+     }
+ 
+     void RDP::setColorImage(uint8_t fmt, uint8_t siz, uint16_t width, uint32_t address) {
++        {
++            static const bool rdpLog = (std::getenv("BT_RT64_RDPLOG") != nullptr);
++            if (rdpLog) std::fprintf(stderr, "[rdp] cimg fmt=%u siz=%u w=%u addr=%08X\n", fmt, siz, width, address);
++        }
+         // Make sure the new color image is actually different. Some games will set the color image
+         // multiple times despite setting the exact same parameters.
+         const uint32_t newAddress = maskAddress(address);
+@@ -269,6 +275,10 @@ namespace RT64 {
+     }
+ 
+     void RDP::setDepthImage(uint32_t address) {
++        {
++            static const bool rdpLog = (std::getenv("BT_RT64_RDPLOG") != nullptr);
++            if (rdpLog) std::fprintf(stderr, "[rdp] zimg addr=%08X\n", address);
++        }
+         const uint32_t newAddress = maskAddress(address);
+         if (depthImage.address != newAddress) {
+             depthImage.address = newAddress;
+@@ -909,6 +919,15 @@ namespace RT64 {
+     }
+ 
+     void RDP::setFogColor(uint32_t color) {
++        {
++            // BT_RT64_FOGLOG: every fog colour change (diagnostic).
++            static const bool fogLog = (std::getenv("BT_RT64_FOGLOG") != nullptr);
++            static uint32_t lastColor = 0xFFFFFFFFU;
++            if (fogLog && (color != lastColor)) {
++                std::fprintf(stderr, "[fog] color=%08X\n", color);
++                lastColor = color;
++            }
++        }
+         hlslpp::float4 &fogColor = fogColorStack[fogColorStackSize - 1];
+         fogColor.x = ((color >> 24) & 0xFF) / 255.0f;
+         fogColor.y = ((color >> 16) & 0xFF) / 255.0f;
+@@ -972,6 +991,10 @@ namespace RT64 {
+     }
+     
+     void RDP::setScissor(uint8_t mode, int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, const ExtendedAlignment &extAlignment) {
++        {
++            static const bool rdpLog = (std::getenv("BT_RT64_RDPLOG") != nullptr);
++            if (rdpLog) std::fprintf(stderr, "[rdp] scissor %d %d %d %d\n", ulx, uly, lrx, lry);
++        }
+         FixedRect &scissorRect = scissorRectStack[scissorStackSize - 1];
+         scissorRect.ulx = std::clamp(movedFromOrigin(ulx + extAlignment.leftOffset, extAlignment.leftOrigin), extAlignment.leftBound, extAlignment.rightBound);
+         scissorRect.uly = std::clamp(uly + extAlignment.topOffset, extAlignment.topBound, extAlignment.bottomBound);
+@@ -1031,6 +1054,10 @@ namespace RT64 {
+     }
+ 
+     void RDP::fillRect(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, const ExtendedAlignment &extAlignment) {
++        {
++            static const bool rdpLog = (std::getenv("BT_RT64_RDPLOG") != nullptr);
++            if (rdpLog) std::fprintf(stderr, "[rdp] fill %d %d %d %d\n", ulx, uly, lrx, lry);
++        }
+ #   ifdef LOG_FILLRECT_METHODS
+         RT64_LOG_PRINTF("RDP::fillRect(ulx %d, uly %d, lrx %d, lry %d)", ulx, uly, lrx, lry);
+ #   endif
 diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
-index 1da2550..2adffa8 100644
+index 1da2550..0595393 100644
 --- a/src/hle/rt64_rsp.cpp
 +++ b/src/hle/rt64_rsp.cpp
-@@ -676,6 +676,7 @@ namespace RT64 {
+@@ -5,6 +5,9 @@
+ #include "rt64_rsp.h"
+ 
+ #include <cassert>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
+ 
+ #include "../include/rt64_extended_gbi.h"
+ #include "common/rt64_common.h"
+@@ -676,6 +679,7 @@ namespace RT64 {
          auto &posScreen = workload.drawData.posScreen;
          const auto &mvp = modelViewProjMatrix;
          const uint32_t globalIndex = workload.drawData.vertexCount();
@@ -1117,7 +1821,7 @@ index 1da2550..2adffa8 100644
          for (uint32_t i = dstIndex; i < dstMax; i++) {
              auto &v = vertices[i];
              posFloats.emplace_back(v.x);
-@@ -760,6 +761,7 @@ namespace RT64 {
+@@ -760,6 +764,7 @@ namespace RT64 {
              auto &worldIndices = workload.drawData.worldIndices;
              auto &posTransformed = workload.drawData.posTransformed;
              const uint32_t newIndex = workload.drawData.vertexCount();
@@ -1125,7 +1829,35 @@ index 1da2550..2adffa8 100644
              posFloats.emplace_back(posFloats[globalIndex * 3 + 0]);
              posFloats.emplace_back(posFloats[globalIndex * 3 + 1]);
              posFloats.emplace_back(posFloats[globalIndex * 3 + 2]);
-@@ -1153,6 +1155,28 @@ namespace RT64 {
+@@ -903,6 +908,10 @@ namespace RT64 {
+         const uint32_t rdramAddress = fromSegmentedMasked(address);
+         const Vp_t *vp = reinterpret_cast<const Vp_t *>(state->fromRDRAM(rdramAddress));
+         interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
++        {
++            static const bool rdpLog = (std::getenv("BT_RT64_RDPLOG") != nullptr);
++            if (rdpLog) std::fprintf(stderr, "[rdp] viewport scale=%d %d %d trans=%d %d %d\n", vp->vscale[1], vp->vscale[0], vp->vscale[3], vp->vtrans[1], vp->vtrans[0], vp->vtrans[3]);
++        }
+         viewport.scale.x = float(vp->vscale[1]) / 4.0f;
+         viewport.scale.y = float(vp->vscale[0]) / 4.0f;
+         viewport.scale.z = float(vp->vscale[3]) / DepthRange;
+@@ -988,6 +997,16 @@ namespace RT64 {
+     }
+ 
+     void RSP::setFog(int16_t mul, int16_t offset) {
++        {
++            // BT_RT64_FOGLOG: every fog range change (diagnostic).
++            static const bool fogLog = (std::getenv("BT_RT64_FOGLOG") != nullptr);
++            static int32_t last = INT32_MIN;
++            const int32_t cur = (int32_t(mul) << 16) | uint16_t(offset);
++            if (fogLog && (cur != last)) {
++                std::fprintf(stderr, "[fog] mul=%d offset=%d\n", mul, offset);
++                last = cur;
++            }
++        }
+         fog.mul = mul;
+         fog.offset = offset;
+         fogChanged = true;
+@@ -1153,6 +1172,28 @@ namespace RT64 {
              const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
              const FixedRect viewportClipRect = viewport.rect(clipRatios.data());
              drawRect = viewportClipRect.intersection(scissorRect.intersection(drawRect));
@@ -1181,10 +1913,10 @@ index 8ea27d5..b829b93 100644
          uint32_t vertexCount() const {
              return uint32_t(worldIndices.size());
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
-index 5a331aa..bb7e320 100644
+index 5a331aa..e042f4c 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
-@@ -4,6 +4,13 @@
+@@ -4,6 +4,14 @@
  
  #include "rt64_workload_queue.h"
  
@@ -1194,11 +1926,189 @@ index 5a331aa..bb7e320 100644
 +#include <cstdlib>
 +
 +extern "C" std::atomic<uint32_t> g_bt_rt64_vertex_interpolated;
++extern "C" double (*g_bt_rt64_harness_seconds)();
 +
  #include "common/rt64_thread.h"
  
  #include "rt64_present_queue.h"
-@@ -882,6 +889,10 @@ namespace RT64 {
+@@ -221,8 +229,10 @@ namespace RT64 {
+         case UserConfiguration::RefreshRate::Manual:
+             workloadConfig.targetRate = ext.sharedResources->userConfig.refreshRateTarget;
+ 
+-            // Limit the target rate to the rate detected by the swap chain.
+-            if ((ext.sharedResources->swapChainRate > 0) && (workloadConfig.targetRate > ext.sharedResources->swapChainRate)) {
++            // Limit the target rate to the rate detected by the swap chain. BT_RT64_UNCAP=1 (testing) lifts the
++            // limit so a 60 Hz test monitor can still generate the user's 144 interpolated frames a second.
++            static const bool uncapped = (std::getenv("BT_RT64_UNCAP") != nullptr);
++            if (!uncapped && (ext.sharedResources->swapChainRate > 0) && (workloadConfig.targetRate > ext.sharedResources->swapChainRate)) {
+                 workloadConfig.targetRate = ext.sharedResources->swapChainRate;
+             }
+ 
+@@ -507,7 +517,136 @@ namespace RT64 {
+             resizedTargets.clear();
+             colorDepthPairs.clear();
+ 
+-            const uint32_t fbPairCount = (debuggerRenderer.framebufferIndex >= 0) ? (debuggerRenderer.framebufferIndex + 1) : workload.fbPairCount;
++            uint32_t fbPairCount = (debuggerRenderer.framebufferIndex >= 0) ? (debuggerRenderer.framebufferIndex + 1) : workload.fbPairCount;
++
++            // BT_RT64_FBLIMIT=<n> (testing): render only the first n+1 framebuffer pairs of every workload, the
++            // debugger's framebuffer index as a switch, to see what each pass contributes.
++            static const int fbLimit = (std::getenv("BT_RT64_FBLIMIT") != nullptr) ? std::atoi(std::getenv("BT_RT64_FBLIMIT")) : -1;
++            if ((fbLimit >= 0) && (fbPairCount > uint32_t(fbLimit + 1))) {
++                fbPairCount = uint32_t(fbLimit + 1);
++            }
++
++            // BT_RT64_CALLLOG=<t0>,<t1> (testing): per workload rendered between t0 and t1 on the BT_AUTOPAD clock,
++            // one [calls] line per framebuffer pair (colour/depth image, write and scissor bounds) and one [proj]
++            // line per projection in it (type, transform id, aspect mode, game calls, triangles).
++            static double callLogT0 = -1.0;
++            static double callLogT1 = -1.0;
++            static const bool callLog = []() {
++                const char *env = std::getenv("BT_RT64_CALLLOG");
++                return (env != nullptr) && (std::sscanf(env, "%lf,%lf", &callLogT0, &callLogT1) == 2);
++            }();
++            bool callLogThis = false;
++            if (callLog && (g_bt_rt64_harness_seconds != nullptr)) {
++                const double s = g_bt_rt64_harness_seconds();
++                static uint64_t callLogLast = UINT64_MAX;
++                if ((s >= callLogT0) && (s <= callLogT1) && (workload.workloadId != callLogLast)) {
++                    callLogLast = workload.workloadId;
++                    callLogThis = true;
++                    for (uint32_t f = 0; f < workload.fbPairCount; f++) {
++                        const FramebufferPair &fbPair = workload.fbPairs[f];
++                        const FixedRect &dr = fbPair.drawColorRect;
++                        const FixedRect &sr = fbPair.scissorRect;
++                        std::fprintf(stderr, "[calls] wl=%llu t=%.3f fb=%u col=%08X w=%u dep=%08X draw=(%d,%d,%d,%d) sc=(%d,%d,%d,%d) projs=%u calls=%u dr=%d dw=%d\n",
++                            (unsigned long long)(workload.workloadId), s, f, fbPair.colorImage.address, fbPair.colorImage.width, fbPair.depthImage.address,
++                            dr.ulx / 4, dr.uly / 4, dr.lrx / 4, dr.lry / 4, sr.ulx / 4, sr.uly / 4, sr.lrx / 4, sr.lry / 4,
++                            fbPair.projectionCount, fbPair.gameCallCount, fbPair.depthRead, fbPair.depthWrite);
++                        for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
++                            const Projection &proj = fbPair.projections[p];
++                            uint32_t tris = 0;
++                            for (uint32_t d = 0; d < proj.gameCallCount; d++) {
++                                tris += proj.gameCalls[d].callDesc.triangleCount;
++                            }
++
++                            uint32_t matrixId = 0;
++                            uint32_t aspect = 0;
++                            if (proj.transformsIndex < workload.drawData.viewProjTransformGroups.size()) {
++                                const uint32_t g = workload.drawData.viewProjTransformGroups[proj.transformsIndex];
++                                if (g < workload.drawData.transformGroups.size()) {
++                                    matrixId = workload.drawData.transformGroups[g].matrixId;
++                                    aspect = workload.drawData.transformGroups[g].aspectMode;
++                                }
++                            }
++
++                            std::fprintf(stderr, "[proj] wl=%llu fb=%u p=%u type=%d xf=%u id=%08X aspect=%u calls=%u tris=%u sc=(%d,%d,%d,%d)\n",
++                                (unsigned long long)(workload.workloadId), f, p, int(proj.type), proj.transformsIndex, matrixId, aspect, proj.gameCallCount, tris,
++                                proj.scissorRect.ulx / 4, proj.scissorRect.uly / 4, proj.scissorRect.lrx / 4, proj.scissorRect.lry / 4);
++
++                            // Perspective: where the triangles land on the CPU-side (4:3) screen -- on it, wholly off one
++                            // side of it, or with a vertex behind the eye.
++                            if (proj.type == Projection::Type::Perspective) {
++                                uint32_t onScreen = 0, offScreen = 0, behind = 0;
++                                const auto &pos = workload.drawData.posScreen;
++                                const auto &clip = workload.drawData.posTransformed;
++                                const auto &faces = workload.drawData.faceIndices;
++                                for (uint32_t d = 0; d < proj.gameCallCount; d++) {
++                                    const GameCall &gc = proj.gameCalls[d];
++                                    uint32_t cOn = 0, cOff = 0, cBehind = 0, cAllBehind = 0;
++                                    float cMinW = 1e30f, cMaxW = -1e30f;
++                                    uint32_t cCol = 0;
++                                    for (uint32_t k = 0; k < gc.callDesc.triangleCount; k++) {
++                                        const uint32_t base = gc.meshDesc.faceIndicesStart + k * 3;
++                                        if (base + 2 >= faces.size()) {
++                                            break;
++                                        }
++
++                                        uint32_t outMask = 0x3F;
++                                        bool anyBehind = false;
++                                        for (uint32_t v = 0; v < 3; v++) {
++                                            const uint32_t gi = faces[base + v];
++                                            const hlslpp::float4 c = clip[gi];
++                                            uint32_t m = 0;
++                                            const float w = c.w;
++                                            if (w <= 0.0f) { anyBehind = true; }
++                                            cMinW = std::min(cMinW, w);
++                                            cCol += workload.drawData.normColBytes[gi * 4 + 0] + workload.drawData.normColBytes[gi * 4 + 1] + workload.drawData.normColBytes[gi * 4 + 2];
++                                            cMaxW = std::max(cMaxW, w);
++                                            if (c.x < -w) m |= 1; if (c.x > w) m |= 2;
++                                            if (c.y < -w) m |= 4; if (c.y > w) m |= 8;
++                                            if (c.z < -w) m |= 16; if (c.z > w) m |= 32;
++                                            outMask &= m;
++                                        }
++
++                                        if (anyBehind) behind++; else if (outMask != 0) offScreen++; else onScreen++;
++                                        if (anyBehind) cBehind++; else if (outMask != 0) cOff++; else cOn++;
++                                        if (anyBehind && (outMask & 0x30)) cAllBehind++;
++                                    }
++
++                                    if (((f == 1) || (f == 2)) && (gc.callDesc.triangleCount > 0)) {
++                                        const interop::RDPParams &rdpP = workload.drawData.rdpParams[gc.callDesc.callIndex];
++                                        std::fprintf(stderr, "[cc] wl=%llu f=%u d=%u tris=%u on=%u off=%u behind=%u zout=%u w=[%.1f,%.1f] mtx=%u-%u prim=%.2f,%.2f,%.2f,%.2f env=%.2f,%.2f,%.2f,%.2f om=%08X:%08X cc=%08X:%08X geo=%08X col=%.1f tex=%016llX:%d:%d n=%u\n", (unsigned long long)(workload.workloadId), f, d,
++                                            gc.callDesc.triangleCount, cOn, cOff, cBehind, cAllBehind, cMinW, cMaxW, gc.callDesc.minWorldMatrix, gc.callDesc.maxWorldMatrix,
++                                            rdpP.primColor.x, rdpP.primColor.y, rdpP.primColor.z, rdpP.primColor.w, rdpP.envColor.x, rdpP.envColor.y, rdpP.envColor.z, rdpP.envColor.w,
++                                            gc.shaderDesc.otherMode.H, gc.shaderDesc.otherMode.L, gc.shaderDesc.colorCombiner.H, gc.shaderDesc.colorCombiner.L, gc.callDesc.geometryMode, (gc.callDesc.triangleCount > 0) ? cCol / (9.0f * gc.callDesc.triangleCount) : 0.0f,
++                                            (gc.callDesc.tileCount > 0) ? (unsigned long long)(workload.drawData.callTiles[gc.callDesc.tileIndex].tmemHashOrID) : 0ULL,
++                                            (gc.callDesc.tileCount > 0) ? int(workload.drawData.callTiles[gc.callDesc.tileIndex].tileCopyUsed) : -1,
++                                            (gc.callDesc.tileCount > 0) ? int(workload.drawData.callTiles[gc.callDesc.tileIndex].valid) : -1, gc.callDesc.tileCount);
++                                    }
++                                }
++
++                                (void)pos;
++                                std::fprintf(stderr, "[clip] wl=%llu fb=%u p=%u on=%u off=%u behind=%u\n", (unsigned long long)(workload.workloadId), f, p, onScreen, offScreen, behind);
++                            }
++
++                            // Rectangles, and any call that samples a framebuffer (a tile copy), one line each.
++                            for (uint32_t d = 0; d < proj.gameCallCount; d++) {
++                                const DrawCall &dc = proj.gameCalls[d].callDesc;
++                                bool tileCopy = false;
++                                for (uint32_t t = 0; t < dc.tileCount; t++) {
++                                    const DrawCallTile &tile = workload.drawData.callTiles[dc.tileIndex + t];
++                                    tileCopy = tileCopy || tile.tileCopyUsed;
++                                }
++
++                                if ((proj.type == Projection::Type::Rectangle) || tileCopy) {
++                                    std::fprintf(stderr, "[call] wl=%llu fb=%u p=%u d=%u rect=(%d,%d,%d,%d) cycle=%u fill=%08X tiles=%u copy=%d tris=%u\n",
++                                        (unsigned long long)(workload.workloadId), f, p, d, dc.rect.ulx / 4, dc.rect.uly / 4, dc.rect.lrx / 4, dc.rect.lry / 4,
++                                        (dc.otherMode.H >> 20) & 3U, dc.fillColor, dc.tileCount, tileCopy, dc.triangleCount);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++
+             for (uint32_t f = 0; f < fbPairCount; f++) {
+                 const FramebufferPair &fbPair = workload.fbPairs[f];
+ #           if RT_ENABLED
+@@ -635,7 +774,8 @@ namespace RT64 {
+                     drawParams.rtEnabled = workloadConfig.raytracingEnabled;
+                     drawParams.submissionFrame = workload.submissionFrame;
+                     drawParams.deltaTimeMs = deltaTimeMs;
+-                    drawParams.ubershadersOnly = ubershadersOnly;
++                    static const bool uberOnlyEnv = (std::getenv("BT_RT64_UBERONLY") != nullptr); // A/B: every draw through the ubershader
++                    drawParams.ubershadersOnly = ubershadersOnly || uberOnlyEnv;
+                     drawParams.postBlendNoise = workloadConfig.postBlendNoise;
+                     drawParams.postBlendNoiseNegative = workloadConfig.postBlendNoiseNegative;
+                     drawParams.maxGameCall = std::min(gameCallCountMax - gameCallCursor, fbPair.gameCallCount);
+@@ -709,6 +849,15 @@ namespace RT64 {
+             for (uint32_t f = 0; f < fbPairCount; f++) {
+                 const FramebufferPair &fbPair = workload.fbPairs[f];
+                 bool validTargets = getTargetsFromPair(f);
++                if (callLogThis) {
++                    std::fprintf(stderr, "[fbrec] wl=%llu fb=%u ops=%zu valid=%d colfmt=%d lastdiff=%d h=%u read=%u resized=%d depfb=%d deph=%u depread=%u\n",
++                        (unsigned long long)(workload.workloadId), f, fbPair.startFbOperations.size(), validTargets,
++                        fbPair.colorImage.formatChanged, (colorFb != nullptr) ? int(colorFb->isLastWriteDifferent(Framebuffer::Type::Color)) : -1,
++                        (colorFb != nullptr) ? colorFb->height : 0U, (colorFb != nullptr) ? colorFb->readHeight : 0U,
++                        int(resizedTargets.count(colorTarget)), (depthFb != nullptr), (depthFb != nullptr) ? depthFb->height : 0U,
++                        (depthFb != nullptr) ? depthFb->readHeight : 0U);
++                }
++
+                 fbManager.recordOperations(ext.workloadGraphicsWorker, &workload.fbChangePool, &workload.fbStorage, ext.shaderLibrary, ext.textureCache,
+                     fbPair.startFbOperations, targetManager, fixedResScale, f, workload.submissionFrame);
+ 
+@@ -882,6 +1031,10 @@ namespace RT64 {
          Thread::setCurrentThreadName("RT64 Workload");
  
          WorkloadConfiguration workloadConfig;
@@ -1209,7 +2119,7 @@ index 5a331aa..bb7e320 100644
          int64_t logicalTicks = 0;
          int64_t displayTicks = 0;
          uint32_t originalRateForTicks = 0;
-@@ -988,7 +999,15 @@ namespace RT64 {
+@@ -988,7 +1141,15 @@ namespace RT64 {
                      const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
                      generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty();
  
@@ -1226,7 +2136,7 @@ index 5a331aa..bb7e320 100644
                      if (resetTicks) {
                          logicalTicks = 0;
                          displayTicks = 0;
-@@ -999,20 +1018,44 @@ namespace RT64 {
+@@ -999,20 +1160,44 @@ namespace RT64 {
  
                  // Estimate amount of frames to render based on how many display frames it'd take to reach the next logical frame.
                  uint32_t displayFrames = 1;
@@ -1275,7 +2185,7 @@ index 5a331aa..bb7e320 100644
                  }
                  else if (workload.viOriginalRate > 0) {
                      deltaTimeMs = 1.0f / float(workload.viOriginalRate);
-@@ -1071,7 +1114,7 @@ namespace RT64 {
+@@ -1071,7 +1256,7 @@ namespace RT64 {
                          const int64_t expectedTimeMicro = frame * maxTimePerFrameMicro;
                          const int64_t measuredFrameMicro = renderTimeTotalMicro / framesRendered;
                          if ((currentTimeMicro > expectedTimeMicro) || ((currentTimeMicro + measuredFrameMicro) > adjustedTimeWindowMicro)) {
@@ -1284,7 +2194,7 @@ index 5a331aa..bb7e320 100644
                              skippedFrames = true;
                              continue;
                          }
-@@ -1080,9 +1123,9 @@ namespace RT64 {
+@@ -1080,9 +1265,9 @@ namespace RT64 {
                      RenderTarget *overrideTarget = nullptr;
                      uint32_t overrideModifier = 0;
                      if (generateInterpolatedFrames) {
@@ -1297,7 +2207,7 @@ index 5a331aa..bb7e320 100644
  
                          // Override the render target.
                          if (usingMSAA || (frame > 0)) {
-@@ -1143,7 +1186,7 @@ namespace RT64 {
+@@ -1143,7 +1328,7 @@ namespace RT64 {
  
                          // Add the amount of display ticks that correspond to the remaining frames.
                          if (skipWorkloadNow) {

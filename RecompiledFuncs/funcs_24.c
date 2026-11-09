@@ -7859,6 +7859,7 @@ L_800A74FC:
     // 0x800A7514: or          $a1, $s0, $zero
     ctx->r5 = ctx->r16 | 0;
     after_19:
+    tooie_frame_end(rdram, ctx);
     // 0x800A7518: jal         0x800E7EF4
     // 0x800A751C: or          $a0, $s1, $zero
     ctx->r4 = ctx->r17 | 0;

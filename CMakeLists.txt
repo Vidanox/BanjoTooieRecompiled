@@ -104,6 +104,7 @@ target_sources(RecompiledFuncs PRIVATE ${FUNC_C_SOURCES} ${FUNC_CXX_SOURCES})
 add_executable(BanjoTooieRecompiled)
 
 set(SOURCES
+    ${CMAKE_SOURCE_DIR}/src/cutscene_skip.cpp
     ${CMAKE_SOURCE_DIR}/src/main.cpp
     ${CMAKE_SOURCE_DIR}/src/recomp_api.cpp
     ${CMAKE_SOURCE_DIR}/src/register_overlays.cpp

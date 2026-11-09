@@ -448,6 +448,32 @@ func = "func_800A73F4"
 before_vram = 0x800A73F4
 text = "tooie_rt64_begin_frame(rdram, ctx);"
 
+# The end of the frame's display list: 0x800A7518 is the call to func_800E7EF4,
+# which appends G_RDPFULLSYNC + G_ENDDL and submits the list, so everything the
+# game draws this frame (the 2D HUD and screen transitions included) is already
+# in it. The hold-to-skip indicator is appended here, on top (AGENTS.md 7.15),
+# and the BT_WORLD_SEAMS / BT_HUDLOG surveys walk the finished list.
+[[patches.hook]]
+func = "func_800A73F4"
+before_vram = 0x800A7518
+text = "tooie_frame_end(rdram, ctx);"
+
+# chintroticker runs every cutscene sequence (the intro, the "Meanwhile..."
+# scenes, the boot logos) and its update holds the game's own skip paths. Hold
+# Start to skip performs them from here (src/cutscene_skip.cpp, AGENTS.md 7.15).
+[[patches.hook]]
+func = "func_808005AC_chintroticker"
+before_vram = 0x808005AC
+text = "tooie_cutscene_ticker(rdram, ctx);"
+
+# Every game flag is written through func_800DA3B8(flag, value). BT_HOLDSKIP=log
+# prints each write: how the flags a skipped sequence still has to set were
+# measured (src/cutscene_skip.cpp kSceneFlags, AGENTS.md 7.15).
+[[patches.hook]]
+func = "func_800DA3B8"
+before_vram = 0x800DA3B8
+text = "tooie_flag_write(rdram, ctx);"
+
 # func_80098BA8 is the verified player draw wrapper, so its entry and exit
 # bracket exactly the draws belonging to one player. The identity comes from
 # the stable player-state slot, not from draw order.

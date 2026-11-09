@@ -854,12 +854,28 @@ extern "C" void tooie_expand_frustum(uint8_t* rdram, recomp_context* ctx) {
         ultramodern::renderer::AspectRatio::Expand) {
         return;
     }
+    // BT_EXPAND_FRUSTUM=off leaves the game's 4:3 planes alone (A/B); =log prints the planes it widens.
+    static const char* frustum_env = std::getenv("BT_EXPAND_FRUSTUM");
+    if (frustum_env != nullptr && frustum_env[0] == 'o') {
+        return;
+    }
     const float expansion = tooie::visibility::display_aspect_ratio() /
                             (4.0f / 3.0f);
     if (expansion <= 1.0f) {
         return;
     }
     const gpr camera = ctx->r16;
+    if (frustum_env != nullptr && frustum_env[0] == 'l') {
+        float v[16];
+        for (int i = 0; i < 16; ++i) {
+            const uint32_t bits = MEM_W(0x24 + i * 4, camera);
+            std::memcpy(&v[i], &bits, sizeof(bits));
+        }
+        std::fprintf(stderr, "[frustum] cam=%08X L=(%.3f %.3f %.3f %.0f) R=(%.3f %.3f %.3f %.0f) "
+                     "T=(%.3f %.3f %.3f %.0f) B=(%.3f %.3f %.3f %.0f)\n",
+                     static_cast<uint32_t>(camera), v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                     v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+    }
     tooie::visibility::Plane planes[2]{};
     for (int side = 0; side < 2; ++side) {
         const int offset = 0x24 + side * 0x10;
@@ -1101,6 +1117,12 @@ static_assert(kProjectionGroupFlags == 0x02008AAAU, "projection group flags");
 // no-op, and it is safe to give every animated root rather than a list.
 constexpr uint32_t kVertexInterpolateBits =
     static_cast<uint32_t>(G_EX_COMPONENT_INTERPOLATE) << 13;
+// The same for the BONES of an animated model (AGENTS.md 7.7i), as AUTO: RT64 blends their CPU-modified vertices
+// exactly as INTERPOLATE's, but smooths only INTERPOLATE (the patched GameFrame::vertexSmoothingFor). Smoothing a
+// bone's vertices moved them off the game's positions while their seam partners on the neighbouring bones stayed
+// put, which opened thin dark cracks in King Jingaling's face (AGENTS.md 7.7j).
+constexpr uint32_t kBoneVertexInterpolateBits =
+    static_cast<uint32_t>(G_EX_COMPONENT_AUTO) << 13;
 static_assert((kActorGroupFlags & (3U << 13)) == 0U &&
                   (kRootGroupFlags & (3U << 13)) == 0U,
               "vertex interpolation is off in the base flags");
@@ -1625,9 +1647,36 @@ float cut_angle() {
     return value;
 }
 
+// How far the camera's screen-up vector may turn in one game frame before the
+// frame counts as a cut, in degrees. BT_RT64_CUT_ROLL overrides it (0 = off).
+// A camera that looks at Banjo from straight above flips its roll by ~150
+// degrees in one frame as he passes under it (its look-at singularity), while
+// its view direction turns only ~4; projections blend as plain matrices, and a
+// blend of two views that far apart is a degenerate matrix (AGENTS.md 7.11).
+float cut_roll() {
+    static const float value = env_float("BT_RT64_CUT_ROLL", 45.0f);
+    return value;
+}
+
 // The limits right after a cut, when there is no previous step to compare with.
 constexpr float kCutUnknownDistance = 400.0f;
 constexpr float kCutUnknownAngle = 40.0f;
+
+// Coherent motion (evaluate_camera_cut, AGENTS.md 7.6c): a step at most this
+// many times the previous one (plus the cut distance), within acos(0.7) = 45.6
+// degrees of it, from a camera that was moving at least this fast, is a speed
+// change. BT_RT64_CUT_COHERENT=off restores the plain velocity rule.
+constexpr float kCutCoherentMinStep = 20.0f;
+constexpr float kCutCoherentCos = 0.7f;
+constexpr float kCutCoherentRatio = 3.0f;
+
+bool rt64_cut_coherent_off() {
+    static const bool off = [] {
+        const char* v = std::getenv("BT_RT64_CUT_COHERENT");
+        return v != nullptr && (std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0);
+    }();
+    return off;
+}
 
 uint32_t g_frame_enables = 0;
 uint32_t g_frame_root_groups = 0;
@@ -1672,6 +1721,7 @@ thread_local uint32_t g_sky_layer = 0;
 struct CameraSample {
     float pos[3];
     float rot[3];  // unit view direction
+    float up[3];   // unit screen-up direction (clip y axis in world space)
 };
 bool g_cam_sampled = false;
 bool g_frame_cut = false;
@@ -1791,10 +1841,16 @@ void pace_recorded_frame(uint8_t* rdram) {
     // divisor of 6 -- 10 Hz for the whole scene -- because once paced every
     // frame really lasts 6 VIs, so step stays above the divisor and the quiet
     // release below can never fire (AGENTS.md 7.8).
+    // Nor may a frame that started within the same VI as the last one: after an
+    // overrun the catch-up frame can read elapsed 0, and the game still advances
+    // it by step 1. Measured in the throne room (steps 3, then 1 with elapsed 0,
+    // 3.4 ms apart) that latched recorded timing and locked normal play at 20 Hz
+    // for the rest of the scene, by the same self-holding mechanism (AGENTS.md
+    // 7.6b). A recorded demo step always has at least one real VI behind it.
     const uint32_t raw_step = read_byte(rdram, kFrameStepVis);
     const uint32_t step = std::min(raw_step, 6U);
     const uint32_t elapsed = read_byte(rdram, kFrameElapsedVis);
-    if (raw_step <= 6U && step > elapsed) {
+    if (raw_step <= 6U && elapsed > 0U && step > elapsed) {
         if (!g_recorded_timing && pace_log_enabled()) {
             std::fprintf(stderr, "[pacing] latch: frame %u step %u elapsed %u divisor %u\n",
                          frame, raw_step, elapsed, divisor);
@@ -1871,7 +1927,22 @@ namespace tooie::harness {
 void on_frame(uint8_t* rdram, recomp_context* ctx);
 }
 
+namespace {
+// Where this frame's display list starts (the cursor at func_800A73F4's entry),
+// for the walks run at its end (tooie_frame_end).
+uint32_t g_frame_dl_head = 0;
+// Whether this frame's list carries RT64's extended-GBI enable.
+bool g_frame_extended = false;
+// The gfx positions of this frame's orthographic (2D) and perspective
+// projection loads, in order, for BT_HUDLOG.
+struct ProjMark { uint32_t gfx; bool ortho; };
+std::vector<ProjMark> g_frame_proj_marks;
+} // namespace
+
 extern "C" void tooie_rt64_begin_frame(uint8_t* rdram, recomp_context* ctx) {
+    g_frame_dl_head = read_word(rdram, kRenderBufferState);
+    g_frame_extended = false;
+    g_frame_proj_marks.clear();
     // BT_POKE / BT_WARP / BT_POS (src/test_harness.cpp): once per game frame, on
     // the game thread. A single null check when none of them is set.
     tooie::harness::on_frame(rdram, ctx);
@@ -1986,13 +2057,33 @@ extern "C" void tooie_rt64_begin_frame(uint8_t* rdram, recomp_context* ctx) {
         return;
     }
     ++g_frame_enables;
+    g_frame_extended = true;
 
     // Tooie's VI manager keeps its current frame divisor at 0x8007913C: 2 for
     // the usual 30 Hz, 3 for the 20 Hz some overlays select. Report the rate
     // the game is actually running at, which is what RT64 interpolates from.
     const uint32_t divisor = read_word(rdram, kViRetraceInterval);
+    uint32_t rate_divisor = divisor;
+    // A frame that overran is followed by a short catch-up frame (measured in the
+    // throne room: steps 2, 1, 3 against a divisor of 2, arriving 48, 6 and 46 ms
+    // apart), and the world advances by the STEP, not by the divisor. Reported at
+    // the divisor's rate, RT64 gave all three frames the same display time, so the
+    // motion halved and then ran 1.5x, and the frames it could not fit before the
+    // next one arrived were dropped (AGENTS.md 7.6b). The step is reported instead
+    // when it is a plausible frame length that really passed (elapsed agrees, or
+    // is 0 on a catch-up frame); a load stall (step 7-15) and a recorded demo step
+    // (step > elapsed, §7.8) keep the divisor. BT_RT64_STEPRATE=off restores the
+    // divisor alone for A/B.
+    static const bool step_rate_off = rt64_env_off("BT_RT64_STEPRATE");
+    const uint32_t step = read_byte(rdram, kFrameStepVis);
+    const uint32_t step_elapsed = read_byte(rdram, kFrameElapsedVis);
+    if (!step_rate_off && divisor > 0U && divisor <= 6U && step >= 1U &&
+        step <= std::min(divisor * 2U, 6U) &&
+        (step_elapsed == step || step_elapsed == 0U)) {
+        rate_divisor = step;
+    }
     const uint32_t refresh_rate =
-        (divisor > 0U && divisor <= 60U) ? 60U / divisor : 30U;
+        (rate_divisor > 0U && rate_divisor <= 60U) ? 60U / rate_divisor : 30U;
     if (!append_command(rdram, kRenderBufferState, kSetRefreshRateWord0,
                         refresh_rate)) {
         note_append_failure(1U);
@@ -2147,6 +2238,14 @@ extern "C" void tooie_rt64_push_player_root(uint8_t* rdram,
 
     if (animated && !rt64_verts_off()) {
         root_flags |= kVertexInterpolateBits;
+        // The bones too (AGENTS.md 7.7i): a bone-animated character's mouth, beak and eyelids are CPU-modified
+        // vertices (and part swaps) UNDER a bone transform, so without this they stepped at the cutscene's
+        // 20 Hz while the bones around them glided. Static bone geometry is untouched (RT64 only blends
+        // vertices that changed). BT_RT64_BONEVERTS=off restores the old flags for A/B.
+        static const bool bone_verts_off = rt64_env_off("BT_RT64_BONEVERTS");
+        if (!bone_verts_off) {
+            scope.bone_flags |= kBoneVertexInterpolateBits;
+        }
     }
     // Where this model's commands start (BT_RT64_ACTORLOG counts from here).
     scope.gfx_start = read_word(rdram, cursor);
@@ -2330,6 +2429,7 @@ int env_mode() {
         if (std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0) return -1;
         if (std::strcmp(v, "log") == 0) return 2;
         if (std::strcmp(v, "log2") == 0) return 3;
+        if (std::strcmp(v, "log3") == 0) return 4;
         return 0;
     }();
     return mode;
@@ -2357,6 +2457,8 @@ struct Edge {
     uint32_t group;
     Tex tex;
     uint8_t axis, side;  // axis 0: an s border (column), 1: a t border (row)
+    uint32_t dl;         // the display list the triangle was drawn from
+    uint32_t state[4];   // combiner (2 words), other mode high/low as last set
 };
 
 bool supported(uint8_t fmt, uint8_t siz) {
@@ -2431,6 +2533,21 @@ struct Walker {
     Load loads[4] = {};
     uint32_t group = 0;
     uint32_t commands = 0;
+    uint32_t cur_dl = 0;
+    uint32_t state[4] = {};
+    bool dump = false;
+    // World seam survey (BT_WORLD_SEAMS=log): collect border edges of every
+    // format, not only the ones whose texels can be read and blended, and count
+    // what the textured triangles use.
+    bool any_format = false;
+    uint32_t skip_start = 0, skip_end = 0;  // a top-level range not to walk (the sky's)
+    uint32_t tex_tris = 0, clamp_tris = 0, offset_tile_tris = 0;
+    // Survey only: skip 2D (orthographic) draws -- level title cards, the HUD,
+    // the pause screen -- so what is counted is the 3D world.
+    bool world_only = false;
+    size_t mark = 0;
+    bool in_ortho = false;
+    uint32_t ortho_tris = 0;
     std::vector<Edge> edges;
 
     bool resolve(uint32_t a, uint32_t& out) const {
@@ -2443,7 +2560,7 @@ struct Walker {
 
     bool texture_of(Tex& t) const {
         const Tile& tile = tiles[render_tile];
-        if (!tile.sized || !supported(tile.fmt, tile.siz) || tile.uls != 0 || tile.ult != 0) return false;
+        if (!tile.sized || (!any_format && !supported(tile.fmt, tile.siz)) || tile.uls != 0 || tile.ult != 0) return false;
         for (const Load& l : loads) {
             if (!l.valid || l.tmem != tile.tmem) continue;
             t.addr = l.addr;
@@ -2459,6 +2576,15 @@ struct Walker {
 
     void triangle(int a, int b, int c) {
         if (!tex_on || a >= 64 || b >= 64 || c >= 64) return;
+        if (world_only && in_ortho) { ++ortho_tris; return; }
+        ++tex_tris;
+        {
+            const Tile& tile = tiles[render_tile];
+            if ((tile.cms & 2) || (tile.cmt & 2)) {
+                ++clamp_tris;
+                if (tile.sized && (tile.uls != 0 || tile.ult != 0)) ++offset_tile_tris;
+            }
+        }
         Tex t;
         if (!texture_of(t)) return;
         const int idx[3] = {a, b, c};
@@ -2483,6 +2609,8 @@ struct Walker {
                     ed.tex = t;
                     ed.axis = axis;
                     ed.side = side;
+                    ed.dl = cur_dl;
+                    std::memcpy(ed.state, state, sizeof(state));
                     if (edges.size() < 4096) edges.push_back(ed);
                 }
             }
@@ -2490,10 +2618,20 @@ struct Walker {
     }
 
     void walk(uint32_t start, uint32_t end, int depth) {
-        for (uint32_t pc = start; pc < end && commands < 20000; pc += 8) {
+        const uint32_t saved_dl = cur_dl;
+        cur_dl = start;
+        struct Restore { uint32_t& r; uint32_t v; ~Restore() { r = v; } } restore{cur_dl, saved_dl};
+        for (uint32_t pc = start; pc < end && commands < (any_format ? 400000U : 20000U); pc += 8) {
+            if (depth == 0 && pc >= skip_start && pc < skip_end) { pc = skip_end - 8; continue; }
+            if (depth == 0 && world_only) {
+                while (mark < g_frame_proj_marks.size() && g_frame_proj_marks[mark].gfx <= pc) {
+                    in_ortho = g_frame_proj_marks[mark++].ortho;
+                }
+            }
             ++commands;
             const uint32_t w0 = rd32(rdram, pc);
             const uint32_t w1 = rd32(rdram, pc + 4);
+            if (dump) std::fprintf(stderr, "[skydl] %d %08X: %08X %08X\n", depth, pc, w0, w1);
             switch (w0 >> 24) {
             case 0x01: {
                 const uint32_t n = (w0 >> 12) & 0xFF;
@@ -2517,6 +2655,19 @@ struct Walker {
                 triangle(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
                 triangle(((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
                 break;
+            case 0xFC: state[0] = w0; state[1] = w1; break;
+            case 0xE2: case 0xE3: {
+                // G_SETOTHERMODE_L/H: len = (w0 & 0xFF) + 1, shift = 32 - ((w0 >> 8) & 0xFF) - len.
+                const uint32_t len = (w0 & 0xFF) + 1;
+                const int shift = 32 - int((w0 >> 8) & 0xFF) - int(len);
+                if (shift >= 0) {
+                    const uint32_t mask = uint32_t(((1ULL << len) - 1ULL) << shift);
+                    uint32_t& word = state[(w0 >> 24) == 0xE3 ? 2 : 3];
+                    word = (word & ~mask) | (w1 & mask);
+                }
+                break;
+            }
+            case 0xEF: state[2] = w0 & 0x00FFFFFFU; state[3] = w1; break;
             case 0xD7:
                 tex_on = ((w0 >> 1) & 0x7F) != 0;
                 render_tile = (w0 >> 8) & 7;
@@ -2606,13 +2757,29 @@ struct State {
     uint32_t key = 0;
     bool have = false;
 };
-State g_state;
+// The last few skies processed. A storm sky alternates between two segment sets at the lightning's pace
+// (the intro: 231 and 579 commands, every 2-3 frames), and with a single entry each switch re-processed
+// the sky (0.3-1.5 ms on the game thread) and re-blended texels that were already blended.
+constexpr int kStateCount = 4;
+State g_states[kStateCount];
+int g_state_next = 0;
+State g_state;  // the entry being filled by process()
 
-void process(uint8_t* rdram, uint32_t dl_start, uint32_t dl_end, int log) {
+// `survey` (the world seam survey, BT_WORLD_SEAMS=log) walks the whole frame
+// except the sky, collects border edges of every format and writes nothing.
+struct Survey { uint32_t skip_start, skip_end; uint32_t fmt_pairs[32]; uint32_t unsupported; };
+void process(uint8_t* rdram, uint32_t dl_start, uint32_t dl_end, int log, Survey* survey = nullptr) {
     const auto t0 = std::chrono::steady_clock::now();
     Walker w;
     w.rdram = rdram;
+    w.dump = log >= 3;
     w.edges.reserve(512);
+    if (survey != nullptr) {
+        w.any_format = true;
+        w.skip_start = survey->skip_start;
+        w.skip_end = survey->skip_end;
+        w.world_only = true;
+    }
     w.walk(dl_start, dl_end, 0);
     const std::vector<Edge>& edges = w.edges;
 
@@ -2641,7 +2808,40 @@ void process(uint8_t* rdram, uint32_t dl_start, uint32_t dl_end, int log) {
         table_val[h] = uint32_t(slots.size() - 1);
         return slots.size() - 1;
     };
-    uint32_t accepted = 0, rejected = 0, skipped = 0;
+    uint32_t accepted = 0, rejected = 0, skipped = 0, displaced = 0;
+    // Measures a candidate pair: maps A's border texels onto B's and returns the mean difference across
+    // the seam and the texture's own gradient next to it. False when the two do not form a seam.
+    struct Candidate { uint32_t i, j; float diff, grad; bool forward, ok; };
+    auto measure = [&](const Edge& a, const Edge& b, bool forward, std::pair<int, int>* map, size_t& mapped,
+                       float& diff, float& grad) {
+        const float a0 = a.along[0], a1 = a.along[1];
+        const float b0 = forward ? b.along[0] : b.along[1];
+        const float b1 = forward ? b.along[1] : b.along[0];
+        mapped = 0; diff = 0; grad = 0;
+        if (std::fabs(a1 - a0) < 1.0f) return false;
+        const int la = border_len(a), lb = border_len(b);
+        for (int k = 0; k < la; ++k) {
+            if (k < std::min(a0, a1) - 0.01f || k > std::max(a0, a1) + 0.01f) continue;
+            const float u = (k - a0) / (a1 - a0);
+            const int m = std::clamp(int(std::lround(b0 + u * (b1 - b0))), 0, lb - 1);
+            float va[4], vb[4], ia[4], ib[4];
+            read_texel(rdram, border_addr(a, k, 0), a.tex, va);
+            read_texel(rdram, border_addr(b, m, 0), b.tex, vb);
+            read_texel(rdram, border_addr(a, k, 1), a.tex, ia);
+            read_texel(rdram, border_addr(b, m, 1), b.tex, ib);
+            for (int c = 0; c < 3; ++c) {
+                diff += std::fabs(va[c] - vb[c]) / 3.0f;
+                grad += (std::fabs(va[c] - ia[c]) + std::fabs(vb[c] - ib[c])) / 6.0f;
+            }
+            if (mapped < 256) map[mapped++] = {k, m};
+        }
+        if (mapped < 2) return false;
+        diff /= float(mapped);
+        grad /= float(mapped);
+        return true;
+    };
+    std::vector<Candidate> candidates;
+    std::pair<int, int> map[256];
     for (size_t i = 0; i < edges.size(); ++i) {
         for (size_t j = i + 1; j < edges.size(); ++j) {
             const Edge& a = edges[i];
@@ -2653,63 +2853,70 @@ void process(uint8_t* rdram, uint32_t dl_start, uint32_t dl_end, int log) {
             else continue;
             if (a.tex.addr == b.tex.addr && a.axis == b.axis && a.side == b.side) continue;
             if (!opposite_sides(a, b)) { ++skipped; continue; }
-            const float a0 = a.along[0], a1 = a.along[1];
-            const float b0 = forward ? b.along[0] : b.along[1];
-            const float b1 = forward ? b.along[1] : b.along[0];
-            if (std::fabs(a1 - a0) < 1.0f) continue;
-            // Map A's border texels onto B's.
-            std::pair<int, int> map[256];
-            size_t mapped = 0;
-            float diff = 0, grad = 0;
-            const int la = border_len(a), lb = border_len(b);
-            for (int k = 0; k < la; ++k) {
-                if (k < std::min(a0, a1) - 0.01f || k > std::max(a0, a1) + 0.01f) continue;
-                const float u = (k - a0) / (a1 - a0);
-                const int m = std::clamp(int(std::lround(b0 + u * (b1 - b0))), 0, lb - 1);
-                float va[4], vb[4], ia[4], ib[4];
-                read_texel(rdram, border_addr(a, k, 0), a.tex, va);
-                read_texel(rdram, border_addr(b, m, 0), b.tex, vb);
-                read_texel(rdram, border_addr(a, k, 1), a.tex, ia);
-                read_texel(rdram, border_addr(b, m, 1), b.tex, ib);
-                for (int c = 0; c < 3; ++c) {
-                    diff += std::fabs(va[c] - vb[c]) / 3.0f;
-                    grad += (std::fabs(va[c] - ia[c]) + std::fabs(vb[c] - ib[c])) / 6.0f;
-                }
-                if (mapped < 256) map[mapped++] = {k, m};
+            if (survey != nullptr &&
+                (!supported(a.tex.fmt, a.tex.siz) || !supported(b.tex.fmt, b.tex.siz))) {
+                ++survey->unsupported;
+                ++survey->fmt_pairs[(a.tex.fmt & 7) * 4 + (a.tex.siz & 3)];
+                continue;
             }
-            if (mapped < 2) continue;
-            diff /= float(mapped);
-            grad /= float(mapped);
-            const bool ok = diff <= 2.0f * grad + 3.0f;
-            if (log >= 2) {
-                std::fprintf(stderr, "[skyseam] pair %08X/%d%d %08X/%d%d texels=%zu diff=%.1f grad=%.1f %s\n",
-                             a.tex.addr, a.axis, a.side, b.tex.addr, b.axis, b.side, mapped, diff, grad,
-                             ok ? "blend" : "REJECT");
-            }
-            if (!ok) { ++rejected; continue; }
-            ++accepted;
-            for (size_t q = 0; q < mapped; ++q) {
-                const auto [k, m] = map[q];
-                const uint32_t aa = border_addr(a, k, 0), ba = border_addr(b, m, 0);
-                const size_t ia = slot_for(aa, a.tex);
-                const size_t ib = slot_for(ba, b.tex);
-                if (ia == SIZE_MAX || ib == SIZE_MAX) continue;
-                // Each distinct partner counts once, however many seams name it.
-                for (int dir = 0; dir < 2; ++dir) {
-                    Slot& self = slots[dir ? ib : ia];
-                    const Slot& other = slots[dir ? ia : ib];
-                    if (std::find(self.seen, self.seen + std::min<uint32_t>(self.n, 6U), other.addr) !=
-                        self.seen + std::min<uint32_t>(self.n, 6U) || self.n >= 6U) continue;
-                    self.seen[self.n] = other.addr;
-                    for (int c = 0; c < 4; ++c) self.sum[c] += other.own[c];
-                    ++self.n;
-                }
+            size_t mapped; float diff, grad;
+            if (!measure(a, b, forward, map, mapped, diff, grad)) continue;
+            if (survey != nullptr) ++survey->fmt_pairs[(a.tex.fmt & 7) * 4 + (a.tex.siz & 3)];
+            candidates.push_back({uint32_t(i), uint32_t(j), diff, grad, forward, diff <= 2.0f * grad + 3.0f});
+        }
+    }
+    // One partner per edge. Some skies draw two layers on the same dome (the intro's storm sky lays a
+    // second panorama over the first during lightning), so an edge can face a border of the OTHER layer
+    // across the same line. Blending with both put a foreign image's border into the average, and each
+    // re-processing compounded it. Each edge keeps only its best-matching candidate, and a pair is blended
+    // only when it is the best for both of its edges.
+    std::vector<int32_t> best(edges.size(), -1);
+    auto score = [](const Candidate& c) { return c.diff / (c.grad + 1.0f); };
+    for (size_t c = 0; c < candidates.size(); ++c) {
+        if (!candidates[c].ok) continue;
+        for (uint32_t e : {candidates[c].i, candidates[c].j}) {
+            if (best[e] < 0 || score(candidates[c]) < score(candidates[size_t(best[e])])) best[e] = int32_t(c);
+        }
+    }
+    for (size_t c = 0; c < candidates.size(); ++c) {
+        const Candidate& cand = candidates[c];
+        const Edge& a = edges[cand.i];
+        const Edge& b = edges[cand.j];
+        const bool mutual = cand.ok && best[cand.i] == int32_t(c) && best[cand.j] == int32_t(c);
+        if (log >= 2) {
+            std::fprintf(stderr, "[%s] pair %08X/%d%d %08X/%d%d fmt=%d/%d %dx%d diff=%.1f grad=%.1f %s"
+                         " dl=%08X/%08X cc=%08X%08X/%08X%08X om=%08X%08X/%08X%08X\n",
+                         survey ? "worldseam" : "skyseam", a.tex.addr, a.axis, a.side, b.tex.addr, b.axis, b.side,
+                         a.tex.fmt, a.tex.siz, a.tex.w, a.tex.h, cand.diff, cand.grad,
+                         !cand.ok ? "REJECT" : (mutual ? "blend" : "displaced"), a.dl, b.dl, a.state[0], a.state[1],
+                         b.state[0], b.state[1], a.state[2], a.state[3], b.state[2], b.state[3]);
+        }
+        if (!cand.ok) { ++rejected; continue; }
+        if (!mutual) { ++displaced; continue; }
+        size_t mapped; float diff, grad;
+        measure(a, b, cand.forward, map, mapped, diff, grad);
+        ++accepted;
+        for (size_t q = 0; q < mapped; ++q) {
+            const auto [k, m] = map[q];
+            const uint32_t aa = border_addr(a, k, 0), ba = border_addr(b, m, 0);
+            const size_t ia = slot_for(aa, a.tex);
+            const size_t ib = slot_for(ba, b.tex);
+            if (ia == SIZE_MAX || ib == SIZE_MAX) continue;
+            // Each distinct partner counts once, however many seams name it.
+            for (int dir = 0; dir < 2; ++dir) {
+                Slot& self = slots[dir ? ib : ia];
+                const Slot& other = slots[dir ? ia : ib];
+                if (std::find(self.seen, self.seen + std::min<uint32_t>(self.n, 6U), other.addr) !=
+                    self.seen + std::min<uint32_t>(self.n, 6U) || self.n >= 6U) continue;
+                self.seen[self.n] = other.addr;
+                for (int c2 = 0; c2 < 4; ++c2) self.sum[c2] += other.own[c2];
+                ++self.n;
             }
         }
     }
     uint32_t written = 0;
     for (Slot& s : slots) {
-        if (s.n == 0) continue;
+        if (s.n == 0 || survey != nullptr) continue;
         float v[4];
         for (int c = 0; c < 4; ++c) v[c] = (s.own[c] + s.sum[c]) / float(1 + s.n);
         write_texel(rdram, s.addr, s.tex, v);
@@ -2720,10 +2927,24 @@ void process(uint8_t* rdram, uint32_t dl_start, uint32_t dl_end, int log) {
         g_state.sample_addr[k] = slots[(slots.size() - 1) * size_t(k) / 3].addr;
         g_state.sample_value[k] = rd8(rdram, g_state.sample_addr[k]);
     }
+    if (survey != nullptr) {
+        std::fprintf(stderr, "[worldseam] dl=%08X-%08X cmds=%u models=%u 2d-tris=%u textured-tris=%u clamped-tris=%u "
+                     "offset-tile-tris=%u border-edges=%zu blendable=%u rejected=%u displaced=%u same-side=%u "
+                     "unreadable-pairs=%u by fmt/siz:", dl_start, dl_end, w.commands, w.group, w.ortho_tris, w.tex_tris,
+                     w.clamp_tris, w.offset_tile_tris, edges.size(), accepted, rejected, displaced, skipped,
+                     survey->unsupported);
+        for (int k = 0; k < 32; ++k) {
+            if (survey->fmt_pairs[k] != 0) std::fprintf(stderr, " %d/%d=%u", k / 4, k % 4, survey->fmt_pairs[k]);
+        }
+        std::fprintf(stderr, " us=%.0f\n",
+                     std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        std::fflush(stderr);
+        return;
+    }
     if (log) {
         std::fprintf(stderr, "[skyseam] dl=%08X-%08X cmds=%u models=%u border-edges=%zu pairs blended=%u rejected=%u "
-                     "same-side=%u texels=%u us=%.0f\n", dl_start, dl_end, w.commands, w.group, edges.size(), accepted,
-                     rejected, skipped, written,
+                     "displaced=%u same-side=%u texels=%u us=%.0f\n", dl_start, dl_end, w.commands, w.group, edges.size(), accepted,
+                     rejected, displaced, skipped, written,
                      std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
         std::fflush(stderr);
     }
@@ -2739,11 +2960,21 @@ void on_sky_entry(uint8_t* rdram, recomp_context* ctx) {
     if ((g_dl_cursor_ptr >> 24) == 0x80) g_dl_start = static_cast<uint32_t>(MEM_W(0, ctx->r4));
 }
 
+// The sky's part of this frame's display list, for the world seam survey.
+uint32_t g_frame_sky_start = 0, g_frame_sky_end = 0;
+
 void on_sky_exit(uint8_t* rdram, recomp_context* ctx) {
     (void)ctx;
+    if (g_dl_start != 0) {
+        g_frame_sky_start = g_dl_start;
+        g_frame_sky_end = rd32(rdram, g_dl_cursor_ptr);
+    }
     const int mode = env_mode();
     if (mode < 0 || g_enabled.load(std::memory_order_relaxed) == 0 || g_dl_start == 0) return;
     const uint32_t end = rd32(rdram, g_dl_cursor_ptr);
+    if (mode >= 4) {
+        std::fprintf(stderr, "[skydraw] dl=%08X-%08X\n", g_dl_start, end);
+    }
     if ((end >> 24) != 0x80 || end <= g_dl_start || end - g_dl_start > 0x10000) return;
     // Key: the model and texture addresses the sky draw emitted (its segment
     // commands) and the parts of the model it called. A new sky, or the same one
@@ -2756,16 +2987,56 @@ void on_sky_exit(uint8_t* rdram, recomp_context* ctx) {
         const uint32_t w0 = rd32(rdram, pc);
         if ((w0 >> 24) == 0xDB || (w0 >> 24) == 0xDE) key = (key ^ rd32(rdram, pc + 4)) * 16777619U;
     }
-    if (g_state.key == key) {
+    int slot = -1;
+    for (int k = 0; k < kStateCount; ++k) {
+        if (g_states[k].key == key) slot = k;
+    }
+    if (slot >= 0) {
         // Reloaded in place: what was written is gone, so do it again.
+        const State& st = g_states[slot];
         bool intact = true;
-        for (int k = 0; k < 4 && g_state.have; ++k) {
-            intact = intact && rd8(rdram, g_state.sample_addr[k]) == g_state.sample_value[k];
+        for (int k = 0; k < 4 && st.have; ++k) {
+            intact = intact && rd8(rdram, st.sample_addr[k]) == st.sample_value[k];
         }
         if (intact) return;
     }
+    else {
+        slot = g_state_next;
+        g_state_next = (g_state_next + 1) % kStateCount;
+    }
+    g_state = State{};
     g_state.key = key;
     process(rdram, g_dl_start, end, mode >= 2 ? mode - 1 : 0);
+    g_states[slot] = g_state;
+}
+
+// BT_WORLD_SEAMS=log / log2: the world seam survey (AGENTS.md §7.14). Walks
+// the whole frame's display list except the sky, at most every two seconds,
+// and reports what a world version of the sky blending would find: textured
+// and clamped triangles, clamped tile-border edges, and the edges two
+// different tiles share, by format. Writes nothing.
+int world_survey_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("BT_WORLD_SEAMS");
+        if (v == nullptr) return 0;
+        if (std::strcmp(v, "log") == 0) return 1;
+        if (std::strcmp(v, "log2") == 0) return 2;
+        return 0;
+    }();
+    return mode;
+}
+
+void survey_frame(uint8_t* rdram, uint32_t start, uint32_t end) {
+    const int mode = world_survey_mode();
+    if (mode == 0 || (start >> 24) != 0x80 || end <= start || end - start > 0x40000) return;
+    static auto next = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) return;
+    next = now + std::chrono::seconds(2);
+    Survey survey{};
+    survey.skip_start = g_frame_sky_start;
+    survey.skip_end = g_frame_sky_end > g_frame_sky_start ? g_frame_sky_end : 0;
+    process(rdram, start, end, mode, &survey);
 }
 
 } // namespace sky_seams
@@ -2876,8 +3147,9 @@ void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
     if (have_dir) {
         for (uint32_t i = 0; i < 3U; ++i) {
             cam.rot[i] = read_mtx_element(rdram, mtx, i, 3U);
+            cam.up[i] = read_mtx_element(rdram, mtx, i, 1U);
         }
-        have_dir = normalize3(cam.rot);
+        have_dir = normalize3(cam.rot) && normalize3(cam.up);
     }
 
     // A cut is a change in the camera's *velocity*, not a large step: the title
@@ -2890,8 +3162,10 @@ void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
     // all 40 shot changes deviate by 75 or more or turn by 17 degrees or more.
     float move = 0.0f;
     float turn = 0.0f;
+    float roll = 0.0f;
     float step[3] = {};
     bool cut = false;
+    bool coherent_held = false;  // the velocity rule fired, coherent motion overrode it
     if (finite && g_have_prev_cam) {
         float deviation = 0.0f;
         for (uint32_t i = 0; i < 3U; ++i) {
@@ -2908,6 +3182,11 @@ void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
                               cam.rot[2] * g_prev_cam.rot[2];
             turn = std::acos(std::fmin(1.0f, std::fmax(-1.0f, dot))) *
                    57.29578f;
+            const float up_dot = cam.up[0] * g_prev_cam.up[0] +
+                                 cam.up[1] * g_prev_cam.up[1] +
+                                 cam.up[2] * g_prev_cam.up[2];
+            roll = std::acos(std::fmin(1.0f, std::fmax(-1.0f, up_dot))) *
+                   57.29578f;
         }
         const float turn_change = g_prev_cam_motion_known
             ? std::fabs(turn - g_prev_cam_turn) : turn;
@@ -2915,8 +3194,33 @@ void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
             ? cut_distance() : kCutUnknownDistance;
         const float turn_limit = g_prev_cam_motion_known
             ? cut_angle() : kCutUnknownAngle;
-        cut = (move > cut_distance() && deviation > move_limit) ||
-              (turn > cut_angle() && turn_change > turn_limit);
+        // The up vector also turns with any pitch, so only the part of its turn
+        // the view direction does not account for counts as roll.
+        const bool roll_cut = cut_roll() > 0.0f && roll > cut_roll() &&
+                              roll > turn + cut_roll() * 0.5f;
+        // A camera already moving that keeps going the same way has changed
+        // speed, not shot. The follow camera catching up with Banjo after a fall
+        // swoops down in irregular steps along one line -- measured 28, 88, 86,
+        // 155, 143, 172 units a frame, consecutive steps within 37 degrees -- and
+        // the velocity rule flagged two of them, holding those frames (the brief
+        // "jump"). A shot change that lands further along the camera's own path,
+        // with no turn, is the one case this lets through; it is drawn as a
+        // short slide instead of a hold. Turns and roll still cut.
+        bool coherent = false;
+        if (g_prev_cam_motion_known && !rt64_cut_coherent_off()) {
+            const float prev_len = std::sqrt(g_prev_cam_step[0] * g_prev_cam_step[0] +
+                                             g_prev_cam_step[1] * g_prev_cam_step[1] +
+                                             g_prev_cam_step[2] * g_prev_cam_step[2]);
+            if (prev_len >= kCutCoherentMinStep && move > 0.0f) {
+                const float along = (step[0] * g_prev_cam_step[0] + step[1] * g_prev_cam_step[1] +
+                                     step[2] * g_prev_cam_step[2]) / (move * prev_len);
+                coherent = along >= kCutCoherentCos &&
+                           move <= kCutCoherentRatio * prev_len + cut_distance();
+            }
+        }
+        coherent_held = coherent && move > cut_distance() && deviation > move_limit;
+        cut = (!coherent && move > cut_distance() && deviation > move_limit) ||
+              (turn > cut_angle() && turn_change > turn_limit) || roll_cut;
     }
     g_frame_cut = cut && !rt64_cuts_off();
 
@@ -2926,11 +3230,12 @@ void evaluate_camera_cut(uint8_t* rdram, recomp_context* ctx,
             std::chrono::steady_clock::now().time_since_epoch()).count();
         std::fprintf(stderr,
                      "[cam] frame=%u t=%.2f vi=%u pos=(%.1f %.1f %.1f) "
-                     "dir=(%.3f %.3f %.3f) move=%.1f turn=%.1f%s\n",
+                     "dir=(%.3f %.3f %.3f) move=%.1f turn=%.1f roll=%.1f%s%s\n",
                      frame, ms, read_word(rdram, kViRetraceInterval),
                      cam.pos[0], cam.pos[1], cam.pos[2], cam.rot[0],
-                     cam.rot[1], cam.rot[2], move, turn,
-                     cut ? (g_frame_cut ? " CUT" : " CUT(not applied)") : "");
+                     cam.rot[1], cam.rot[2], move, turn, roll,
+                     cut ? (g_frame_cut ? " CUT" : " CUT(not applied)") : "",
+                     coherent_held && !cut ? " coherent" : "");
         std::fflush(stderr);
     }
     g_prev_cam_has_dir = have_dir;
@@ -2955,11 +3260,30 @@ extern "C" void tooie_rt64_tag_projection(uint8_t* rdram, recomp_context* ctx,
         return;
     }
 
+    if (g_frame_proj_marks.size() < 64) {
+        g_frame_proj_marks.push_back({read_word(rdram, cursor_address), kind != 0U});
+    }
     uint32_t transform_id = kOrthoProjectionId;
     uint32_t flags = kProjectionGroupFlags;
     if (kind == 0U) {
         const bool first_of_frame = !g_cam_sampled;
         evaluate_camera_cut(rdram, ctx, cursor_address);
+        // BT_RT64_CAMLOG=2: every perspective projection, sky or world, with its camera position and the
+        // projection's diagonal and depth terms.
+        static const char* camlog_env = std::getenv("BT_RT64_CAMLOG");
+        if (camlog_env != nullptr && camlog_env[0] == '2') {
+            const uint32_t sp = static_cast<uint32_t>(ctx->r29);
+            const uint32_t mtx = read_word(rdram, cursor_address + 4U);
+            if (in_rdram(mtx, 64U)) {
+                std::fprintf(stderr, "[proj] frame=%u sky=%u pos=(%.1f %.1f %.1f) m00=%.4f m11=%.4f m22=%.5f m32=%.2f m23=%.4f dir=(%.3f %.3f %.3f)\n",
+                             read_word(rdram, kGameFrameCount), g_sky_draw_depth,
+                             read_float(rdram, sp + 0x38U), read_float(rdram, sp + 0x3CU), read_float(rdram, sp + 0x40U),
+                             read_mtx_element(rdram, mtx, 0U, 0U), read_mtx_element(rdram, mtx, 1U, 1U),
+                             read_mtx_element(rdram, mtx, 2U, 2U), read_mtx_element(rdram, mtx, 3U, 2U),
+                             read_mtx_element(rdram, mtx, 2U, 3U), read_mtx_element(rdram, mtx, 0U, 3U),
+                             read_mtx_element(rdram, mtx, 1U, 3U), read_mtx_element(rdram, mtx, 2U, 3U));
+            }
+        }
         if (first_of_frame && g_frame_cut &&
             !append_matrix_group(rdram, cursor_address, G_EX_ID_AUTO,
                                  kCutActorGroupFlags)) {
@@ -2998,6 +3322,171 @@ extern "C" void tooie_rt64_tag_projection(uint8_t* rdram, recomp_context* ctx,
         // shape, so a plain count could not tell which one refused.
         note_append_failure(kind == 0U ? 7U : 8U);
     }
+}
+
+namespace {
+
+// BT_HUDLOG=1 (+ BT_HUDDUMP=<dir>): once a second, every texture the frame draws
+// in 2D -- texture rectangles, and textured triangles after an orthographic
+// projection -- with its RDRAM address, format, size and screen rectangle.
+// BT_HUDDUMP writes each new one's texels (then its palette, if any) to
+// <dir>/hud_<addr>_<fmt>-<siz>_<w>x<h>_<line>.bin, for finding a HUD graphic.
+struct HudScan {
+    uint8_t* rdram = nullptr;
+    uint32_t seg[16] = {};
+    bool seg_known[16] = {};
+    uint32_t img = 0, img_w = 0;
+    uint8_t img_siz = 0;
+    struct Tile { uint8_t fmt, siz, pal; uint16_t line, tmem, uls, ult, lrs, lrt; };
+    Tile tiles[8] = {};
+    struct Load { uint16_t tmem; uint32_t addr; uint32_t row; };
+    Load loads[8] = {};
+    uint32_t tlut = 0, tlut_n = 0;
+    bool tex_on = false;
+    uint8_t render_tile = 0;
+    size_t mark = 0;
+    bool ortho = false;
+    uint32_t commands = 0;
+    std::vector<uint32_t> seen;
+    const char* dump_dir = nullptr;
+
+    bool resolve(uint32_t a, uint32_t& out) const {
+        const uint32_t s = (a >> 24) & 0x0F;
+        if ((a >> 24) == 0x80 || (a >> 24) == 0x00) { out = 0x80000000U | (a & 0x7FFFFFU); return true; }
+        if ((a >> 24) > 0x0F || !seg_known[s]) return false;
+        out = 0x80000000U | ((seg[s] + (a & 0x00FFFFFFU)) & 0x7FFFFFU);
+        return true;
+    }
+    uint32_t addr_of(uint8_t tile) const {
+        for (const Load& l : loads) if (l.addr != 0 && l.tmem == tiles[tile].tmem) return l.addr;
+        return 0;
+    }
+    void report(const char* what, uint8_t tile, int x0, int y0, int x1, int y1) {
+        const uint32_t a = addr_of(tile);
+        if (a == 0 || std::find(seen.begin(), seen.end(), a) != seen.end() || seen.size() > 64) return;
+        seen.push_back(a);
+        const Tile& t = tiles[tile];
+        const int w = (t.lrs - t.uls) / 4 + 1, h = (t.lrt - t.ult) / 4 + 1;
+        std::fprintf(stderr, "[hudtex] %s addr=%08X fmt=%u siz=%u pal=%u line=%u tmem=%u size=%dx%d rect=(%d,%d)-(%d,%d) "
+                     "tlut=%08X/%u\n", what, a, t.fmt, t.siz, t.pal, t.line, t.tmem, w, h, x0, y0, x1, y1,
+                     t.fmt == 2 ? tlut : 0U, t.fmt == 2 ? tlut_n : 0U);
+        if (dump_dir == nullptr || w <= 0 || h <= 0 || w > 256 || h > 256) return;
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/hud_%08X_%u-%u_%dx%d_%u.bin", dump_dir, a, t.fmt, t.siz, w, h, t.line);
+        FILE* f = std::fopen(path, "wb");
+        if (f == nullptr) return;
+        const uint32_t bytes = uint32_t(h) * t.line * 8U;
+        for (uint32_t i = 0; i < bytes; ++i) std::fputc(rdram[((a + i) & 0x7FFFFFU) ^ 3U], f);
+        if (t.fmt == 2 && tlut != 0) {
+            for (uint32_t i = 0; i < tlut_n * 2U; ++i) std::fputc(rdram[((tlut + i) & 0x7FFFFFU) ^ 3U], f);
+        }
+        std::fclose(f);
+    }
+    uint32_t rd32(uint32_t a) const { return *reinterpret_cast<const uint32_t*>(rdram + (a & 0x7FFFFCU)); }
+    void walk(uint32_t start, uint32_t end, int depth) {
+        for (uint32_t pc = start; pc < end && commands < 400000U; pc += 8) {
+            ++commands;
+            if (depth == 0) {
+                while (mark < g_frame_proj_marks.size() && g_frame_proj_marks[mark].gfx <= pc) {
+                    ortho = g_frame_proj_marks[mark++].ortho;
+                }
+            }
+            const uint32_t w0 = rd32(pc), w1 = rd32(pc + 4);
+            switch (w0 >> 24) {
+            case 0xDB:
+                if (((w0 >> 16) & 0xFF) == 0x06) {
+                    const uint32_t s = ((w0 & 0xFFFF) / 4) & 0x0F;
+                    seg[s] = w1; seg_known[s] = true;
+                }
+                break;
+            case 0xDE: {
+                uint32_t a;
+                if (depth < 8 && resolve(w1, a)) walk(a, a + 8 * 4096, depth + 1);
+                if (((w0 >> 16) & 0xFF) == 0x01) return;
+                break;
+            }
+            case 0xDF:
+                if (depth > 0) return;
+                break;
+            case 0xD7:
+                tex_on = ((w0 >> 1) & 0x7F) != 0;
+                render_tile = (w0 >> 8) & 7;
+                break;
+            case 0xFD:
+                if (!resolve(w1, img)) img = 0;
+                img_siz = (w0 >> 19) & 3;
+                img_w = (w0 & 0xFFF) + 1;
+                break;
+            case 0xF5: {
+                Tile& t = tiles[(w1 >> 24) & 7];
+                t.fmt = (w0 >> 21) & 7; t.siz = (w0 >> 19) & 3;
+                t.line = (w0 >> 9) & 0x1FF; t.tmem = w0 & 0x1FF; t.pal = (w1 >> 20) & 0xF;
+                break;
+            }
+            case 0xF2: {
+                Tile& t = tiles[(w1 >> 24) & 7];
+                t.uls = (w0 >> 12) & 0xFFF; t.ult = w0 & 0xFFF;
+                t.lrs = (w1 >> 12) & 0xFFF; t.lrt = w1 & 0xFFF;
+                break;
+            }
+            case 0xF0:
+                tlut = img;
+                tlut_n = ((w1 >> 14) & 0x3FF) + 1;
+                break;
+            case 0xF3: case 0xF4: {
+                const uint16_t tmem = tiles[(w1 >> 24) & 7].tmem;
+                Load nl{tmem, img, img_w};
+                bool placed = false;
+                for (Load& l : loads) if (l.addr != 0 && l.tmem == tmem) { l = nl; placed = true; break; }
+                if (!placed) { std::memmove(&loads[1], &loads[0], sizeof(Load) * 7); loads[0] = nl; }
+                break;
+            }
+            case 0xE4: case 0xE5:
+                report("rect", (w1 >> 24) & 7, int((w1 >> 12) & 0xFFF) / 4, int(w1 & 0xFFF) / 4,
+                       int((w0 >> 12) & 0xFFF) / 4, int(w0 & 0xFFF) / 4);
+                break;
+            case 0x05: case 0x06: case 0x07:
+                if (ortho && tex_on) report("tri", render_tile, 0, 0, 0, 0);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+};
+
+void hud_log(uint8_t* rdram, uint32_t start, uint32_t end) {
+    static const bool on = std::getenv("BT_HUDLOG") != nullptr;
+    if (!on || (start >> 24) != 0x80 || end <= start || end - start > 0x40000) return;
+    static auto next = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) return;
+    next = now + std::chrono::seconds(1);
+    HudScan scan;
+    scan.rdram = rdram;
+    scan.dump_dir = std::getenv("BT_HUDDUMP");
+    std::fprintf(stderr, "[hudtex] frame=%u map=0x%03X\n", read_word(rdram, kGameFrameCount),
+                 (read_word(rdram, 0x80132DC0U) & 0xFFFFU));
+    scan.walk(start, end, 0);
+    std::fflush(stderr);
+}
+
+} // namespace
+
+namespace tooie::cutscene_skip {
+void on_frame_end(uint8_t* rdram, recomp_context* ctx, uint32_t dl_head, bool extended);
+}
+
+// Runs at 0x800A7518 in func_800A73F4, just before func_800E7EF4 closes the
+// frame's display list (G_RDPFULLSYNC + G_ENDDL) and submits it: everything the
+// game draws this frame, the 2D HUD and screen transitions included, is
+// already in the list, so whatever is appended here is drawn on top of it.
+extern "C" void tooie_frame_end(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t end = read_word(rdram, kRenderBufferState);
+    sky_seams::survey_frame(rdram, g_frame_dl_head, end);
+    sky_seams::g_frame_sky_start = sky_seams::g_frame_sky_end = 0;
+    hud_log(rdram, g_frame_dl_head, end);
+    tooie::cutscene_skip::on_frame_end(rdram, ctx, g_frame_dl_head, g_frame_extended);
 }
 
 // The original boot inflater places core1 in its final RDRAM range without an
