@@ -171,7 +171,7 @@ index 038eace..b410f7f 100644
              // Only applies to raw triangle geometry from LLE triangle commands.
              uint32_t rawVertexStart;
 diff --git a/src/hle/rt64_game_frame.cpp b/src/hle/rt64_game_frame.cpp
-index 87392d0..62a18a0 100644
+index 87392d0..12dab10 100644
 --- a/src/hle/rt64_game_frame.cpp
 +++ b/src/hle/rt64_game_frame.cpp
 @@ -9,6 +9,52 @@
@@ -242,7 +242,7 @@ index 87392d0..62a18a0 100644
          }
      };
  
-@@ -252,6 +300,437 @@ namespace RT64 {
+@@ -252,6 +300,527 @@ namespace RT64 {
          return matchResult;
      }
  
@@ -341,13 +341,26 @@ index 87392d0..62a18a0 100644
 +    // basis to separate coincident origins), and a pairing far longer than the rest is dropped, so a card
 +    // that only just came into view is drawn as submitted instead of flying in from another lamp.
 +    // BT_RT64_IDNEAREST=off restores pure order pairing; =log prints every id range that was re-paired.
-+    template<typename TransformVector>
-+    static void pairSharedIdRange(const TransformVector &curTransforms, const TransformVector &prevTransforms,
++    //
++    // ⚠ Origins alone are not enough when the parts carry their own geometry (AGENTS.md 7.7l). The file
++    // select's hand (id 20001500, 17 parts, one id because its bones are not tagged) reorders its parts when it
++    // clenches, and several of them share one origin: a 5-vertex and a 35-vertex part at (-2, -9, -9) were
++    // paired with each other, three fingers with their neighbours, and vertex interpolation then drew the
++    // fingers flowing into one another for that frame. So each transform also carries the WORLD-space
++    // centroid of its own vertices -- where its geometry actually is -- and a different vertex count costs a
++    // little: the order is implausible as soon as an order pair's geometry has moved much further than to its
++    // nearest candidate, and the nearest pairing weighs geometry first. A set of parts with no vertices of
++    // their own (the lamp cards' matrices) pairs exactly as before. BT_RT64_IDGEOM=off drops the geometry.
++    static void pairSharedIdRange(const DrawData &cd, const DrawData &pd,
 +        const std::vector<uint32_t> &cur, const std::vector<uint32_t> &prev, uint32_t matrixId, std::vector<std::pair<uint32_t, uint32_t>> &pairs)
 +    {
 +        static const char *mode = std::getenv("BT_RT64_IDNEAREST");
 +        static const bool off = (mode != nullptr) && (std::strcmp(mode, "off") == 0);
 +        static const bool log = (mode != nullptr) && (std::strcmp(mode, "log") == 0);
++        static const char *geomMode = std::getenv("BT_RT64_IDGEOM");
++        static const bool geomOff = (geomMode != nullptr) && (geomMode[0] == 'o');
++        const auto &curTransforms = cd.worldTransforms;
++        const auto &prevTransforms = pd.worldTransforms;
 +        const size_t curCount = cur.size();
 +        const size_t prevCount = prev.size();
 +        const size_t orderCount = std::min(curCount, prevCount);
@@ -358,6 +371,50 @@ index 87392d0..62a18a0 100644
 +            return std::sqrt(dx * dx + dy * dy + dz * dz);
 +        };
 +
++        // World-space centroid and vertex count of each transform's own geometry.
++        struct Part { uint32_t count; hlslpp::float3 c; };
++        auto partOf = [](const DrawData &d, uint32_t t) {
++            Part part = { d.worldTransformVertexCount(t), hlslpp::float3(0.0f, 0.0f, 0.0f) };
++            const uint32_t start = d.worldTransformVertexIndices[t];
++            hlslpp::float3 sum(0.0f, 0.0f, 0.0f);
++            for (uint32_t i = 0; i < part.count; i++) {
++                const size_t v = (size_t(start) + i) * 3;
++                sum += hlslpp::float3(d.posFloats[v], d.posFloats[v + 1], d.posFloats[v + 2]);
++            }
++
++            const hlslpp::float3 local = (part.count > 0) ? (sum / float(part.count)) : hlslpp::float3(0.0f, 0.0f, 0.0f);
++            part.c = hlslpp::mul(hlslpp::float4(local, 1.0f), d.worldTransforms[t]).xyz;
++            return part;
++        };
++
++        thread_local std::vector<Part> curParts, prevParts;
++        curParts.clear();
++        prevParts.clear();
++        bool useGeometry = !geomOff && (curCount > 1) && (curCount * prevCount <= 4096);
++        if (useGeometry) {
++            for (uint32_t c : cur) {
++                curParts.push_back(partOf(cd, c));
++            }
++
++            for (uint32_t p : prev) {
++                prevParts.push_back(partOf(pd, p));
++            }
++
++            // Matrices that carry no vertices of their own have nothing to say about geometry.
++            bool anyGeometry = false;
++            for (const Part &part : curParts) {
++                anyGeometry = anyGeometry || (part.count > 0);
++            }
++
++            useGeometry = anyGeometry;
++        }
++
++        auto geometryDistance = [&](uint32_t i, uint32_t j) {
++            return float(hlslpp::length(curParts[i].c - prevParts[j].c));
++        };
++
++        constexpr float CountMismatchCost = 20.0f;
++
 +        bool orderPlausible = (curCount == prevCount);
 +        if (!off && orderPlausible && (curCount > 1)) {
 +            for (size_t i = 0; (i < curCount) && orderPlausible; i++) {
@@ -367,6 +424,19 @@ index 87392d0..62a18a0 100644
 +                }
 +
 +                orderPlausible = (originDistance(cur[i], prev[i]) <= (4.0f * nearest + 50.0f));
++            }
++
++            // The geometry has to agree too: parts that share an origin can only be told apart by it.
++            for (size_t i = 0; useGeometry && (i < curCount) && orderPlausible; i++) {
++                float nearest = FLT_MAX;
++                for (size_t j = 0; j < prevCount; j++) {
++                    nearest = std::min(nearest, geometryDistance(uint32_t(i), uint32_t(j)) +
++                        ((curParts[i].count != prevParts[j].count) ? CountMismatchCost : 0.0f));
++                }
++
++                const float order = geometryDistance(uint32_t(i), uint32_t(i)) +
++                    ((curParts[i].count != prevParts[i].count) ? CountMismatchCost : 0.0f);
++                orderPlausible = (order <= (4.0f * nearest + 20.0f));
 +            }
 +
 +            // A set moving as one -- every order pair displaced alike -- keeps its order however fast it
@@ -389,6 +459,20 @@ index 87392d0..62a18a0 100644
 +                    }
 +
 +                    rigid = (std::sqrt(deviation) <= (0.25f * meanLength + 20.0f));
++                }
++
++                // ...and its parts' geometry moved alike too, with every part keeping its vertex count.
++                if (rigid && useGeometry) {
++                    hlslpp::float3 gMean(0.0f, 0.0f, 0.0f);
++                    for (size_t i = 0; i < curCount; i++) {
++                        gMean += (curParts[i].c - prevParts[i].c) / float(curCount);
++                    }
++
++                    const float gMeanLength = hlslpp::length(gMean);
++                    for (size_t i = 0; (i < curCount) && rigid; i++) {
++                        rigid = (curParts[i].count == prevParts[i].count) &&
++                            (float(hlslpp::length((curParts[i].c - prevParts[i].c) - gMean)) <= (0.25f * gMeanLength + 20.0f));
++                    }
 +                }
 +
 +                orderPlausible = rigid;
@@ -432,7 +516,13 @@ index 87392d0..62a18a0 100644
 +                }
 +
 +                const float distance = originDistance(cur[i], prev[j]);
-+                candidates.push_back({ distance + 10.0f * std::sqrt(basisDiff / basisNorm), distance, i, j });
++                float cost = distance + 10.0f * std::sqrt(basisDiff / basisNorm);
++                if (useGeometry) {
++                    cost = geometryDistance(i, j) + 0.25f * distance + 10.0f * std::sqrt(basisDiff / basisNorm) +
++                        ((curParts[i].count != prevParts[j].count) ? CountMismatchCost : 0.0f);
++                }
++
++                candidates.push_back({ cost, distance, i, j });
 +            }
 +        }
 +
@@ -680,7 +770,7 @@ index 87392d0..62a18a0 100644
      void GameFrame::match(RenderWorker *worker, WorkloadQueue &workloadQueue, const GameFrame &prevFrame, BufferUploader *velocityUploader, bool &velocityUploaderUsed, bool &tileInterpolationUsed, bool &lookAtInterpolationUsed) {
          tileInterpolationUsed = false;
          lookAtInterpolationUsed = false;
-@@ -296,6 +775,11 @@ namespace RT64 {
+@@ -296,6 +865,11 @@ namespace RT64 {
                  prevWorkloadMap = &prevFrame.frameMap.workloads[workloadMap.prevWorkloadIndex];
              }
  
@@ -692,7 +782,7 @@ index 87392d0..62a18a0 100644
              // Match the transforms linearly in the order they were submitted.
              ModifiedBuffers modifiedBuffers;
              auto curIt = curWorkload.transformIdMap.begin();
-@@ -309,12 +793,36 @@ namespace RT64 {
+@@ -309,12 +883,36 @@ namespace RT64 {
                      prevIt++;
                  }
                  else {
@@ -714,7 +804,7 @@ index 87392d0..62a18a0 100644
 +                        rangePrev.push_back(prevIt->second);
 +                    }
 +
-+                    pairSharedIdRange(curWorkload.drawData.worldTransforms, prevWorkload.drawData.worldTransforms, rangeCur, rangePrev, matrixId, rangePairs);
++                    pairSharedIdRange(curWorkload.drawData, prevWorkload.drawData, rangeCur, rangePrev, matrixId, rangePairs);
 +                    for (const std::pair<uint32_t, uint32_t> &pair : rangePairs) {
 +                        matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, pair.first, pair.second, modifiedBuffers);
 +                        if (matrixId >= 0x10000000U) {
@@ -732,7 +822,7 @@ index 87392d0..62a18a0 100644
              if (!modifiedBuffers.empty()) {
                  workloadsModified[workloads[w]].merge(modifiedBuffers);
              }
-@@ -385,6 +893,10 @@ namespace RT64 {
+@@ -385,6 +983,10 @@ namespace RT64 {
                      uploads.emplace_back(BufferUploader::Upload{ workload.drawData.velFloats.data(), { 0, workload.drawData.velFloats.size() }, sizeof(float), RenderBufferFlag::FORMATTED, { RenderFormat::R32_FLOAT }, &workload.drawBuffers.velocityBuffer });
                  }
  
@@ -743,7 +833,7 @@ index 87392d0..62a18a0 100644
                  if (it.second.texcoordVelocity) {
                      uploads.emplace_back(BufferUploader::Upload{ workload.drawData.tcVelFloats.data(), { 0, workload.drawData.tcVelFloats.size() }, sizeof(float), RenderBufferFlag::FORMATTED, { RenderFormat::R32_FLOAT }, &workload.drawBuffers.texcoordVelocityBuffer });
                  }
-@@ -460,6 +972,14 @@ namespace RT64 {
+@@ -460,6 +1062,14 @@ namespace RT64 {
                  const TransformGroup &curProjGroup = curWorkload.drawData.transformGroups[curProjGroupIndex];
                  const TransformGroup &prevProjGroup = prevWorkload.drawData.transformGroups[prevProjGroupIndex];
  
@@ -758,7 +848,7 @@ index 87392d0..62a18a0 100644
                  // Cameras usually look better with simple interpolation, so default decomposition to off.
                  bool projectionDecompose = false;
                  uint8_t projectionLinearComponent = G_EX_COMPONENT_INTERPOLATE;
-@@ -475,6 +995,9 @@ namespace RT64 {
+@@ -475,6 +1085,9 @@ namespace RT64 {
                      projectionSkewComponent = curProjGroup.skewInterpolation;
                      projectionPerspectiveComponent = curProjGroup.perspectiveInterpolation;
                      viewProjMap.mapped = (curProjGroup.matrixId == prevProjGroup.matrixId);
@@ -768,7 +858,7 @@ index 87392d0..62a18a0 100644
                  }
                  else {
                      viewProjMap.mapped = (curProjGroup.matrixId == G_EX_ID_AUTO);
-@@ -517,6 +1040,11 @@ namespace RT64 {
+@@ -517,6 +1130,11 @@ namespace RT64 {
          tileCheckSet.clear();
          lookAtCheckSet.clear();
  
@@ -780,7 +870,7 @@ index 87392d0..62a18a0 100644
          // Traverse the map and fill the set with all the combinations of transforms to check.
          for (std::pair<uint64_t, GameCallMap> curIt : curCallHashMap) {
              auto prevRange = prevCallHashMap.equal_range(curIt.first);
-@@ -543,6 +1071,9 @@ namespace RT64 {
+@@ -543,6 +1161,9 @@ namespace RT64 {
                          const TransformGroup &prevGroup = prevWorkload.drawData.transformGroups[prevGroupIndex];
                          if ((curGroup.matrixId == prevGroup.matrixId) && ((curGroup.matrixId == G_EX_ID_AUTO) || ((curGroup.matrixId != G_EX_ID_IGNORE) && (curGroup.ordering == G_EX_ORDER_AUTO)))) {
                              transformCheckSet.emplace(curWorldMatrix, prevWorldMatrix);
@@ -790,7 +880,7 @@ index 87392d0..62a18a0 100644
                          }
                      }
                  }
-@@ -588,13 +1119,19 @@ namespace RT64 {
+@@ -588,13 +1209,19 @@ namespace RT64 {
  
              TransformMatchResult matchResult = computeTransformMatch(curTransform, firstCurViewProj, prevTransform, firstPrevViewProj, prevRigidBody);
              if (matchResult.valid) {
@@ -811,7 +901,7 @@ index 87392d0..62a18a0 100644
              if (firstCurWorkloadMap.transforms[candidate.curIndex].mapped) {
                  continue;
              }
-@@ -709,6 +1246,568 @@ namespace RT64 {
+@@ -709,6 +1336,568 @@ namespace RT64 {
          }
      }
  
@@ -1380,7 +1470,7 @@ index 87392d0..62a18a0 100644
      void GameFrame::matchTransform(Workload &curWorkload, const Workload &prevWorkload, GameFrameMap::WorkloadMap &curWorkloadMap, const GameFrameMap::WorkloadMap *prevWorkloadMap, uint32_t curTransformIndex, uint32_t prevTransformIndex, ModifiedBuffers &modifiedBuffers) {
          GameFrameMap::TransformMap &curTransformMap = curWorkloadMap.transforms[curTransformIndex];
          if (prevWorkloadMap != nullptr) {
-@@ -723,12 +1822,30 @@ namespace RT64 {
+@@ -723,12 +1912,30 @@ namespace RT64 {
          curTransformMap.rigidBody.updateAngular(prevTransform, curTransform, curGroup.rotationInterpolation, curGroup.scaleInterpolation, curGroup.skewInterpolation);
          curTransformMap.rigidBody.updatePerspective(prevTransform, curTransform, curGroup.perspectiveInterpolation);
          curTransformMap.rigidBody.updateDecomposition(curTransform, curGroup.decompose);
@@ -1411,7 +1501,7 @@ index 87392d0..62a18a0 100644
          uint32_t curVertexIndex = curWorkload.drawData.worldTransformVertexIndices[curTransformIndex];
          uint32_t curVertexCount = curWorkload.drawData.worldTransformVertexCount(curTransformIndex);
          uint32_t prevVertexIndex = prevWorkload.drawData.worldTransformVertexIndices[prevTransformIndex];
-@@ -744,13 +1861,107 @@ namespace RT64 {
+@@ -744,13 +1951,107 @@ namespace RT64 {
                  const float *curPosFloatsRef = &curPosFloats[curVertexIndex * 3];
                  const float *prevPosFloatsRef = &prevPosFloats[prevVertexIndex * 3];
                  float *curVelFloatsRef = &curVelFloats[curVertexIndex * 3];
@@ -1913,7 +2003,7 @@ index 1da2550..0595393 100644
                  fbPair.drawColorRect.merge(drawRect);
                  if (otherModeStack[otherModeStackSize - 1].zUpd()) {
 diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
-index 2970e71..7a89f44 100644
+index 2970e71..6680c97 100644
 --- a/src/hle/rt64_state.cpp
 +++ b/src/hle/rt64_state.cpp
 @@ -4,8 +4,12 @@
@@ -1929,26 +2019,58 @@ index 2970e71..7a89f44 100644
  
  #include "im3d/im3d.h"
  #include "im3d/im3d_math.h"
-@@ -27,6 +31,10 @@
+@@ -27,6 +31,11 @@
  #define MI_INTR_DP          0x00000020
  #define MI_INTR_SP          0x00000001
  
 +// The "Improved Shadows" graphics option (State::btImproveShadows), written by the game side when the option
 +// loads or changes; 1 = on, the default.
 +extern "C" { std::atomic<uint32_t> g_bt_rt64_improved_shadows{1}; }
++extern "C" double (*g_bt_rt64_harness_seconds)();
 +
  namespace RT64 {
      const float ShiftScaleMap[] = {
          1.0f,
-@@ -1775,6 +1783,7 @@ namespace RT64 {
-         }
-         
-         // Advance the workload queue at the end of a full synchronization.
-+        btImproveShadows(workload);
-         advanceWorkload(workload, false);
-         ext.workloadQueue->advanceToNextWorkload();
+@@ -1016,6 +1025,26 @@ namespace RT64 {
  
-@@ -2654,6 +2663,344 @@ namespace RT64 {
+                     if (proj.usesViewport()) {
+                         flags.culling = (callDesc.geometryMode & callDesc.cullBothMask) != 0;
++                        // Banjo-Tooie port (AGENTS.md 7.7m): character models -- the player's and every tracked actor's
++                        // transform ids -- are drawn without back-face culling when they are opaque and depth-writing,
++                        // so a gap in a model (a native crack where a swapped mouth part or a T-junction does not seal,
++                        // visible as a dark line at high resolution) shows the model's own inside instead of the
++                        // background. Vertex lighting depends on the normal, not on the facing, so the inside carries the
++                        // surface's own colours; a closed model looks exactly the same. BT_RT64_TWOSIDED=off restores
++                        // the game's culling.
++                        static const bool twoSidedOff = [] {
++                            const char *env = std::getenv("BT_RT64_TWOSIDED");
++                            return (env != nullptr) && (env[0] == 'o');
++                        }();
++                        if (!twoSidedOff && flags.culling && callDesc.otherMode.zCmp() && callDesc.otherMode.zUpd() &&
++                            !callDesc.otherMode.forceBlend() && (callDesc.minWorldMatrix < workload.drawData.worldTransformGroups.size()))
++                        {
++                            const uint32_t group = workload.drawData.worldTransformGroups[callDesc.minWorldMatrix];
++                            const uint32_t id = workload.drawData.transformGroups[group].matrixId;
++                            if ((id >= 0x10000000U) && (id < 0x30000000U)) {
++                                flags.culling = false;
++                            }
++                        }
+                         flags.smoothShade = (callDesc.geometryMode & callDesc.shadingSmoothMask) != 0;
+                         flags.NoN = callDesc.NoN;
+                     }
+@@ -1123,6 +1152,11 @@ namespace RT64 {
+         // Ensure there's as many GPU tiles as call tiles available in the vector.
+         workload.drawData.gpuTiles.resize(workload.drawData.callTiles.size());
+ 
++        // Banjo-Tooie "Improved Shadows": it writes the shadow draws' RDP params, so it must run before they are
++        // uploaded just below (it used to run at the end of the sync, after the upload, and the depth window never
++        // reached the GPU -- only the easing, which the projection processor reads later, took effect).
++        btImproveShadows(workload);
++
+         // Start uploading the entire draw data for all the framebuffer pairs that were processed.
+         workload.updateDrawDataRanges();
+         workload.uploadDrawData(ext.framebufferGraphicsWorker, ext.drawDataUploader);
+@@ -2654,6 +2688,373 @@ namespace RT64 {
          }
      }
  
@@ -1969,6 +2091,8 @@ index 2970e71..7a89f44 100644
 +            float tilt[2] = {};
 +            float planeY = 0.0f;
 +            float scale[2][2] = { { 1.0f, 0.0f }, { 0.0f, 1.0f } };
++            // The caster's facing, eased briefly (BtShadowTurnTime) so that no two consecutive frames are far apart.
++            float angle = 0.0f;
 +            float age = 0.0f;
 +            bool seen = false;
 +            bool initialized = false;
@@ -1991,7 +2115,8 @@ index 2970e71..7a89f44 100644
 +
 +        // BT_RT64_SHADOWS=off forces the improvement off for A/B (overriding the graphics option); =log prints
 +        // one [shadow] line per caster per game frame; =ab applies only the depth window, on every other game frame
-+        // (no easing), so consecutive frames of one run differ by the window alone.
++        // (no easing), so consecutive frames of one run differ by the window alone; =cov keeps everything on and
++        // draws the shadow's coverage in solid magenta (with the =log lines), to count frames without one.
 +        int btShadowMode() {
 +            static const int mode = []() {
 +                const char *env = std::getenv("BT_RT64_SHADOWS");
@@ -2007,6 +2132,10 @@ index 2970e71..7a89f44 100644
 +                    return 3;
 +                }
 +
++                if ((env[0] == 'c') && (env[1] == 'o')) {
++                    return 4;
++                }
++
 +                return (env[0] == 'l') ? 2 : 1;
 +            }();
 +            return mode;
@@ -2018,6 +2147,12 @@ index 2970e71..7a89f44 100644
 +
 +        // How quickly an eased shadow follows the game's, in seconds.
 +        constexpr float BtShadowEaseTime = 0.12f;
++
++        // How quickly the shadow follows the caster's facing. Short, so it never visibly lags a turn; but not zero:
++        // between two game frames RT64 blends the shadow's projection as a plain matrix, and a caster that turns
++        // round in one frame (Banjo reversing) blends through a silhouette squashed to a line -- measured, coverage
++        // 245 -> 0 for three of the five frames at 144 Hz.
++        constexpr float BtShadowTurnTime = 0.04f;
 +
 +        bool btIsShadowDecal(const GameCall &call) {
 +            const uint32_t L = call.shaderDesc.otherMode.L;
@@ -2052,7 +2187,13 @@ index 2970e71..7a89f44 100644
 +        dt = std::clamp(dt, 1.0f / 120.0f, 0.25f);
 +        state.last = now;
 +        state.haveLast = true;
-+        const float ease = 1.0f - std::exp(-dt / BtShadowEaseTime);
++        // BT_RT64_SHADOW_EASE=<seconds> overrides the easing time (0 = follow the game exactly), for A/B.
++        static const float easeTime = []() {
++            const char *env = std::getenv("BT_RT64_SHADOW_EASE");
++            return (env != nullptr) ? float(std::atof(env)) : BtShadowEaseTime;
++        }();
++        const float ease = (easeTime > 0.0f) ? (1.0f - std::exp(-dt / easeTime)) : 1.0f;
++        const float turnEase = 1.0f - std::exp(-dt / BtShadowTurnTime);
 +        for (BtShadowCaster &caster : state.casters) {
 +            caster.seen = false;
 +            caster.age += dt;
@@ -2180,7 +2321,7 @@ index 2970e71..7a89f44 100644
 +                // F must be affine (a tilted plane is fine: it shows as world-y terms in rows 0 and 2).
 +                const bool affine = (std::abs(F[0][3]) < 1e-4f) && (std::abs(F[1][3]) < 1e-4f) && (std::abs(F[2][3]) < 1e-4f) && (std::abs(F[3][3] - 1.0f) < 1e-3f);
 +                if (!affine) {
-+                    if (btShadowMode() == 2) {
++                    if (btShadowMode() >= 2) {
 +                        fprintf(stderr, "[shadow] wl=%llu ti=%u not affine\n", (unsigned long long)(workloadId + 1), ti);
 +                    }
 +
@@ -2224,6 +2365,14 @@ index 2970e71..7a89f44 100644
 +                    *easedParts[k] = fresh ? current[k] : (*easedParts[k] + (current[k] - *easedParts[k]) * ease);
 +                }
 +
++                if (fresh) {
++                    match->angle = angle;
++                }
++                else {
++                    float turn = std::remainder(angle - match->angle, 6.2831853f);
++                    match->angle = std::remainder(match->angle + turn * turnEase, 6.2831853f);
++                }
++
 +                match->x = x;
 +                match->z = z;
 +                match->age = 0.0f;
@@ -2231,10 +2380,11 @@ index 2970e71..7a89f44 100644
 +
 +                // Recompose A' = R * P' and F', and draw the caster through F' * VP_m.
 +                const float (&S)[2][2] = match->scale;
-+                F[0][0] = cs * S[0][0] + sn * S[1][0];
-+                F[0][2] = cs * S[0][1] + sn * S[1][1];
-+                F[2][0] = -sn * S[0][0] + cs * S[1][0];
-+                F[2][2] = -sn * S[0][1] + cs * S[1][1];
++                const float ecs = std::cos(match->angle), esn = std::sin(match->angle);
++                F[0][0] = ecs * S[0][0] + esn * S[1][0];
++                F[0][2] = ecs * S[0][1] + esn * S[1][1];
++                F[2][0] = -esn * S[0][0] + ecs * S[1][0];
++                F[2][2] = -esn * S[0][1] + ecs * S[1][1];
 +                F[1][0] = match->shear[0];
 +                F[1][1] = match->shear[1];
 +                F[1][2] = match->shear[2];
@@ -2246,10 +2396,11 @@ index 2970e71..7a89f44 100644
 +                drawData.viewTransforms[ti] = hlslpp::float4x4::identity();
 +                drawData.projTransforms[ti] = eased;
 +
-+                if (btShadowMode() == 2) {
-+                    fprintf(stderr, "[shadow] wl=%llu ti=%u at=(%.1f %.1f) shear=(%.3f %.3f)->(%.3f %.3f) plane=%.1f->%.1f stretch=(%.3f %.3f %.3f %.3f) dark=%.2f\n",
-+                        (unsigned long long)(workloadId + 1), ti, x, z, shearX, shearZ, match->shear[0], match->shear[2], planeY, match->planeY,
++                if ((btShadowMode() == 2) || (btShadowMode() == 4)) {
++                    fprintf(stderr, "[shadow] t=%.3f wl=%llu ti=%u at=(%.1f %.1f) shear=(%.3f %.3f)->(%.3f %.3f) plane=%.1f->%.1f stretch=(%.3f %.3f %.3f %.3f) dark=%.2f\n",
++                        (g_bt_rt64_harness_seconds != nullptr) ? g_bt_rt64_harness_seconds() : -1.0, (unsigned long long)(workloadId + 1), ti, x, z, shearX, shearZ, match->shear[0], match->shear[2], planeY, match->planeY,
 +                        S[0][0], S[0][1], S[1][0], S[1][1], darkness);
++
 +                }
 +            }
 +
@@ -2271,7 +2422,7 @@ index 2970e71..7a89f44 100644
 +                workload.btShadow.compositePair = int32_t(c);
 +                workload.btShadow.shadowPair = int32_t(s);
 +                workload.btShadow.darkness = state.darkness;
-+                workload.btShadow.coverage = (btShadowMode() == 3);
++                workload.btShadow.coverage = (btShadowMode() >= 3);
 +            }
 +        }
 +

@@ -1260,6 +1260,51 @@ between. It is the FOV snap of §7.6d. Banjo's shadow there IS native: it goes f
 and comes back hard at his feet as he crosses the gold step, identically at
 `Original`: it is the §7.13 decal changing the plane it lands on.
 
+### 7.7l The file select's hand: parts sharing one id were paired by origin alone
+
+"At the file selection Banjo's hand has this grabby motion and his rightmost finger
+is glitching." The hand in picture 1 of the file select (map `0x158`, reached with
+`BT_AUTOPAD=26:start`) is one actor drawn as 17 matrices under one id (`20001500`;
+its bones are not tagged), each with its own geometry, and it clenches once a second
+at 20 Hz. On the clench frame the game reorders the parts; §7.7f's pairing found the
+order implausible and re-paired by nearest ORIGIN, and several parts share an origin:
+measured with a per-pair log, the 5- and 35-vertex parts at (-2, -9, -9) were paired
+with each other and three fingers with their neighbours, so vertex interpolation drew
+fingers flowing into one another for that game frame (7 presented frames). Bisected:
+only `BT_RT64_VERTS=off` removed it; `VTXALIGN` (off, `nomorph`, `morphpart`),
+`VTXSMOOTH=off` and `BONEVERTS=off` did not, and it is absent at `Original`.
+
+Fix (RT64 patch, `pairSharedIdRange`): each transform also carries the world-space
+centroid of its own vertices and its vertex count; the order is implausible when an
+order pair's geometry has moved much further than to its nearest candidate, the
+rigid-shift rescue also requires the geometry to have moved alike, and the nearest
+pairing weighs geometry first (a different count costs 20 units). Matrices with no
+vertices of their own pair exactly as before. Measured (per-frame temporal spike in a
+crop of the hand, the user's exact default configuration): max 1.47 at every clench
+before, 0.47 after (the rest of the animation's level). No regression found: Bottles'
+house lamp cards (§7.7f) 1 vs 1 long pairing over the same C-left turning, the
+new-game intro's first 240 s 7 vs 6 re-paired ranges and identical lerp-guard trips
+(275), King Jingaling none. `BT_RT64_IDGEOM=off` restores origin-only pairing.
+
+### 7.7m Characters are drawn two-sided, so native cracks show the model, not the background
+
+After §7.7j and §7.7k the King still showed thin dark lines on his face in a few
+frames, and the user asked for them gone even where the N64 has them. They are not
+seams that interpolation opens: `[seam2]` over the whole scene finds no pair of
+coincident vertices drawn apart at any weight, and pairs 0.05-2 units apart on
+different parts are rare (0 on 945 of 981 frames), so welding coincident vertices
+cannot remove them. They are holes in the mesh -- a swapped mouth part or a
+T-junction that does not seal -- through which the background shows. Characters
+(player and actor transform ids, `0x10000000`-`0x2FFFFFFF`) are now drawn without
+back-face culling when opaque and depth-writing (`rt64_state.cpp`), so a hole shows
+the model's own inside, which carries the surface's colours because N64 lighting is
+per vertex. A closed model looks the same. Measured over the whole throne-room
+scene at a true 144 (step-1 crops of his face in the shots that show it, frames with
+a dark crack of 6+ px): 1.44% -> 0.63%, mean crack pixels 0.39 -> 0.27; what remains
+is a hairline along the mouth slit itself. Banjo, Kazooie and Jamjars close-ups show
+no change; translucent draws (Bottles' ghost) keep their culling. `BT_RT64_TWOSIDED=off`
+restores the game's culling.
+
 ### 7.8 The attract demo played 1.5x too fast
 
 Not interpolation (it happens at `Original` refresh too). Rare's demos replay
@@ -1545,6 +1590,23 @@ frame) measured the window adding ~40% coverage on the frames a swim shadow cros
 the pool's grass bank. Cost: one full-screen pass and one resolve of the shadow
 buffer per display frame, and a few matrix products per caster per game frame.
 `BT_RT64_SHADOWS=off` (or the option) restores the game's shadow exactly.
+
+⚠ **The first version's depth window never reached the GPU** (user: "keeps
+disappearing while moving" up the Mayahem Temple entrance slope). `btImproveShadows`
+ran at the end of `State::fullSync`, after `Workload::uploadDrawData` had already
+uploaded the RDP params it writes, so only the easing (read later by the projection
+processor) took effect, and the eased plane -- 3-4 units off the ground on that
+slope -- failed the plain coplanar test. Proved with a plane deliberately offset 10
+units: no coverage at all, at any window size. It now runs before the upload.
+Moving also exposed a second dropout: a caster that turns round in one game frame
+(Banjo reversing) is blended by RT64 as a plain matrix between the two frames, which
+squashes the silhouette to a line for three of five frames at 144 Hz; the facing is
+now eased over 0.04 s (`BtShadowTurnTime`), so consecutive frames are never far
+apart. Verified with `BT_RT64_SHADOWS=cov` (coverage in magenta) over a 30 s run at
+the spawn (run, walk, both directions, reversals, two jumps) at a true 144 with every
+option at its default: 0 of 4388 frames without a shadow (min 9, median 74 sampled
+pixels); before the fix 558 of 2433 in 17 s. `BT_RT64_SHADOW_EASE=<s>` overrides the
+easing time (0 = follow the game) for A/B.
 ⚠ Not covered yet: the exact user swim spot was not reproduced (the tested swim
 shadows were complete in both), and remote players' and enemies' shadows go through
 the same pass but were not separately checked.
@@ -1890,7 +1952,8 @@ Different failures need different tools. Choosing the wrong one wastes a session
 |**Which bones blend plainly**|`BT_RT64_LERPGUARD=log`|one line per transform whose decomposed blend strayed off its vertices' paths (§7.7c): id, vertex count, deviation, travel. `=off` disables the check.|
 |**Player id table exhaustion**|`BT_RT64_SLOTCAP=n`|shrinks the player id table so running out (§7.7d) happens in seconds; `BT_RT64_SLOTRECLAIM=off` restores the old never-reuse table for A/B.|
 |**Which pairings jumped**|`BT_RT64_PAIRLOG=<units>`|one line per id-paired transform whose origin moved further than that in one frame: id, both transform indices, distance, both origins, transform counts. A wrong pairing shows as thousands of units where its neighbours move tens (§7.7f).|
-|**Transforms sharing an id**|`BT_RT64_IDNEAREST=log`|one line per id range that was re-paired by nearest origin instead of submission order (§7.7f): counts, pairs, dropped. `=off` restores order pairing.|
+|**Transforms sharing an id**|`BT_RT64_IDNEAREST=log`|one line per id range that was re-paired by nearest origin instead of submission order (§7.7f): counts, pairs, dropped. `=off` restores order pairing. `BT_RT64_IDGEOM=off` drops the parts' geometry (centroid and vertex count) from that pairing (§7.7l).|
+|**Two-sided characters, A/B**|`BT_RT64_TWOSIDED=off`|restores back-face culling on opaque player and actor draws (§7.7m).|
 |**Which particles were re-paired**|`BT_RT64_AUTOGATE=log`|one line per untagged pairing removed by the gate (§7.7g): call hash, both transform indices, predicted distance, the group's limit and size, both origins. `=off` disables the gate.|
 |**Sky seam blending, A/B and what it did**|`BT_SKY_SEAMS=off`, `=log`, `=log2`|`off` disables the §7.9 blending, overriding the graphics option. `log` prints one `[skyseam]` line per processed sky: display-list range, commands walked, models, border edges, pairs blended/rejected, coincident (`same-side`) pairs skipped, texels written, and `us=` the time it took. `log2` adds one line per pair with its `diff`/`grad`, verdict (`blend`, `REJECT`, or `displaced` = a valid seam that is not the best match for one of its edges, §7.9), the display lists of both triangles and their combiner/other-mode state. `log3` also dumps every command the walker visits (`[skydl]`) and one `[skydraw]` line per sky draw.|
 |**Does the blend open a seam**|`BT_RT64_SEAMLOG=<hex id>>8>[-<last>]`|per frame, for that model's transforms (root id without its bone byte, e.g. `20002D`): vertex pairs on different transforms that coincide at both keyframes, and the largest gap the drawn blend opens between them at the midpoint, against a plain blend. Also `rawpairs`/`keycracks`/`keygap`: pairs the game's own (pre-smoothing) positions put together this frame, how many are drawn more than 0.1 apart on the game frame itself, and the largest such gap (§7.7j). Also `[seam2]`: the in-betweens exactly as `RSPWorldCS` draws them (`M(w) * (pos - vel*(1-w))`) for every mapped transform, count changes and same-transform pairs included: `together`/`gap` = pairs together at w=0 and w=1 and the largest separation at w=0.25/0.5/0.75; `open`/`openswapped` = together at w=1 but apart at w=0 (§7.7k). O(n²) in vertices, so it is a diagnostic only (§7.7e, King Jingaling).|
@@ -1904,7 +1967,7 @@ Different failures need different tools. Choosing the wrong one wastes a session
 |**Per-vertex trajectories**|`BT_RT64_VTXDUMP=<path>:<n>[,<n>...]`|appends, for every vertex-interpolated transform with one of those vertex counts, a record `u32 id, u32 n, n×3 f32 game positions, n×3 f32 drawn positions` (binary, flushed per frame). For offline A/B of a filter on the identical input: dump with `BT_RT64_VTXSMOOTH=off` and replay.|
 |**Unattended runs that stay out of the way**|`BT_WINDOW_POS=x,y`|creates the window at that position (physical pixels) without activating it, e.g. on a second monitor. Launch with `--game bt` to skip the launcher menu (it ignores `BT_AUTOPAD` and posted clicks), and set `"background_input_mode": "Off"` in a portable `general.json` so a controller in use elsewhere does not drive the test.|
 |**Every presented frame, to disk**|`BT_RT64_FRAMEDUMP=<path>[,<step>[,<t0>[,<t1>[,<x>,<y>,<w>,<h>]]]]`|appends every presented frame (game and interpolated, so a true 144 Hz run gives 144 a second), point-sampled every `step` pixels of RT64's presented colour target, between `t0` and `t1` on the BT_AUTOPAD clock, optionally cropped to a `w`x`h` rectangle at (`x`,`y`) (a face close-up at step 1 for seconds instead of a full frame; the full-frame step-1 dump costs ~600 MB/s and itself drops presented frames). Record: `FDMP`, u32 seq, u32 index in its game frame, u32 frames in it, f64 t, u32 w, u32 h, w*h*3 RGB. D3D12 only (plume has no texture-to-buffer copy; under Vulkan it would crash). ~25 MB/s at step 5 on the 1600x900 window, so keep the window short. Use it instead of window captures, which the compositor caps at the monitor rate (§7.11, §7.12).|
-|**Improved Shadows, A/B and what it did**|`BT_RT64_SHADOWS=off`, `=log`, `=ab`|`off` restores the game's shadow (overrides the option, §7.13). `log` prints one `[shadow]` line per caster per game frame: position, the game's shear and plane height and the eased ones, the eased stretch, the composite's darkness. `ab` draws the shadow's coverage in solid magenta and applies the depth window on every other game frame without easing, so consecutive frames of one run differ by the window alone; count magenta pixels to measure what it recovers.|
+|**Improved Shadows, A/B and what it did**|`BT_RT64_SHADOWS=off`, `=log`, `=ab`|`off` restores the game's shadow (overrides the option, §7.13). `log` prints one `[shadow]` line per caster per game frame: position, the game's shear and plane height and the eased ones, the eased stretch, the composite's darkness. `ab` draws the shadow's coverage in solid magenta and applies the depth window on every other game frame without easing, so consecutive frames of one run differ by the window alone; count magenta pixels to measure what it recovers. `cov` keeps everything on and draws the coverage magenta (plus the `log` lines): the pink shadow in those runs is this tint, not the composite. `BT_RT64_SHADOW_EASE=<s>` overrides the easing time.|
 |**Matrices in the call log**|`BT_RT64_CALLLOG_MTX=1`|with `BT_RT64_CALLLOG`, adds `[vp]` (each projection's merged matrix) and `[mtx]` (each perspective call's world matrix and id) -- how §7.13's `F = VP_s x inv(VP_m)` was found.|
 |**What RT64 drew, per pass and per call**|`BT_RT64_CALLLOG=<t0>,<t1>`|once per workload in that window: `[calls]` per framebuffer pair (colour/depth image, write and scissor bounds, depth read/write), `[proj]` per projection (type, transform id, aspect mode, calls, triangles), `[clip]` where its triangles land in clip space, `[call]` per rectangle or framebuffer-sampling call, `[cc]` per call of passes 1-2 (clip counts, w range, prim/env, other mode, combiner, mean vertex colour, first texture hash), and `[fbrec]` per pass record (RDRAM reloads, format changes). Heavy; keep the window to a second (§7.12).|
 |**Draw only the first passes**|`BT_RT64_FBLIMIT=<n>`|renders only framebuffer pairs 0..n of every workload. Meaningful at `Original` refresh only (interpolated frames show stale targets).|

@@ -377,7 +377,7 @@ ultramodern::input::connected_device_info_t get_connected_device_info(
 // presses are ORed in after the real controller is read. Format:
 // "seconds:button,..." with seconds counted from the first input poll and
 // button one of a b z start l r du dd dl dr cu cd cl cr, or a stick direction
-// up down left right (full deflection). Each press is held for 0.15 s;
+// up down left right (full deflection) or wup wdown wleft wright (a third, walking). Each press is held for 0.15 s;
 // "from-to:button" holds it for that span instead. Unset means no effect.
 struct AutopadPress {
     double at;
@@ -424,6 +424,11 @@ std::vector<AutopadPress> autopad_script() {
             if (name == "down") presses.push_back({at, until, 0, 0.0f, -1.0f});
             if (name == "left") presses.push_back({at, until, 0, -1.0f, 0.0f});
             if (name == "right") presses.push_back({at, until, 0, 1.0f, 0.0f});
+            // Walking speed: the same directions at a third of the deflection.
+            if (name == "wup") presses.push_back({at, until, 0, 0.0f, 0.33f});
+            if (name == "wdown") presses.push_back({at, until, 0, 0.0f, -0.33f});
+            if (name == "wleft") presses.push_back({at, until, 0, -0.33f, 0.0f});
+            if (name == "wright") presses.push_back({at, until, 0, 0.33f, 0.0f});
         }
         start = end + 1;
     }
