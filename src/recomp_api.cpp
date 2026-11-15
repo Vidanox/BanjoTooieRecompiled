@@ -4799,18 +4799,21 @@ extern "C" void func_800C6E38(uint8_t* rdram, recomp_context* ctx);
 extern "C" void func_800D035C(uint8_t* rdram, recomp_context* ctx);
 
 extern "C" void func_800CF87C(uint8_t* rdram, recomp_context* ctx);
-extern "C" void func_800CFC8C(uint8_t* rdram, recomp_context* ctx);
+extern "C" void func_800D0018(uint8_t* rdram, recomp_context* ctx);
 
 // Notes collected in the current level (0..100), computed on a copy of the
 // context so the caller's registers (notably r2) are untouched.
+// func_800D0018(type, level) counts a level's COLLECTED records; the
+// func_800CFC8C used before sums every record the level HAS (its constant
+// total of 100). The level id those tables are keyed on is the byte at
+// 0x8012762C, the one bsjig_entrypoint_1 and the pause menu pass. The word
+// func_800CF87C returns is not it: it reads 1 in Mayahem Temple, where no
+// record matches, so the count was always 0 and the chime never fired.
 int32_t current_level_notes(uint8_t* rdram, const recomp_context* ctx) {
     recomp_context local = *ctx;
-    func_800CF87C(rdram, &local);
-    const uint32_t level_id = uint32_t(local.r2);
-    local = *ctx;
     local.r4 = 6;
-    local.r5 = level_id;
-    func_800CFC8C(rdram, &local);
+    local.r5 = uint32_t(MEM_BU(0, guest_address(0x8012762CU)));
+    func_800D0018(rdram, &local);
     return static_cast<int32_t>(local.r2);
 }
 
