@@ -586,3 +586,24 @@ text = "tooie_expand_pickup_scope(rdram, ctx, 2);"
 func = "func_800DE498"
 before_vram = 0x800DE6E0
 text = "tooie_expand_pickup_radius(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800D0BD4"
+before_vram = 0x800D0BF4
+text = "int32_t previous_notes = ctx->r16 == 6 ? tooie_note_total_before_pickup(rdram, ctx) : -1;"
+
+[[patches.hook]]
+func = "func_800D0BD4"
+before_vram = 0x800D0C1C
+text = "tooie_on_note_collected(rdram, ctx, previous_notes);"
+
+[[patches.hook]]
+func = "sumole_entrypoint_16"
+before_vram = 0x80801A98
+text = "int32_t final_move = tooie_final_jamjars_move(rdram, ctx, (uint32_t)ctx->r6, (uint32_t)ctx->r9);"
+
+[[patches.hook]]
+func = "sumole_entrypoint_16"
+before_vram = 0x80801AA0
+text = "tooie_on_jamjars_move_learned(rdram, ctx, final_move);"
+

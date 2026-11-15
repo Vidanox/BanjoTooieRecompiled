@@ -13,6 +13,7 @@
 //     calls the game's own go-to-map request, func_800A791C(map, exit, 1),
 //     exactly as a warp pad or load zone does
 //   BT_POS=x,y,z[@when][;...]     sets Banjo's position (floats)
+//   BT_CAM=x,y,z[,yaw,pitch][@when][;...] sets camera position and optional angles
 //   BT_HARNESSLOG=1               logs map, position and movement state once a
 //                                 second; =2 four times a second plus every
 //                                 movement-state change (map changes are always
@@ -30,6 +31,7 @@
 // recompiler's MEM_* macros, so the `addr ^ 3` / `^ 2` byte order of RDRAM on a
 // little-endian host is applied exactly as the game's own code sees it.
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -57,6 +59,9 @@ constexpr uint32_t kPlayerPointers = 0x80135490U; // u32[8]
 constexpr uint32_t kPlayerIndex = 0x801354DFU;    // u8
 constexpr uint32_t kPlayerPosition = 0xE4U;       // -> float x, y, z (+3 copies)
 constexpr uint32_t kPlayerMovement = 0x120U;      // -> u32 prev, u32 current
+constexpr uint32_t kPlayerYaw = 0xF8U;             // -> float current_yaw, float ideal_yaw
+constexpr uint32_t kCameraPointer = 0x8012D500U;   // u32 -> float x, y, z camera struct
+constexpr uint32_t kCameraAngles = 0x18U;         // pitch, yaw, roll in degrees
 
 enum class Op { Set, Or, And };
 
@@ -93,6 +98,18 @@ struct Warp {
 struct Position {
     std::string text;
     float xyz[3] = {0.0f, 0.0f, 0.0f};
+    float yaw = 0.0f;
+    bool has_yaw = false;
+    When when;
+    bool done = false;
+};
+
+struct CameraTarget {
+    std::string text;
+    float xyz[3] = {0.0f, 0.0f, 0.0f};
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    bool has_rot = false;
     When when;
     bool done = false;
 };
@@ -101,6 +118,7 @@ struct Harness {
     std::vector<Poke> pokes;
     std::vector<Warp> warps;
     std::vector<Position> positions;
+    std::vector<CameraTarget> cameras;
     int log_level = 0;
     uint32_t last_state = 0xFFFFFFFFU;
     bool active = false;
@@ -242,9 +260,10 @@ Harness* load_harness() {
     const char* poke_env = std::getenv("BT_POKE");
     const char* warp_env = std::getenv("BT_WARP");
     const char* pos_env = std::getenv("BT_POS");
+    const char* cam_env = std::getenv("BT_CAM");
     const char* log_env = std::getenv("BT_HARNESSLOG");
     if (poke_env == nullptr && warp_env == nullptr && pos_env == nullptr &&
-        log_env == nullptr) {
+        cam_env == nullptr && log_env == nullptr) {
         return nullptr;
     }
     auto* h = new Harness{};
@@ -283,20 +302,50 @@ Harness* load_harness() {
         for (const std::string& item : split(pos_env, ";")) {
             Position pos;
             std::string body;
-            const bool ok = parse_when(item, &body, &pos.when, false) &&
-                std::sscanf(body.c_str(), "%f,%f,%f", &pos.xyz[0], &pos.xyz[1],
-                            &pos.xyz[2]) == 3;
+            const bool ok = parse_when(item, &body, &pos.when, true);
             if (ok) {
-                pos.text = item;
-                h->positions.push_back(pos);
+                int matched = std::sscanf(body.c_str(), "%f,%f,%f,%f",
+                                          &pos.xyz[0], &pos.xyz[1], &pos.xyz[2], &pos.yaw);
+                if (matched >= 3) {
+                    pos.has_yaw = (matched >= 4);
+                    pos.text = item;
+                    h->positions.push_back(pos);
+                }
+                else {
+                    std::fprintf(stderr, "[pos] cannot parse '%s'\n", item.c_str());
+                }
             }
             else {
                 std::fprintf(stderr, "[pos] cannot parse '%s'\n", item.c_str());
             }
         }
     }
-    std::fprintf(stderr, "[harness] %zu pokes, %zu warps, %zu positions%s\n",
-                 h->pokes.size(), h->warps.size(), h->positions.size(),
+    if (cam_env != nullptr) {
+        for (const std::string& item : split(cam_env, ";")) {
+            CameraTarget cam;
+            std::string body;
+            const bool ok = parse_when(item, &body, &cam.when, true);
+            if (ok) {
+                int matched = std::sscanf(body.c_str(), "%f,%f,%f,%f,%f",
+                                          &cam.xyz[0], &cam.xyz[1], &cam.xyz[2],
+                                          &cam.yaw, &cam.pitch);
+                if ((matched == 3 || matched == 5) && std::isfinite(cam.xyz[0]) && std::isfinite(cam.xyz[1]) &&
+                    std::isfinite(cam.xyz[2]) && std::isfinite(cam.yaw) && std::isfinite(cam.pitch)) {
+                    cam.has_rot = matched == 5;
+                    cam.text = item;
+                    h->cameras.push_back(cam);
+                }
+                else {
+                    std::fprintf(stderr, "[cam] cannot parse '%s'\n", item.c_str());
+                }
+            }
+            else {
+                std::fprintf(stderr, "[cam] cannot parse '%s'\n", item.c_str());
+            }
+        }
+    }
+    std::fprintf(stderr, "[harness] %zu pokes, %zu warps, %zu positions, %zu cameras%s\n",
+                 h->pokes.size(), h->warps.size(), h->positions.size(), h->cameras.size(),
                  h->log_level > 0 ? ", periodic log" : "");
     h->active = true;
     return h;
@@ -443,9 +492,48 @@ bool apply_position(uint8_t* rdram, Position& pos, double now) {
             write_value(rdram, block + copy * 12U + axis * 4U, 32, bits);
         }
     }
-    std::fprintf(stderr, "[pos] t=%.2f '%s' block 0x%08X read back (%.1f, %.1f, %.1f)\n",
+    if (pos.has_yaw) {
+        const uint32_t yaw_block = player_sub_object(rdram, kPlayerYaw);
+        if (yaw_block != 0U) {
+            uint32_t yaw_bits;
+            std::memcpy(&yaw_bits, &pos.yaw, sizeof(yaw_bits));
+            write_value(rdram, yaw_block + 0x0U, 32, yaw_bits); // current yaw
+            write_value(rdram, yaw_block + 0x4U, 32, yaw_bits); // ideal yaw
+        }
+    }
+    std::fprintf(stderr, "[pos] t=%.2f '%s' block 0x%08X read back (%.1f, %.1f, %.1f)%s\n",
                  now, pos.text.c_str(), block, read_float(rdram, block),
-                 read_float(rdram, block + 4U), read_float(rdram, block + 8U));
+                 read_float(rdram, block + 4U), read_float(rdram, block + 8U),
+                 pos.has_yaw ? " with yaw" : "");
+    return true;
+}
+
+bool apply_camera(uint8_t* rdram, recomp_context* ctx, const CameraTarget& cam, double now) {
+    const uint32_t ptr = read_value(rdram, kCameraPointer, 32);
+    if (!in_rdram(ptr, 0x110)) {
+        return false;
+    }
+    const auto write_float = [rdram](uint32_t address, float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        write_value(rdram, address, 32, bits);
+    };
+    for (uint32_t axis = 0; axis < 3U; ++axis) {
+        write_float(ptr + axis * 4U, cam.xyz[axis]);
+    }
+    if (cam.has_rot) {
+        write_float(ptr + kCameraAngles, cam.pitch);
+        write_float(ptr + kCameraAngles + 4U, cam.yaw);
+        write_float(ptr + kCameraAngles + 8U, 0.0f);
+    }
+    // Refresh the game's view matrices and frustum from this pose.
+    recomp_context rebuild = *ctx;
+    rebuild.r4 = static_cast<int32_t>(ptr);
+    func_800CAF34(rdram, &rebuild);
+    if (!cam.done) {
+        std::fprintf(stderr, "[cam] t=%.2f '%s' camera 0x%08X applied%s\n", now, cam.text.c_str(), ptr,
+                     cam.has_rot ? " with yaw/pitch" : "");
+    }
     return true;
 }
 
@@ -500,14 +588,30 @@ void on_frame(uint8_t* rdram, recomp_context* ctx) {
         return;   // nothing is timed before the first input poll
     }
 
+    const bool has_target_warp = !h->warps.empty();
+    const uint32_t target_warp_map = has_target_warp ? h->warps[0].map : 0U;
+
     for (Poke& poke : h->pokes) {
         if (due(poke.when, poke.done, now, map, in_map)) {
             apply_poke(rdram, poke, now);
         }
     }
     for (Position& pos : h->positions) {
+        if (has_target_warp && !pos.when.on_map && pos.when.seconds == 0.0 &&
+            !pos.when.every_frame && map != target_warp_map) {
+            continue;
+        }
         if (due(pos.when, pos.done, now, map, in_map)) {
             pos.done = apply_position(rdram, pos, now);
+        }
+    }
+    for (CameraTarget& cam : h->cameras) {
+        if (has_target_warp && !cam.when.on_map && cam.when.seconds == 0.0 &&
+            !cam.when.every_frame && map != target_warp_map) {
+            continue;
+        }
+        if (due(cam.when, cam.done, now, map, in_map)) {
+            cam.done = apply_camera(rdram, ctx, cam, now);
         }
     }
     for (Warp& warp : h->warps) {

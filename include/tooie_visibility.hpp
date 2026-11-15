@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace tooie::visibility {
 

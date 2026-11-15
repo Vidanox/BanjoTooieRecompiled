@@ -1981,10 +1981,11 @@ Different failures need different tools. Choosing the wrong one wastes a session
 |**Coherent camera motion, A/B**|`BT_RT64_CUT_COHERENT=off`|restores the plain velocity rule, which flags the follow camera's swoop after a fall as cuts (§7.6c). `[cam]` lines print `coherent` where the coherence test overrode it.|
 |**Any button to the file select, A/B**|`BT_BOOTSKIP=off`|disables §7.16, overriding the option. With `BT_HOLDSKIP=log`, `[boot]` lines give each map's arrival in seconds since process start and on the pad clock, and each press that skipped.|
 |**Texture seams (world/models), A/B and cost**|`BT_TEX_SEAMS=off`, `=log`, `=log2`, `=dry`|`off` disables §7.14's blending, overriding the option; `log` prints a `[texseam]` line every 2 s (scan cost per frame, walks and their cost, pairs blended/rejected/conflicts, lists seen, borders, rewrites, volatile textures); `log2` adds each walk and each pair, tagged `PLAYER`/`MODEL`/`world` by the draw it came from; `dry` does everything except write.|
-|**Start somewhere specific (debug only)**|`BT_WARP`, `BT_POKE`, `BT_POS`|`src/test_harness.cpp`, run once per game frame from the `func_800A73F4` hook; unset = one null check. Syntax and verified recipes below.|
+|**Start somewhere specific (debug only)**|`BT_WARP`, `BT_POKE`, `BT_POS`, `BT_CAM`|`src/test_harness.cpp`, run once per game frame from the `func_800A73F4` hook; unset = one null check. Syntax and verified recipes below.|
+|**Capture exact repro location (F9) / Debug coords**|`F9` hotkey, `Show Debug Coordinates` option|With `BT_DEBUG_HOTKEYS=1` or developer mode on (the hotkeys do nothing otherwise), press F9 in-game to copy an exact repro line (`BT_WARP=... BT_POS=... BT_CAM=...`) to clipboard and append to `bt_repro.txt` next to the executable. "Show Debug Coordinates" option (General tab) displays live map, player pos/yaw, camera pos/rot/FOV in the window title. Future agents: ask user to press F9, then launch with that line as env vars.|
 |**Where am I, what is Banjo doing**|`BT_HARNESSLOG=1` (`=2`)|map id, Banjo's position and movement state once a second (`=2`: 4x a second plus every state change). Map changes are logged whenever any harness variable is set. States: `0x1` idle, `0x4` walk, `0x5` jump, `0x2D`/`0x2E` swimming/paddling, `0x73` locked in dialogue, `0x98` scripted walk, `0xA6`-`0xAA` Grip Grab.|
 
-### Starting a run anywhere: `BT_WARP` / `BT_POKE` / `BT_POS`
+### Starting a run anywhere: `BT_WARP` / `BT_POKE` / `BT_POS` / `BT_CAM`
 
 A clean portable save plus `BT_AUTOPAD=26:start,32:a` reaches the new-game intro
 (map `0x0A1`) at ~34.5 s; a warp at 40 s lands in the target map by ~42 s. Times
@@ -2001,12 +2002,26 @@ after the first run the same autopad loads file 1 straight into the saved map at
   from the digit count (2/4/8). Each item logs `was / wrote / read back` on its
   first write, and when the game had changed it back. Quote it in cmd
   (`set "BT_POKE=..."`) because of `|`.
-* `BT_POS=x,y,z[@when][;...]` sets Banjo's position (all three copies the game
-  keeps). Retries until a player exists.
-* `when`: none = every frame (a constant GameShark code; for warps and positions,
-  none = once at 0 s); `@S` once at S s; `@mMAP` once on entering MAP;
-  `@mMAP+S` once, S s after entering it; a trailing `~` repeats every frame from
-  then on (for `@m`, while in that map).
+* `BT_POS=x,y,z[,yaw][@when][;...]` sets Banjo's position and facing yaw (all
+  three copies the game keeps). Retries until a player exists.
+* `BT_CAM=cx,cy,cz[,yaw,pitch][@when][;...]` sets the camera's position and
+  optional rotation in degrees, then rebuilds the game's view matrices. The
+  camera controller resumes on the next frame unless `~` repeats the override.
+* `when`: none = every frame (a constant GameShark code; for warps, positions,
+  and cameras, none = once at 0 s; when `BT_WARP` is also present, unadorned
+  `BT_POS` and `BT_CAM` automatically wait until the warp's target map is reached);
+  `@S` once at S s; `@mMAP` once on entering MAP; `@mMAP+S` once, S s after entering
+  it; a trailing `~` repeats every frame from then on (for `@m`, while in that map).
+
+**Capturing repro locations:**
+* With `BT_DEBUG_HOTKEYS=1` or developer mode on, press **F9** in-game to copy the current pose to the clipboard and append it
+  to `bt_repro.txt` next to the executable:
+  `BT_WARP=0x0B8@40 BT_POS=x,y,z,yaw@m0B8+0.5 BT_CAM=cx,cy,cz,yaw,pitch@m0B8+0.5`
+* Use the regular file-select input sequence with the captured environment
+  variables. The capture saves position and orientation only. Script any
+  relevant movement, camera mode, dialogue or other scene state separately.
+* "Show Debug Coordinates" option in the General settings tab displays live map ID,
+  player XYZ and yaw, and camera XYZ, yaw/pitch, and FOV in the window title.
 
 Addresses (USA 1.0), each observed in game: current map `0x80132DC2` (u16; boot
 `0x18B`, file select `0x158`); flag block = `*0x8012C770` (heap, moves between

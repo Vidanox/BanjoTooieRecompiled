@@ -76,6 +76,7 @@ void tooie_expand_frustum(uint8_t* rdram, recomp_context* ctx);
 // Expand-only complete bounds around the shared composite-pickup bowl draw.
 void tooie_expand_pickup_scope(uint8_t* rdram, recomp_context* ctx, uint32_t stage);
 void tooie_expand_pickup_radius(uint8_t* rdram, recomp_context* ctx);
+void tooie_expand_jiggy_tile(uint8_t* rdram, recomp_context* ctx);
 
 // RT64 interpolation metadata. The game emits none of its own, so every
 // transform looks new to RT64 and it blends matrices that do not correspond,
@@ -100,6 +101,31 @@ void tooie_rt64_sky_layer(uint8_t* rdram, recomp_context* ctx);
 void tooie_rt64_tag_projection(uint8_t* rdram, recomp_context* ctx,
                                uint32_t kind, uint32_t cursor_address);
 void tooie_dump(uint8_t* rdram, uint32_t addr);
+
+int32_t tooie_note_total_before_pickup(uint8_t* rdram, recomp_context* ctx);
+void tooie_on_note_collected(uint8_t* rdram, recomp_context* ctx, int32_t previous_notes);
+int32_t tooie_final_jamjars_move(uint8_t* rdram, recomp_context* ctx, uint32_t table, uint32_t index);
+void tooie_on_jamjars_move_learned(uint8_t* rdram, recomp_context* ctx, int32_t final_move);
+
+// Snapshot of the current game location (for debug coordinate display and repro capture).
+typedef struct {
+    uint32_t map;
+    uint32_t frame;
+    uint32_t has_player;
+    float player_x;
+    float player_y;
+    float player_z;
+    float player_yaw;
+    uint32_t has_camera;
+    float cam_x;
+    float cam_y;
+    float cam_z;
+    float cam_yaw;
+    float cam_pitch;
+    float cam_fov;
+} TooieReproSnapshot;
+
+int tooie_get_latest_repro(TooieReproSnapshot* out);
 
 // TEMPORARY: report every indirect dispatch with the host caller, so a
 // `Failed to find function at <vram>` can be attributed to the generated

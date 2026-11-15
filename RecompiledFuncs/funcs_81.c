@@ -22281,6 +22281,7 @@ L_80801A34:
     ctx->r10 = S32(ctx->r9 << 4);
     // 0x80801A94: addu        $t3, $a2, $t2
     ctx->r11 = ADD32(ctx->r6, ctx->r10);
+    int32_t final_move = tooie_final_jamjars_move(rdram, ctx, (uint32_t)ctx->r6, (uint32_t)ctx->r9);
     // 0x80801A98: jal         0x800C7074
     // 0x80801A9C: lb          $a0, 0xA($t3)
     ctx->r4 = MEM_B(ctx->r11, 0XA);
@@ -22289,6 +22290,7 @@ L_80801A34:
     // 0x80801A9C: lb          $a0, 0xA($t3)
     ctx->r4 = MEM_B(ctx->r11, 0XA);
     after_32:
+    tooie_on_jamjars_move_learned(rdram, ctx, final_move);
     // 0x80801AA0: lwc1        $f6, 0x54($s0)
     ctx->f6.u32l = MEM_W(ctx->r16, 0X54);
     // 0x80801AA4: lw          $a2, 0x2C($sp)

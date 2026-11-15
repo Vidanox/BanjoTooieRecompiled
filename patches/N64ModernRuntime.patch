@@ -118,7 +118,7 @@ index 850689d..68f31a2 100644
              return true;
  
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
-index 17d7a47..4ae9b3a 100644
+index 17d7a47..ae0ca9e 100644
 --- a/ultramodern/src/events.cpp
 +++ b/ultramodern/src/events.cpp
 @@ -339,9 +339,12 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
@@ -146,6 +146,40 @@ index 17d7a47..4ae9b3a 100644
  
      while (!exited) {
          // Try to pull an action from the queue
+@@ -364,11 +369,6 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+-                // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
+-                // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
+-                // is finished as well, so sending this early shouldn't be an issue in most cases.
+-                // If this causes issues then the logic can be replaced with responding to yield requests.
+-                sp_complete();
+                 ultramodern::measure_input_latency();
+ 
+                 PTR(u64) displaylist = task_action->task.t.data_ptr;
+@@ -378,6 +378,10 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                 renderer_context->send_dl(&task_action->task);
+                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
+ 
++                // Report the RSP done only once send_dl has read the task's RDRAM inputs (display lists,
++                // matrices, vertices) into RT64's workload, as real hardware reports it once the RSP has
++                // consumed them; a game may reuse those buffers on SP done. submit_rsp_task does not wait.
++                sp_complete();
+                 dp_complete();
+                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
+                 ultramodern::extensions::on_displaylist_parsed(displaylist);
+@@ -565,7 +569,9 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
+ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+     OSTask* task = TO_PTR(OSTask, task_);
+ 
+-    // Send gfx tasks to the graphics action queue
++    // Send gfx tasks to the graphics action queue. The gfx thread reports SP and DP done once it has read
++    // the task (see gfx_thread_func); the game thread does not wait here, so its CPU work for the next
++    // frame overlaps RT64's display list processing instead of queueing behind it.
+     if (task->t.type == M_GFXTASK) {
+         events_context.action_queue.enqueue(SpTaskAction{ *task });
+     }
 diff --git a/ultramodern/src/scheduling.cpp b/ultramodern/src/scheduling.cpp
 index a22f747..78ea025 100644
 --- a/ultramodern/src/scheduling.cpp

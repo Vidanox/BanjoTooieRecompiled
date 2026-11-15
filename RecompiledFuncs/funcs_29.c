@@ -6784,6 +6784,7 @@ RECOMP_FUNC void func_800D0BD4(uint8_t* rdram, recomp_context* ctx) {
     }
     // 0x800D0BF0: or          $a0, $v0, $zero
     ctx->r4 = ctx->r2 | 0;
+    int32_t previous_notes = ctx->r16 == 6 ? tooie_note_total_before_pickup(rdram, ctx) : -1;
     // 0x800D0BF4: jal         0x800DA544
     // 0x800D0BF8: nop
 
@@ -6826,6 +6827,7 @@ RECOMP_FUNC void func_800D0BD4(uint8_t* rdram, recomp_context* ctx) {
     // 0x800D0C18: addiu       $a0, $zero, 0x6
     ctx->r4 = ADD32(0, 0X6);
     after_2:
+    tooie_on_note_collected(rdram, ctx, previous_notes);
     // 0x800D0C1C: addiu       $a0, $zero, 0xD0
     ctx->r4 = ADD32(0, 0XD0);
     // 0x800D0C20: or          $a1, $v0, $zero
