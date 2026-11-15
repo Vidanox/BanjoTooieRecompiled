@@ -6,13 +6,18 @@
 // their overlay table come from RecompiledFuncs/.
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -116,8 +121,23 @@ ultramodern::renderer::WindowHandle create_window(
     flags |= SDL_WINDOW_VULKAN;
 #endif
 
+    // BT_WINDOW_POS=x,y (test harness): create the window at that position, in
+    // physical pixels, without activating it, so an unattended run can sit on a
+    // second monitor instead of popping up over whatever the user is doing.
+    int window_x = SDL_WINDOWPOS_CENTERED;
+    int window_y = SDL_WINDOWPOS_CENTERED;
+    if (const char* pos = std::getenv("BT_WINDOW_POS")) {
+        int x = 0;
+        int y = 0;
+        if (std::sscanf(pos, "%d,%d", &x, &y) == 2) {
+            window_x = x;
+            window_y = y;
+            SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "1");
+        }
+    }
+
     window = SDL_CreateWindow("Banjo-Tooie: Recompiled",
-                              SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                              window_x, window_y,
                               1600, 900, flags);
     if (window == nullptr) {
         exit_error("Failed to create window: %s\n", SDL_GetError());
@@ -142,6 +162,249 @@ ultramodern::renderer::WindowHandle create_window(
 #endif
 }
 
+namespace {
+inline uint32_t get_initial_debug_coords() {
+    const char* env = std::getenv("BT_SHOW_DEBUG_COORDS");
+    if (env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0)) {
+        return 1U;
+    }
+    return 0U;
+}
+}
+
+std::atomic<uint32_t> g_bt_show_debug_coords{get_initial_debug_coords()};
+
+namespace {
+using CompletionClock = std::chrono::steady_clock;
+std::atomic<CompletionClock::rep> g_jamjars_message_until{0};
+std::atomic<uint32_t> g_jamjars_message_id{recompui::ContextId::null().slot_id};
+
+std::atomic<uint32_t> g_debug_coords_id{recompui::ContextId::null().slot_id};
+recompui::Label* g_debug_coords_label = nullptr;
+
+std::atomic<bool> g_recompui_ready{false};
+std::mutex g_overlay_init_mutex;
+
+void initialize_jamjars_message() {
+    if (g_jamjars_message_id.load(std::memory_order_acquire) != recompui::ContextId::null().slot_id) {
+        return;
+    }
+    if (!g_recompui_ready.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_overlay_init_mutex);
+    if (g_jamjars_message_id.load(std::memory_order_acquire) != recompui::ContextId::null().slot_id) {
+        return;
+    }
+
+    auto previous = recompui::try_close_current_context();
+    auto message = recompui::create_context();
+    message.set_captures_input(false);
+    message.set_captures_mouse(false);
+    message.open();
+    auto* label = message.create_element<recompui::Label>(
+        message.get_root_element(), "Jamjars: You've learned all the moves in this area!", recompui::LabelStyle::Normal);
+    label->set_position(recompui::Position::Absolute);
+    label->set_left(10.0f, recompui::Unit::Percent);
+    label->set_right(10.0f, recompui::Unit::Percent);
+    label->set_top(8.0f, recompui::Unit::Percent);
+    label->set_padding(10.0f);
+    label->set_text_align(recompui::TextAlign::Center);
+    label->set_background_color(recompui::Color{24, 18, 12, 230});
+    label->set_font_size(22.0f);
+    message.close();
+    g_jamjars_message_id.store(message.slot_id, std::memory_order_release);
+    if (previous != recompui::ContextId::null()) {
+        previous.open();
+    }
+}
+
+void initialize_debug_coords() {
+    if (g_debug_coords_id.load(std::memory_order_acquire) != recompui::ContextId::null().slot_id) {
+        return;
+    }
+    if (!g_recompui_ready.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_overlay_init_mutex);
+    if (g_debug_coords_id.load(std::memory_order_acquire) != recompui::ContextId::null().slot_id) {
+        return;
+    }
+
+    auto previous = recompui::try_close_current_context();
+    auto coords = recompui::create_context();
+    coords.set_captures_input(false);
+    coords.set_captures_mouse(false);
+    coords.open();
+    auto* label = coords.create_element<recompui::Label>(
+        coords.get_root_element(), "Map: --- | Waiting for coordinates...", recompui::LabelStyle::Normal);
+    label->set_position(recompui::Position::Absolute);
+    label->set_left(10.0f);
+    label->set_top(10.0f);
+    label->set_padding_left(10.0f);
+    label->set_padding_right(10.0f);
+    label->set_padding_top(6.0f);
+    label->set_padding_bottom(6.0f);
+    label->set_background_color(recompui::Color{0, 0, 0, 180});
+    label->set_color(recompui::Color{255, 255, 255, 255});
+    label->set_font_size(14.0f);
+    label->set_border_radius(4.0f);
+    label->set_white_space(recompui::WhiteSpace::Nowrap);
+    label->set_text_align(recompui::TextAlign::Left);
+    label->set_pointer_events(recompui::PointerEvents::None);
+    coords.close();
+    g_debug_coords_label = label;
+    g_debug_coords_id.store(coords.slot_id, std::memory_order_release);
+    if (previous != recompui::ContextId::null()) {
+        previous.open();
+    }
+}
+
+void initialize_overlay_contexts() {
+    initialize_jamjars_message();
+    initialize_debug_coords();
+}
+
+void update_jamjars_message() {
+    if (g_jamjars_message_id.load(std::memory_order_relaxed) == recompui::ContextId::null().slot_id) {
+        initialize_jamjars_message();
+    }
+    const recompui::ContextId message{g_jamjars_message_id.load(std::memory_order_acquire)};
+    if (message == recompui::ContextId::null()) {
+        return;
+    }
+    const auto until = g_jamjars_message_until.load(std::memory_order_relaxed);
+    const bool visible = until != 0 && CompletionClock::now().time_since_epoch().count() < until;
+    const bool shown = recompui::is_context_shown(message);
+    if (visible && !shown) {
+        recompui::show_context(message, "");
+    }
+    else if (!visible && shown) {
+        recompui::hide_context(message);
+    }
+}
+
+void update_debug_coords() {
+    if (g_debug_coords_id.load(std::memory_order_relaxed) == recompui::ContextId::null().slot_id) {
+        initialize_debug_coords();
+    }
+    recompui::ContextId coords_ctx{g_debug_coords_id.load(std::memory_order_acquire)};
+    const bool game_started = ultramodern::is_game_started();
+    const bool show_coords = game_started && (g_bt_show_debug_coords.load(std::memory_order_relaxed) != 0U);
+    static std::string last_title;
+    static std::string last_hud;
+
+    if (show_coords) {
+        TooieReproSnapshot s{};
+        if (tooie_get_latest_repro(&s)) {
+            char title_buf[256];
+            std::snprintf(title_buf, sizeof(title_buf),
+                          "Banjo-Tooie: Recompiled | Map: 0x%03X | Pos: %.1f, %.1f, %.1f | Yaw: %.1f° | Cam: %.1f, %.1f, %.1f | CamRot: %.1f°, %.1f° | FOV: %.1f°",
+                          s.map, s.player_x, s.player_y, s.player_z, s.player_yaw,
+                          s.cam_x, s.cam_y, s.cam_z, s.cam_yaw, s.cam_pitch, s.cam_fov);
+            if (last_title != title_buf) {
+                SDL_SetWindowTitle(window, title_buf);
+                last_title = title_buf;
+            }
+
+            char hud_buf[256];
+            std::snprintf(hud_buf, sizeof(hud_buf),
+                          "Map: 0x%03X | Pos: %.1f, %.1f, %.1f | Yaw: %.1f° | Cam: %.1f, %.1f, %.1f | CamRot: %.1f°, %.1f° | FOV: %.1f°",
+                          s.map, s.player_x, s.player_y, s.player_z, s.player_yaw,
+                          s.cam_x, s.cam_y, s.cam_z, s.cam_yaw, s.cam_pitch, s.cam_fov);
+            if (coords_ctx != recompui::ContextId::null() && g_debug_coords_label != nullptr && last_hud != hud_buf) {
+                auto previous = recompui::try_close_current_context();
+                coords_ctx.open();
+                g_debug_coords_label->set_text(hud_buf);
+                coords_ctx.close();
+                if (previous != recompui::ContextId::null()) {
+                    previous.open();
+                }
+                last_hud = hud_buf;
+            }
+        }
+    }
+    else {
+        if (!last_title.empty()) {
+            SDL_SetWindowTitle(window, "Banjo-Tooie: Recompiled");
+            last_title.clear();
+        }
+        last_hud.clear();
+    }
+
+    // Never show an unparented context while on the launcher, since draw_hook skips
+    // opening the launcher menu whenever is_any_context_shown() is true.
+    if (coords_ctx != recompui::ContextId::null()) {
+        const bool want_hud = show_coords && !recompui::is_context_capturing_input();
+        const bool is_shown = recompui::is_context_shown(coords_ctx);
+        if (want_hud && !is_shown) {
+            recompui::show_context(coords_ctx, "");
+        }
+        else if (!want_hud && is_shown) {
+            recompui::hide_context(coords_ctx);
+        }
+    }
+}
+}
+
+extern "C" void tooie_show_jamjars_completion() {
+    const auto until = CompletionClock::now() + std::chrono::seconds(4);
+    g_jamjars_message_until.store(until.time_since_epoch().count(), std::memory_order_relaxed);
+}
+
+void tooie_capture_repro_to_file_and_clipboard() {
+    TooieReproSnapshot s{};
+    if (!tooie_get_latest_repro(&s) || !s.has_player || !s.has_camera) {
+        std::fprintf(stderr, "[repro] No gameplay position and camera to capture yet.\n");
+        return;
+    }
+
+    char time_str[32] = "1970-01-01 00:00";
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf{};
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M", &tm_buf);
+
+    char line_buf[512];
+    std::snprintf(line_buf, sizeof(line_buf),
+                  "BT_WARP=0x%03X@40 BT_POS=%.1f,%.1f,%.1f,%.1f@m%03X+0.5 "
+                  "BT_CAM=%.1f,%.1f,%.1f,%.1f,%.1f@m%03X+0.5  # %s frame=%u",
+                  s.map,
+                  s.player_x, s.player_y, s.player_z, s.player_yaw, s.map,
+                  s.cam_x, s.cam_y, s.cam_z, s.cam_yaw, s.cam_pitch, s.map,
+                  time_str, s.frame);
+
+    const bool copied = SDL_SetClipboardText(line_buf) == 0;
+    if (!copied) {
+        std::fprintf(stderr, "[repro] Clipboard write failed: %s\n", SDL_GetError());
+    }
+
+    char* base_path = SDL_GetBasePath();
+    std::filesystem::path txt_path = base_path ? (std::filesystem::path(base_path) / "bt_repro.txt")
+                                               : std::filesystem::path("bt_repro.txt");
+    if (base_path) {
+        SDL_free(base_path);
+    }
+
+    std::ofstream out(txt_path, std::ios::app);
+    if (out.is_open()) {
+        out << line_buf << "\n";
+        out.close();
+        std::fprintf(stderr, "[repro] %sAppended to %s:\n  %s\n",
+                     copied ? "Copied to clipboard. " : "", txt_path.string().c_str(), line_buf);
+    }
+    else {
+        std::fprintf(stderr, "[repro] %sCould not write %s:\n  %s\n",
+                     copied ? "Copied to clipboard. " : "", txt_path.string().c_str(), line_buf);
+    }
+    std::fflush(stderr);
+}
+
 void update_gfx(void*) {
     static int count = 0;
     if (count < 5) {
@@ -152,6 +415,43 @@ void update_gfx(void*) {
     int width = 0, height = 0;
     SDL_GetWindowSize(window, &width, &height);
     tooie::visibility::update_display_size(width, height);
+    initialize_overlay_contexts();
+    update_jamjars_message();
+
+    // Developer hotkeys (F8: toggle debug coords, F9: capture repro line). They do nothing in a player's
+    // game: they act only with BT_DEBUG_HOTKEYS=1 or the renderer's developer mode on. Edges are still
+    // tracked so a key held when they become enabled does not fire.
+    const Uint8* keys = SDL_GetKeyboardState(nullptr);
+    static const bool hotkeys_env = [] {
+        const char* v = std::getenv("BT_DEBUG_HOTKEYS");
+        return v != nullptr && (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0 || std::strcmp(v, "true") == 0);
+    }();
+    auto hotkeys_enabled = [] {
+        return hotkeys_env || ultramodern::renderer::get_graphics_config().developer_mode;
+    };
+    static bool f8_was_down = false;
+    bool f8_down = keys && (keys[SDL_SCANCODE_F8] != 0);
+    if (f8_down && !f8_was_down && hotkeys_enabled()) {
+        uint32_t current = g_bt_show_debug_coords.load(std::memory_order_relaxed);
+        uint32_t next = (current == 0U) ? 1U : 0U;
+        g_bt_show_debug_coords.store(next, std::memory_order_relaxed);
+        try {
+            recompui::config::get_general_config().update_option_value("bt_show_debug_coords", next != 0U);
+        } catch (...) {
+        }
+    }
+    f8_was_down = f8_down;
+
+    static bool f9_was_down = false;
+    bool f9_down = keys && (keys[SDL_SCANCODE_F9] != 0);
+    if (f9_down && !f9_was_down && hotkeys_enabled()) {
+        tooie_capture_repro_to_file_and_clipboard();
+    }
+    f9_was_down = f9_down;
+
+    // Show Debug Coordinates option (window title + on-screen RecompUI HUD overlay)
+    update_debug_coords();
+
     if (count < 5) {
         std::fprintf(stderr, "[tooie] update_gfx call %d done\n", count);
         std::fflush(stderr);
@@ -175,7 +475,35 @@ static uint32_t discarded_output_frames = 0;
 
 constexpr uint32_t bytes_per_frame = input_channels * sizeof(float);
 
+// BT_PACELOG (src/recomp_api.cpp) reads these: the audio clock as the game
+// generates it, how much of it never reached the device, and how often the
+// device queue was found empty (an underrun proxy).
+std::atomic<uint64_t> g_audio_in_frames{0};
+std::atomic<uint64_t> g_audio_dropped_out_frames{0};
+std::atomic<uint32_t> g_audio_empty_queues{0};
+std::atomic<uint32_t> g_audio_buffers{0};
+
+extern "C" void tooie_audio_stats(uint64_t* in_frames, uint64_t* dropped_out,
+                                  uint32_t* empty_queues, uint32_t* buffers,
+                                  uint32_t* queued_us, uint32_t* in_rate,
+                                  uint32_t* out_rate) {
+    *in_frames = g_audio_in_frames.load(std::memory_order_relaxed);
+    *dropped_out = g_audio_dropped_out_frames.load(std::memory_order_relaxed);
+    *empty_queues = g_audio_empty_queues.load(std::memory_order_relaxed);
+    *buffers = g_audio_buffers.load(std::memory_order_relaxed);
+    const uint64_t queued = audio_device != 0 ? SDL_GetQueuedAudioSize(audio_device) : 0;
+    *queued_us = static_cast<uint32_t>(queued / (output_channels * sizeof(float)) *
+                                       1000000ULL / output_sample_rate);
+    *in_rate = sample_rate;
+    *out_rate = output_sample_rate;
+}
+
 void queue_samples(int16_t* audio_data, size_t sample_count) {
+    g_audio_buffers.fetch_add(1, std::memory_order_relaxed);
+    g_audio_in_frames.fetch_add(sample_count / input_channels, std::memory_order_relaxed);
+    if (SDL_GetQueuedAudioSize(audio_device) == 0) {
+        g_audio_empty_queues.fetch_add(1, std::memory_order_relaxed);
+    }
     static std::vector<float> swap_buffer;
     static std::array<float, duplicated_input_frames * input_channels>
         duplicated_sample_buffer;
@@ -231,6 +559,10 @@ void queue_samples(int16_t* audio_data, size_t sample_count) {
     const uint32_t skip_factor = cur_queued_microseconds / 100000;
     if (skip_factor != 0) {
         const uint32_t skip_ratio = 1 << skip_factor;
+        g_audio_dropped_out_frames.fetch_add(
+            (num_bytes_to_queue - num_bytes_to_queue / skip_ratio) /
+                (output_channels * sizeof(swap_buffer[0])),
+            std::memory_order_relaxed);
         num_bytes_to_queue /= skip_ratio;
         for (size_t i = 0;
              i < num_bytes_to_queue / (output_channels * sizeof(swap_buffer[0]));
@@ -320,6 +652,137 @@ ultramodern::input::connected_device_info_t get_connected_device_info(
     };
 }
 
+// BT_AUTOPAD: scripted button presses for player 1, for reaching states the
+// attract loop never shows (the new-game intro) from an unattended run.
+// Synthetic keystrokes do not reach the window (AGENTS.md, Instruments), so the
+// presses are ORed in after the real controller is read. Format:
+// "seconds:button,..." with seconds counted from the first input poll and
+// button one of a b z start l r du dd dl dr cu cd cl cr, or a stick direction
+// up down left right (full deflection) or wup wdown wleft wright (a third, walking). Each press is held for 0.15 s;
+// "from-to:button" holds it for that span instead. Unset means no effect.
+struct AutopadPress {
+    double at;
+    double until;
+    uint16_t button;
+    float x;
+    float y;
+};
+
+std::vector<AutopadPress> autopad_script() {
+    std::vector<AutopadPress> presses;
+    const char* script = std::getenv("BT_AUTOPAD");
+    if (script == nullptr) {
+        return presses;
+    }
+    static const std::pair<const char*, uint16_t> names[] = {
+        {"a", 0x8000}, {"b", 0x4000}, {"z", 0x2000}, {"start", 0x1000},
+        {"du", 0x0800}, {"dd", 0x0400}, {"dl", 0x0200}, {"dr", 0x0100},
+        {"l", 0x0020}, {"r", 0x0010}, {"cu", 0x0008}, {"cd", 0x0004},
+        {"cl", 0x0002}, {"cr", 0x0001},
+    };
+    std::string text = script;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find(',', start);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        const std::string item = text.substr(start, end - start);
+        const size_t colon = item.find(':');
+        if (colon != std::string::npos) {
+            const std::string when = item.substr(0, colon);
+            const std::string name = item.substr(colon + 1);
+            const size_t dash = when.find('-');
+            const double at = std::atof(when.c_str());
+            const double until = (dash != std::string::npos)
+                ? std::atof(when.c_str() + dash + 1) : at + 0.15;
+            for (const auto& [label, bit] : names) {
+                if (name == label) {
+                    presses.push_back({at, until, bit, 0.0f, 0.0f});
+                }
+            }
+            if (name == "up") presses.push_back({at, until, 0, 0.0f, 1.0f});
+            if (name == "down") presses.push_back({at, until, 0, 0.0f, -1.0f});
+            if (name == "left") presses.push_back({at, until, 0, -1.0f, 0.0f});
+            if (name == "right") presses.push_back({at, until, 0, 1.0f, 0.0f});
+            // Walking speed: the same directions at a third of the deflection.
+            if (name == "wup") presses.push_back({at, until, 0, 0.0f, 0.33f});
+            if (name == "wdown") presses.push_back({at, until, 0, 0.0f, -0.33f});
+            if (name == "wleft") presses.push_back({at, until, 0, -0.33f, 0.0f});
+            if (name == "wright") presses.push_back({at, until, 0, 0.33f, 0.0f});
+        }
+        start = end + 1;
+    }
+    return presses;
+}
+
+// The BT_AUTOPAD clock: steady_clock ticks at the first input poll, shared with
+// the test harness (src/test_harness.cpp) so BT_POKE/BT_WARP/BT_POS times line
+// up with BT_AUTOPAD's.
+std::atomic<int64_t> g_harness_origin{0};
+
+double harness_seconds_since(int64_t origin) {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::duration(
+            std::chrono::steady_clock::now().time_since_epoch().count() - origin))
+        .count();
+}
+
+extern "C" double tooie_harness_seconds() {
+    const int64_t origin = g_harness_origin.load(std::memory_order_relaxed);
+    return origin == 0 ? -1.0 : harness_seconds_since(origin);
+}
+
+// RT64's BT_RT64_FRAMEDUMP times its window on this clock (rt64_present_queue.cpp).
+extern "C" double (*g_bt_rt64_harness_seconds)();
+
+bool get_input_with_autopad(int player_index, uint16_t* buttons_out,
+                            float* x_out, float* y_out) {
+    static const std::vector<AutopadPress> presses = autopad_script();
+    if (g_harness_origin.load(std::memory_order_relaxed) == 0) {
+        int64_t expected = 0;
+        g_harness_origin.compare_exchange_strong(
+            expected, std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+    const bool connected = recompinput::profiles::get_n64_input(
+        player_index, buttons_out, x_out, y_out);
+    if (presses.empty() || player_index != 0) {
+        return connected;
+    }
+    const double now = harness_seconds_since(
+        g_harness_origin.load(std::memory_order_relaxed));
+    for (const AutopadPress& press : presses) {
+        if (now >= press.at && now < press.until) {
+            *buttons_out |= press.button;
+            if (press.x != 0.0f) {
+                *x_out = press.x;
+            }
+            if (press.y != 0.0f) {
+                *y_out = press.y;
+            }
+        }
+    }
+    return true;
+}
+
+// Controller 1's buttons that went down since the last read, for the
+// any-button skip to the file select (cutscene_skip.cpp, AGENTS.md §7.16). The
+// game's own button counters cannot serve: an attract demo replays its
+// recording INTO the raw pad buffer (_glrecord_entrypoint_0), so they report
+// the demo's presses as the player's.
+extern "C" std::atomic<uint32_t> g_bt_pad1_pressed;
+
+bool get_input_tracked(int player_index, uint16_t* buttons_out, float* x_out, float* y_out) {
+    const bool connected = get_input_with_autopad(player_index, buttons_out, x_out, y_out);
+    if (player_index == 0) {
+        static uint16_t last = 0;
+        const uint16_t now = static_cast<uint16_t>(*buttons_out & 0xFF3FU);
+        g_bt_pad1_pressed.fetch_or(static_cast<uint32_t>(now & ~last), std::memory_order_relaxed);
+        last = now;
+    }
+    return connected;
+}
+
 // --- RSP microcode ---------------------------------------------------------
 
 extern RspUcodeFunc n_aspMain;
@@ -356,6 +819,25 @@ std::vector<recomp::GameEntry> supported_games = {
     },
 };
 
+// RT64's switch for vertex smoothing (lib/rt64 rt64_game_frame.cpp).
+extern "C" std::atomic<uint32_t> g_bt_rt64_vertex_smooth;
+// RT64's switch for the improved shadows (lib/rt64 rt64_state.cpp).
+extern "C" std::atomic<uint32_t> g_bt_rt64_improved_shadows;
+extern "C" std::atomic<uint32_t> g_bt_rt64_shadow_blur;
+extern "C" std::atomic<uint32_t> g_bt_rt64_upscale_2d;
+// The sky seam blending switch (recomp_api.cpp, sky_seams, AGENTS.md §7.9).
+extern "C" std::atomic<uint32_t>* tooie_sky_seams_flag();
+// The texture seam blending switch (recomp_api.cpp, texseam, AGENTS.md §7.14).
+extern "C" std::atomic<uint32_t>* tooie_tex_seams_flag();
+// The character texture seam blending switch (recomp_api.cpp, texseam, AGENTS.md §7.14).
+extern "C" std::atomic<uint32_t>* tooie_char_seam_bleed_flag();
+// The hold-Start-to-skip switch (cutscene_skip.cpp, AGENTS.md §7.15).
+extern "C" std::atomic<uint32_t>* tooie_hold_skip_flag();
+// The any-button-to-file-select switch (cutscene_skip.cpp, AGENTS.md §7.16).
+extern "C" std::atomic<uint32_t>* tooie_boot_skip_flag();
+extern "C" std::atomic<uint32_t>* tooie_note_chime_flag();
+extern "C" std::atomic<uint32_t>* tooie_all_moves_msg_flag();
+
 void initialize_config() {
     const std::filesystem::path recomp_dir =
         recompui::file::get_app_folder_path();
@@ -364,12 +846,183 @@ void initialize_config() {
     }
 
     recompui::config::GeneralTabOptions general_options{};
-    recompui::config::create_general_tab(general_options);
-    recompui::config::create_graphics_tab();
+    recomp::config::Config& general = recompui::config::create_general_tab(general_options);
+    // Port option: hold Start for a second to skip a cutscene sequence, through
+    // the game's own skip paths (cutscene_skip.cpp, AGENTS.md §7.15).
+    general.add_bool_option(
+        "bt_hold_skip",
+        "Hold Start to Skip Cutscenes",
+        "Hold Start for a second during a cutscene to skip it, the way the game itself skips the intro. "
+        "A short press of Start does what it always did.",
+        true);
+    general.add_option_change_callback("bt_hold_skip",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_hold_skip_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    // Port option: any button during the boot logos, the title or the attract
+    // demo goes straight to the file select, through the game's own Start paths
+    // (cutscene_skip.cpp, AGENTS.md §7.16).
+    general.add_bool_option(
+        "bt_boot_skip",
+        "Skip Straight to File Select",
+        "Press any button during the opening logos, the title screen or the attract demo to go straight to "
+        "the file select, instead of waiting for the logos to finish and pressing Start.",
+        true);
+    general.add_option_change_callback("bt_boot_skip",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_boot_skip_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    general.add_bool_option(
+        "bt_note_chime",
+        "100 Notes Chime",
+        "Plays a chime when collecting all 100 musical notes in an area.",
+        true);
+    general.add_option_change_callback("bt_note_chime",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_note_chime_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    general.add_bool_option(
+        "bt_all_moves_msg",
+        "All Moves Celebration",
+        "Shows a message when Jamjars teaches the last move in a level (the game's own learn jingle still plays).",
+        true);
+    general.add_option_change_callback("bt_all_moves_msg",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_all_moves_msg_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    general.add_bool_option(
+        "bt_show_debug_coords",
+        "Show Debug Coordinates",
+        "Displays map ID, player coordinates, yaw, and camera details in the window title and on-screen HUD.",
+        false);
+    general.add_option_change_callback("bt_show_debug_coords",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                g_bt_show_debug_coords.store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    recomp::config::Config& graphics = recompui::config::create_graphics_tab();
+    // Port option: smooth the whole-unit snapping of CPU-animated vertices
+    // (RT64 GameFrame::smoothVertexRange, AGENTS.md §7.7h). The change callback
+    // also fires on load, so RT64's flag follows the saved value from the start.
+    graphics.add_bool_option(
+        "bt_smooth_faces",
+        "Smooth Animated Faces",
+        "Smooths the per-vertex shimmer of characters the game animates on the CPU (Mingella, Grunty and "
+        "others), whose vertices snap to whole units every frame. Takes effect when the framerate is above "
+        "the original.",
+        true);
+    graphics.add_option_change_callback("bt_smooth_faces",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                g_bt_rt64_vertex_smooth.store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    // Port option: blend the texels either side of the sky's tile borders so the
+    // seams between sky tiles stop showing (AGENTS.md §7.9). The game data is
+    // rewritten once per sky, so turning it off takes effect at the next map load.
+    graphics.add_bool_option(
+        "bt_sky_seams",
+        "Blend Sky Seams",
+        "Hides the seams between the tiles the sky is made of. The game cuts each sky into square tiles that "
+        "cannot blend into each other, which shows as straight lines through the clouds. Turning this off "
+        "takes effect at the next area load.",
+        true);
+    graphics.add_option_change_callback("bt_sky_seams",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_sky_seams_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    // Port option: filter across matched world texture tiles.
+    graphics.add_bool_option(
+        "bt_tex_seams",
+        "Blend Texture Seams",
+        "Filters across adjacent texture tiles on world geometry.",
+        true);
+    graphics.add_option_change_callback("bt_tex_seams",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_tex_seams_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    // Port option: filter across matched character texture tiles.
+    graphics.add_bool_option(
+        "bt_char_seam_bleed",
+        "Blend Character Seams",
+        "Filters across adjacent texture tiles on character models.",
+        true);
+    graphics.add_option_change_callback("bt_char_seam_bleed",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                tooie_char_seam_bleed_flag()->store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    // Port option: character shadows drawn whole on any ground and eased between
+    // lights (RT64 rt64_state.cpp btImproveShadows + the composite pass, AGENTS.md §7.13).
+    graphics.add_bool_option(
+        "bt_improved_shadows",
+        "Improved Shadows",
+        "Draws character shadows whole on stairs, ledges, slopes and uneven floors, where the original cuts "
+        "them along the ground's edges, and eases them between lights instead of snapping.",
+        true);
+    graphics.add_option_change_callback("bt_improved_shadows",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                g_bt_rt64_improved_shadows.store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    graphics.add_bool_option(
+        "bt_shadow_blur",
+        "Soft Shadows",
+        "Softens character shadow edges when Improved Shadows is enabled.",
+        true);
+    graphics.add_option_change_callback("bt_shadow_blur",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                g_bt_rt64_shadow_blur.store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
+    graphics.add_bool_option(
+        "bt_upscale_2d",
+        "Smooth 2D UI",
+        "Smooths HUD icons, text and other 2D elements when they are scaled up to your screen, using bicubic filtering instead of blocky pixels. It adds no extra detail.",
+        false);
+    graphics.add_option_change_callback("bt_upscale_2d",
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,
+           recomp::config::OptionChangeContext) {
+            if (const bool* on = std::get_if<bool>(&cur_value)) {
+                g_bt_rt64_upscale_2d.store(*on ? 1U : 0U, std::memory_order_relaxed);
+            }
+        });
     recompui::config::create_controls_tab();
     recompui::config::create_sound_tab();
     recompui::config::create_mods_tab();
     recompui::config::finalize();
+    if (const char* env_coords = std::getenv("BT_SHOW_DEBUG_COORDS")) {
+        if (std::strcmp(env_coords, "1") == 0 || std::strcmp(env_coords, "true") == 0) {
+            g_bt_show_debug_coords.store(1U, std::memory_order_relaxed);
+        }
+    }
 }
 
 // The launcher wallpaper.
@@ -458,6 +1111,8 @@ static constexpr recompui::Color kOptionPlateActive{0, 38, 117, 240};
 static constexpr recompui::Color kOptionText{245, 245, 245, 255};
 
 void initialize_launcher_menu(recompui::LauncherMenu* menu) {
+    g_recompui_ready.store(true, std::memory_order_release);
+    initialize_overlay_contexts();
     constexpr recompui::Color menu_background{0x24, 0x17, 0x0D, 0xFF};
     menu->set_background_color(menu_background);
     menu->set_font_family("LatoLatin");
@@ -539,6 +1194,7 @@ void initialize_launcher_menu(recompui::LauncherMenu* menu) {
 int main(int argc, char** argv) {
     std::fprintf(stderr, "[tooie] main entered\n");
     std::fflush(stderr);
+    g_bt_rt64_harness_seconds = tooie_harness_seconds;
 
     std::set_terminate([]() {
         std::fprintf(stderr, "[tooie] std::terminate called\n");
@@ -644,6 +1300,7 @@ int main(int argc, char** argv) {
 
     recompui::register_ui_exports();
     recompui::register_launcher_init_callback(initialize_launcher_menu);
+    initialize_overlay_contexts();
     std::fprintf(stderr, "[tooie] step ui_exports\n"); std::fflush(stderr);
 
     tooie::register_overlays();
@@ -671,6 +1328,8 @@ int main(int argc, char** argv) {
                 developer_mode);
             std::fprintf(stderr, "[tooie] create_render_context done\n");
             std::fflush(stderr);
+            g_recompui_ready.store(true, std::memory_order_release);
+            initialize_overlay_contexts();
             return ctx;
         },
     };
@@ -683,7 +1342,7 @@ int main(int argc, char** argv) {
 
     ultramodern::input::callbacks_t input_callbacks{
         .poll_input = recompinput::poll_inputs,
-        .get_input = recompinput::profiles::get_n64_input,
+        .get_input = get_input_tracked,
         .set_rumble = recompinput::set_rumble,
         .get_connected_device_info = get_connected_device_info,
     };
@@ -696,7 +1355,10 @@ int main(int argc, char** argv) {
 
     ultramodern::events::callbacks_t events_callbacks{
         .vi_callback = recompinput::update_rumble,
-        .gfx_init_callback = nullptr,
+        .gfx_init_callback = []() {
+            g_recompui_ready.store(true, std::memory_order_release);
+            initialize_overlay_contexts();
+        },
     };
 
     ultramodern::error_handling::callbacks_t error_handling_callbacks{

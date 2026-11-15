@@ -14270,6 +14270,7 @@ L_800DA3AC:
 RECOMP_FUNC void func_800DA3B8(uint8_t* rdram, recomp_context* ctx) {
     uint64_t hi = 0, lo = 0, result = 0;
     int c1cs = 0;
+    tooie_flag_write(rdram, ctx);
     // 0x800DA3B8: addiu       $sp, $sp, -0x20
     ctx->r29 = ADD32(ctx->r29, -0X20);
     // 0x800DA3BC: sw          $ra, 0x14($sp)

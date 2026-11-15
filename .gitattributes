@@ -1,0 +1,4 @@
+# Keep the dependency patches byte-for-byte as committed. A Windows checkout
+# with core.autocrlf=true would otherwise rewrite them with CRLF line endings,
+# and git apply then rejects hunks whose context no longer matches (CI build-windows).
+patches/*.patch -text

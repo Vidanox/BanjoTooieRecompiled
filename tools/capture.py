@@ -28,6 +28,10 @@ CREATE_NO_WINDOW = 0x08000000
 user32 = C.WinDLL("user32", use_last_error=True)
 gdi32 = C.WinDLL("gdi32", use_last_error=True)
 PW_RENDERFULLCONTENT = 0x00000002
+try:
+    user32.SetProcessDpiAwarenessContext(C.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+except Exception:
+    pass
 SRCCOPY = 0x00CC0020
 DIB_RGB_COLORS = 0
 
@@ -67,8 +71,12 @@ def find_window(pid):
 
 
 def capture(hwnd, path):
+    # PrintWindow paints the whole window (caption included) at physical pixels,
+    # so size the bitmap from the window rect in a per-monitor DPI aware process.
+    # GetClientRect in a DPI-unaware process returned the scaled-down client size
+    # and every shot was a crop of the window's top-left corner.
     rect = wintypes.RECT()
-    user32.GetClientRect(hwnd, C.byref(rect))
+    user32.GetWindowRect(hwnd, C.byref(rect))
     width, height = rect.right - rect.left, rect.bottom - rect.top
     if width <= 0 or height <= 0:
         return None

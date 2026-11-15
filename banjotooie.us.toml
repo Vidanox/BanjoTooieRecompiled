@@ -328,6 +328,16 @@ func = "func_800C2AB8"
 before_vram = 0x800C2B50
 text = "tooie_yield_pending_sound(rdram, ctx);"
 
+# Gives the cooperative scheduler a preemption point in the new-game intro's
+# busy-wait for its next music cue (`osGetCount` polled until the scene's cue
+# time). On hardware the audio thread preempts it and the score keeps playing;
+# without this it is starved for the whole wait and the music falls ~34 s
+# behind the pictures by the end of the intro (AGENTS.md 6.9).
+[[patches.hook]]
+func = "glintrosyncDll_entrypoint_1"
+before_vram = 0x808002BC
+text = "tooie_yield_intro_sync(rdram, ctx);"
+
 # TEMPORARY diagnostic: chanim_entrypoint_7 is entered with a0 = NULL although
 # the syscall site that dispatches it had a0 = 0x801DD74C.
 [[patches.hook]]
@@ -437,6 +447,32 @@ text = "tooie_expand_frustum(rdram, ctx);"
 func = "func_800A73F4"
 before_vram = 0x800A73F4
 text = "tooie_rt64_begin_frame(rdram, ctx);"
+
+# The end of the frame's display list: 0x800A7518 is the call to func_800E7EF4,
+# which appends G_RDPFULLSYNC + G_ENDDL and submits the list, so everything the
+# game draws this frame (the 2D HUD and screen transitions included) is already
+# in it. The hold-to-skip indicator is appended here, on top (AGENTS.md 7.15),
+# and the BT_WORLD_SEAMS / BT_HUDLOG surveys walk the finished list.
+[[patches.hook]]
+func = "func_800A73F4"
+before_vram = 0x800A7518
+text = "tooie_frame_end(rdram, ctx);"
+
+# chintroticker runs every cutscene sequence (the intro, the "Meanwhile..."
+# scenes, the boot logos) and its update holds the game's own skip paths. Hold
+# Start to skip performs them from here (src/cutscene_skip.cpp, AGENTS.md 7.15).
+[[patches.hook]]
+func = "func_808005AC_chintroticker"
+before_vram = 0x808005AC
+text = "tooie_cutscene_ticker(rdram, ctx);"
+
+# Every game flag is written through func_800DA3B8(flag, value). BT_HOLDSKIP=log
+# prints each write: how the flags a skipped sequence still has to set were
+# measured (src/cutscene_skip.cpp kSceneFlags, AGENTS.md 7.15).
+[[patches.hook]]
+func = "func_800DA3B8"
+before_vram = 0x800DA3B8
+text = "tooie_flag_write(rdram, ctx);"
 
 # func_80098BA8 is the verified player draw wrapper, so its entry and exit
 # bracket exactly the draws belonging to one player. The identity comes from
@@ -550,3 +586,24 @@ text = "tooie_expand_pickup_scope(rdram, ctx, 2);"
 func = "func_800DE498"
 before_vram = 0x800DE6E0
 text = "tooie_expand_pickup_radius(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800D0BD4"
+before_vram = 0x800D0BF4
+text = "int32_t previous_notes = ctx->r16 == 6 ? tooie_note_total_before_pickup(rdram, ctx) : -1;"
+
+[[patches.hook]]
+func = "func_800D0BD4"
+before_vram = 0x800D0C1C
+text = "tooie_on_note_collected(rdram, ctx, previous_notes);"
+
+[[patches.hook]]
+func = "sumole_entrypoint_16"
+before_vram = 0x80801A98
+text = "int32_t final_move = tooie_final_jamjars_move(rdram, ctx, (uint32_t)ctx->r6, (uint32_t)ctx->r9);"
+
+[[patches.hook]]
+func = "sumole_entrypoint_16"
+before_vram = 0x80801AA0
+text = "tooie_on_jamjars_move_learned(rdram, ctx, final_move);"
+
