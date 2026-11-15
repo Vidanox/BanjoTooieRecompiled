@@ -1004,8 +1004,8 @@ void initialize_config() {
         });
     graphics.add_bool_option(
         "bt_upscale_2d",
-        "Upscale 2D UI",
-        "Draws 2D rectangles, including HUD elements, at render resolution with linear filtering.",
+        "Smooth 2D UI",
+        "Smooths HUD icons, text and other 2D elements when they are scaled up to your screen, using bicubic filtering instead of blocky pixels. It adds no extra detail.",
         false);
     graphics.add_option_change_callback("bt_upscale_2d",
         [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant,

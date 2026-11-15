@@ -2557,7 +2557,7 @@ index 1da2550..0595393 100644
                  fbPair.drawColorRect.merge(drawRect);
                  if (otherModeStack[otherModeStackSize - 1].zUpd()) {
 diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
-index 2970e71..576ef99 100644
+index 2970e71..7c6c19f 100644
 --- a/src/hle/rt64_state.cpp
 +++ b/src/hle/rt64_state.cpp
 @@ -4,8 +4,14 @@
@@ -3020,7 +3020,7 @@ index 2970e71..576ef99 100644
                      const bool upscaleIfScaledRect = (upscale2D == UserConfiguration::Upscale2D::ScaledOnly) && flags.rect && !callDesc.identityRectScale();
                      flags.upscale2D = forcedUpscale2D || upscaleIfScaledRect;
  
-+                    // Banjo-Tooie port: "Upscale 2D UI". The HUD is drawn both as texture rectangles and as
++                    // Banjo-Tooie port: "Smooth 2D UI" (bt_upscale_2d). The HUD is drawn both as texture rectangles and as
 +                    // orthographic triangles; mark their tiles so the sampler reconstructs smooth, sharp
 +                    // edges at output resolution instead of magnifying the N64 texels (TextureSampler.hlsli).
 +                    // Perspective (3D world) draws and framebuffer copies are never touched.

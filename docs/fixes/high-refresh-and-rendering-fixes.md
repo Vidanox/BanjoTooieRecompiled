@@ -108,9 +108,9 @@ This document summarizes all bugs investigated and fixed across the `fix/high-re
   * Added `G_LOADTILE` (`uls/ult != 0`) sub-tile tracking and expanded format support (`texseam_supported`: RGBA16/32, IA, and CI4/CI8 with TLUT validation).
   * Replaced in-place RDRAM texel mutation with `tooie_stitch_texture` in `src/recomp_api.cpp`, `TextureManager::uploadStitched` in `lib/rt64/src/hle/rt64_rdp_tmem.cpp`, and `gpuTileFlagStitched` in `lib/rt64/src/shaders/TextureSampler.hlsli`. Matching clamped tile borders are copied into a temporary 1-texel padded gutter verified against TMEM (never modifying RDRAM).
 
-### 5.2 2D UI High-Resolution Upscaling (`bt_upscale_2d`)
+### 5.2 Smooth 2D UI (`bt_upscale_2d`)
 * **Problem:** 2D HUD icons, fonts, and rectangles rendered blocky or half-texel shifted when scaled to modern resolutions.
-* **Fix:** Registered `"bt_upscale_2d"` (**Upscale 2D UI**, Graphics tab, default `false`) in `src/main.cpp`. When enabled, `lib/rt64/src/hle/rt64_state.cpp` marks 2D draws with `is2DUI` / `gpuTileFlagUpscale2D` and `linearFiltering`, and `lib/rt64/src/shaders/TextureSampler.hlsli` re-centers point-sampled tiles by `-0.5 * tcScale` and applies 4×4 clamped Catmull-Rom bicubic interpolation with cutout alpha reconstruction and luminance edge tightening.
+* **Fix:** Registered `"bt_upscale_2d"` (**Smooth 2D UI**, Graphics tab, default `false`; it smooths the existing sprites when scaling and adds no detail, so it was renamed from "Upscale 2D UI") in `src/main.cpp`. When enabled, `lib/rt64/src/hle/rt64_state.cpp` marks 2D draws with `is2DUI` / `gpuTileFlagUpscale2D` and `linearFiltering`, and `lib/rt64/src/shaders/TextureSampler.hlsli` re-centers point-sampled tiles by `-0.5 * tcScale` and applies 4×4 clamped Catmull-Rom bicubic interpolation with cutout alpha reconstruction and luminance edge tightening.
 
 ---
 
